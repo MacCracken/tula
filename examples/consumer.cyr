@@ -1,0 +1,161 @@
+# examples/consumer.cyr — a complete downstream consumer of the tula codec, the
+# v1.0 "≥1 consumer green" gate. It plays the role of a quantizing checkpoint
+# writer + a hardened loader, exercising the whole public surface end-to-end:
+#
+#   quantize (ternary) -> builder + sidecar scale -> sign -> write -> read
+#   (untrusted) -> verify signature -> payload-ok guard -> unpack -> dequant.
+#
+# In-repo it includes src/lib.cyr; a real external consumer pulls dist/tula.cyr
+# via [deps.tula] and supplies its own sigil (the bundle leaves ed25519_*
+# unresolved — the standard consumer-bundle pattern).
+#
+#   cyrius build examples/consumer.cyr build/tula_consumer && ./build/tula_consumer
+
+include "src/lib.cyr"
+
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn fclose(a, b, tol): i64 {
+    return f64_lt(f64_abs(f64_sub(a, b)), tol);
+}
+
+# gamma = mean(|w_i|) — the b1.58 per-tensor ternary scale (mirrors tentib).
+fn absmean(w, n): i64 {
+    var s = f64_from(0);
+    var i = 0;
+    while (i < n) {
+        s = f64_add(s, f64_abs(load64(w + i * 8)));
+        i = i + 1;
+    }
+    return f64_div(s, f64_from(n));
+}
+
+fn main(): i64 {
+    alloc_init();
+    var fails = 0;
+
+    # ---- original f64 weights the consumer wants to store as ternary ----
+    var n = 8;
+    var w = alloc(n * 8);
+    store64(w + 0 * 8, f64_from(2));
+    store64(w + 1 * 8, f64_from(0 - 1));
+    store64(w + 2 * 8, f64_from(0));
+    store64(w + 3 * 8, f64_from(3));
+    store64(w + 4 * 8, f64_from(0 - 2));
+    store64(w + 5 * 8, f64_from(1));
+    store64(w + 6 * 8, f64_from(0 - 3));
+    store64(w + 7 * 8, f64_from(1));
+
+    # ---- quantize to ternary {-1,0,+1} with a per-tensor gamma ----
+    var gamma = absmean(w, n);
+    var trits = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        var q = f64_to(f64_round(f64_div(load64(w + i * 8), gamma)));
+        if (q > 1) { q = 1; }
+        if (q < (0 - 1)) { q = 0 - 1; }
+        store64(trits + i * 8, q);
+        i = i + 1;
+    }
+    var packed = alloc(tula_ternary_bytes(n));
+    var plen = tula_ternary_pack(trits, n, packed);
+
+    # ---- a plain f64 bias tensor, for variety ----
+    var bn = 4;
+    var bias = alloc(bn * 8);
+    store64(bias + 0 * 8, f64_from(10));
+    store64(bias + 1 * 8, f64_from(20));
+    store64(bias + 2 * 8, f64_from(30));
+    store64(bias + 3 * 8, f64_from(40));
+
+    # ---- keypair (deterministic seed) ----
+    var sk = alloc(64);
+    var pk = alloc(32);
+    var seed = alloc(32);
+    var k = 0;
+    while (k < 32) { store8(seed + k, (k + 7) & 0xFF); k = k + 1; }
+    ed25519_keypair(seed, sk, pk);
+
+    # ---- build: ternary weight + its scale sidecar + f64 bias ----
+    var shapeW = alloc(8);
+    store64(shapeW, n);
+    var shapeS = alloc(8);
+    store64(shapeS, 1);
+    var gbuf = alloc(8);
+    store64(gbuf, gamma);
+    var shapeB = alloc(8);
+    store64(shapeB, bn);
+
+    var b = tula_builder_new();
+    tula_builder_add(b, "layer.w", TULA_DT_TERNARY, shapeW, 1, packed, plen);
+    tula_builder_add(b, "layer.w.scale", TULA_DT_F64, shapeS, 1, gbuf, 8);
+    tula_builder_add(b, "layer.b", TULA_DT_F64, shapeB, 1, bias, bn * 8);
+    var buf = tula_builder_finish_signed(b, sk);
+    var total = tula_total_len(buf);
+
+    var path = "/tmp/tula_consumer_model.tula";
+    if (tula_write_file(path, buf, total) != total) { fails = fails + 1; }
+    sput("wrote signed model: /tmp/tula_consumer_model.tula\n");
+
+    # ================================================================
+    # LOAD as if untrusted (a fresh process reading a foreign file)
+    # ================================================================
+    var r = tula_read_file(path);
+    if (r == 0) { sput("FAIL: model did not open\n"); return 1; }
+    if (tula_count(r) != 3) { fails = fails + 1; }
+
+    # 1. authenticity
+    if (tula_verify(r, pk) != TULA_SIG_OK) { sput("FAIL: signature\n"); fails = fails + 1; }
+    else { sput("signature: OK\n"); }
+
+    # 2. locate + guard the ternary weight, then unpack + dequant
+    var ew = tula_find(r, "layer.w");
+    var es = tula_find(r, "layer.w.scale");
+    if (ew == 0) { fails = fails + 1; }
+    if (es == 0) { fails = fails + 1; }
+    if (tula_entry_payload_ok(ew) != 1) { sput("FAIL: payload guard\n"); fails = fails + 1; }
+
+    var gamma2 = load64(tula_entry_data(r, es));
+    var wn = tula_entry_dim(ew, 0);
+    var got = alloc(wn * 8);
+    tula_ternary_unpack(tula_entry_data(r, ew), wn, got);
+
+    # dequantized weight = trit * gamma; must track the original within ternary error
+    var tol = f64_mul(gamma2, f64_from(2));
+    var okw = 1;
+    i = 0;
+    while (i < wn) {
+        if (load64(got + i * 8) != load64(trits + i * 8)) { okw = 0; }
+        var recon = f64_mul(f64_from(load64(got + i * 8)), gamma2);
+        if (fclose(recon, load64(w + i * 8), tol) != 1) { okw = 0; }
+        i = i + 1;
+    }
+    if (okw != 1) { sput("FAIL: ternary reconstruction\n"); fails = fails + 1; }
+    else { sput("ternary weight: unpacked + dequantized OK\n"); }
+
+    # 3. plain f64 bias round-trips bit-exact
+    var eb = tula_find(r, "layer.b");
+    if (eb == 0) { fails = fails + 1; }
+    var bp = tula_entry_data(r, eb);
+    var okb = 1;
+    i = 0;
+    while (i < bn) {
+        if (load64(bp + i * 8) != load64(bias + i * 8)) { okb = 0; }
+        i = i + 1;
+    }
+    if (okb != 1) { sput("FAIL: bias round-trip\n"); fails = fails + 1; }
+    else { sput("f64 bias: bit-exact\n"); }
+
+    if (fails == 0) {
+        sput("RESULT: PASS — consumer loaded a signed, quantized model end-to-end\n");
+        return 0;
+    }
+    sput("RESULT: FAIL\n");
+    return 1;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

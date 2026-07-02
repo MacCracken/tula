@@ -17,11 +17,15 @@ fn tula_read_file(path): i64 {
     var n = file_read_all(path, hdr, TULA_HEADER_SIZE);
     if (n < TULA_HEADER_SIZE) { return 0; }
     if (load64(hdr + 0) != TULA_MAGIC) { return 0; }
-    var total = load64(hdr + 32) + load64(hdr + 40) + load64(hdr + 56);
+    # Bomb guard: sanity-check the header-declared total BEFORE allocating.
+    var total = tula_hdr_total(hdr);
+    if (total < TULA_HEADER_SIZE) { return 0; }
+    if (total > TULA_READ_MAX_BYTES) { return 0; }
     var buf = alloc(total);
+    if (buf == 0) { return 0; }
     var got = file_read_all(path, buf, total);
     if (got != total) { return 0; }
-    return tula_open(buf, total);
+    return tula_open(buf, total);   # full structural validation
 }
 
 # Zero-copy: mmap a tula file read-only. Returns the mapped buffer (reader
@@ -33,7 +37,10 @@ fn tula_open_mmap(path): i64 {
     var n = file_read(fd, hdr, TULA_HEADER_SIZE);
     if (n < TULA_HEADER_SIZE) { file_close(fd); return 0; }
     if (load64(hdr + 0) != TULA_MAGIC) { file_close(fd); return 0; }
-    var total = load64(hdr + 32) + load64(hdr + 40) + load64(hdr + 56);
+    # Bomb guard: sanity-check the header-declared total BEFORE mmap'ing.
+    var total = tula_hdr_total(hdr);
+    if (total < TULA_HEADER_SIZE) { file_close(fd); return 0; }
+    if (total > TULA_READ_MAX_BYTES) { file_close(fd); return 0; }
     var addr = mmap_file_ro(fd, total);
     file_close(fd);   # the mapping survives fd close
     if (addr == 0) { return 0; }

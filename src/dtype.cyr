@@ -1,0 +1,279 @@
+# @public — tula dtype payload helpers (M2): pure pack/unpack transforms for the
+# quantized dtypes so consumers can store REAL quantized weights, not just
+# declare the dtype.
+#
+# These are pure byte transforms — they NEVER touch the file layout. A packed
+# tensor is stored under the normal builder/reader machinery (dtype = TERNARY /
+# INT8 / NF4); its scale(s) travel as a SIDECAR tensor named "<name>.scale"
+# (see docs/adr/0002). So a quantized weight `w` is two entries: `w` (packed
+# codes, logical shape, data_len = packed byte length) + `w.scale` (f64 scales,
+# shape expresses granularity — [1] scalar / [rows] per-row / [n_blocks] block).
+# The codec is oblivious to the pairing; the importer owns the convention.
+#
+# f64 values are i64 IEEE-754 bit patterns (the sovereign convention). The
+# compiler ships f64_add/sub/mul/div/abs/round/from/to/lt/gt/eq as builtins.
+
+enum TulaDtypeCfg {
+    TULA_NF4_BLOCK = 64;    # default NF4 block size (QLoRA convention)
+}
+
+# ---------------------------------------------------------------------------
+# ternary {-1,0,+1} <-> 2-bit packed codes (mirrors tentib's tpack2/tunpack2)
+# codes: 0 -> 0, +1 -> 1, -1 -> 2; 4 codes per byte, LSB-first.
+# `src`/`dst` (unpacked) are i64[n] trit slots (rosnet layout, tentib-compatible);
+# the packed form is a byte buffer of tula_ternary_bytes(n) bytes.
+# ---------------------------------------------------------------------------
+
+# Packed byte length for n ternary trits.
+fn tula_ternary_bytes(n): i64 {
+    return (n + 3) / 4;
+}
+
+# Pack n trits (i64 slots in {-1,0,+1}) from `src` into `dst`. Returns byte len.
+fn tula_ternary_pack(src, n, dst): i64 {
+    var nbytes = (n + 3) / 4;
+    var b = 0;
+    while (b < nbytes) {
+        store8(dst + b, 0);
+        b = b + 1;
+    }
+    var i = 0;
+    while (i < n) {
+        var w = load64(src + i * 8);
+        var code = 0;
+        if (w == 1) { code = 1; }
+        if (w == (0 - 1)) { code = 2; }
+        var bi = i / 4;
+        var sh = (i % 4) * 2;
+        store8(dst + bi, load8(dst + bi) | (code << sh));
+        i = i + 1;
+    }
+    return nbytes;
+}
+
+# Random-access a single trit (no full unpack). Returns -1 / 0 / +1.
+fn tula_ternary_get(packed, i): i64 {
+    var code = (load8(packed + i / 4) >> ((i % 4) * 2)) & 3;
+    if (code == 1) { return 1; }
+    if (code == 2) { return 0 - 1; }
+    return 0;
+}
+
+# Unpack n trits from `src` into `dst` (i64 slots). Returns n.
+fn tula_ternary_unpack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, tula_ternary_get(src, i));
+        i = i + 1;
+    }
+    return n;
+}
+
+# ---------------------------------------------------------------------------
+# int8 per-tensor absmax quantization
+#   scale = absmax / 127 ; q_i = clamp(round(x_i / scale), -127, +127)
+# `src`/`dst` (dequantized) are f64[n] i64-bit slots; the packed form is int8[n]
+# bytes (two's-complement). Store the returned scale as the sidecar.
+# ---------------------------------------------------------------------------
+
+# Quantize f64[n] `src` into int8[n] `dst`. Returns the scale as f64 bits.
+fn tula_int8_quant(src, n, dst): i64 {
+    var amax = f64_from(0);
+    var i = 0;
+    while (i < n) {
+        var a = f64_abs(load64(src + i * 8));
+        if (f64_gt(a, amax) == 1) { amax = a; }
+        i = i + 1;
+    }
+    var scale = f64_from(0);
+    var has = f64_gt(amax, f64_from(0));
+    if (has == 1) { scale = f64_div(amax, f64_from(127)); }
+    i = 0;
+    while (i < n) {
+        var q = 0;
+        if (has == 1) {
+            q = f64_to(f64_round(f64_div(load64(src + i * 8), scale)));
+            if (q > 127) { q = 127; }
+            if (q < (0 - 127)) { q = 0 - 127; }
+        }
+        store8(dst + i, q & 0xFF);
+        i = i + 1;
+    }
+    return scale;
+}
+
+# Dequantize int8[n] `src` into f64[n] `dst` using `scale` (f64 bits). Returns 0.
+fn tula_int8_dequant(src, n, scale, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var b = load8(src + i);
+        if (b >= 128) { b = b - 256; }   # sign-extend the int8 byte
+        store64(dst + i * 8, f64_mul(f64_from(b), scale));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# NF4 — 4-bit blockwise NormalFloat (QLoRA). Each block carries a per-block
+# absmax scale; values normalize to [-1,1], snap to the 16-entry NF4 codebook.
+# `scales` is f64[n_blocks] (i64-bit slots) — store it as the "<name>.scale"
+# sidecar. `nibbles` is a byte buffer of tula_nf4_bytes(n) bytes (2 codes/byte).
+# Double-quant is free: int8-quantize the `scales` tensor via tula_int8_quant
+# (ADR 0002).
+# ---------------------------------------------------------------------------
+
+# The NF4 codebook: the 16 NormalFloat4 quantiles (bitsandbytes/QLoRA standard),
+# as f64 IEEE-754 bit patterns. Code i in [0,15] -> level in [-1, +1].
+fn tula_nf4_level(i): i64 {
+    if (i == 0)  { return 0xBFF0000000000000; }   # -1.0
+    if (i == 1)  { return 0xBFE6473620000000; }   # -0.6961928009986877
+    if (i == 2)  { return 0xBFE0CD6600000000; }   # -0.5250730514526367
+    if (i == 3)  { return 0xBFD9465400000000; }   # -0.39491748809814453
+    if (i == 4)  { return 0xBFD23449A0000000; }   # -0.28444138169288635
+    if (i == 5)  { return 0xBFC7A6A7E0000000; }   # -0.18477343022823334
+    if (i == 6)  { return 0xBFB74F0E20000000; }   # -0.09105003625154495
+    if (i == 7)  { return 0x0000000000000000; }   #  0.0
+    if (i == 8)  { return 0x3FB45F5FE0000000; }   #  0.07958029955625534
+    if (i == 9)  { return 0x3FC4995C60000000; }   #  0.16093020141124725
+    if (i == 10) { return 0x3FCF809BA0000000; }   #  0.24611230194568634
+    if (i == 11) { return 0x3FD5A06740000000; }   #  0.33791524171829224
+    if (i == 12) { return 0x3FDC349700000000; }   #  0.44070982933044434
+    if (i == 13) { return 0x3FE200F560000000; }   #  0.5626170039176941
+    if (i == 14) { return 0x3FE7227660000000; }   #  0.7229568362236023
+    if (i == 15) { return 0x3FF0000000000000; }   #  1.0
+    return 0;
+}
+
+# Number of blocks for n elements at a given block size.
+fn tula_nf4_blocks(n, block): i64 {
+    return (n + block - 1) / block;
+}
+
+# Packed nibble byte length for n elements (2 codes per byte).
+fn tula_nf4_bytes(n): i64 {
+    return (n + 1) / 2;
+}
+
+# Nearest NF4 codebook index for a normalized value xn in [-1,1]. Returns 0..15.
+fn tula_nf4_nearest(xn): i64 {
+    var best = 0;
+    var bestd = f64_abs(f64_sub(xn, tula_nf4_level(0)));
+    var j = 1;
+    while (j < 16) {
+        var d = f64_abs(f64_sub(xn, tula_nf4_level(j)));
+        if (f64_lt(d, bestd) == 1) {
+            bestd = d;
+            best = j;
+        }
+        j = j + 1;
+    }
+    return best;
+}
+
+# Random-access a single 4-bit code (0..15) from a packed nibble buffer.
+fn tula_nf4_get(nibbles, i): i64 {
+    var byi = i / 2;
+    if ((i & 1) == 0) { return load8(nibbles + byi) & 0xF; }
+    return (load8(nibbles + byi) >> 4) & 0xF;
+}
+
+# Pack f64[n] `src` into 4-bit NF4 codes (`nibbles`) + per-block absmax scales
+# (`scales`, f64[n_blocks]). Returns the block count.
+fn tula_nf4_pack(src, n, block, scales, nibbles): i64 {
+    var nbytes = (n + 1) / 2;
+    var z = 0;
+    while (z < nbytes) {
+        store8(nibbles + z, 0);
+        z = z + 1;
+    }
+    var nblocks = (n + block - 1) / block;
+    var bi = 0;
+    while (bi < nblocks) {
+        var start = bi * block;
+        var end = start + block;
+        if (end > n) { end = n; }
+        var amax = f64_from(0);
+        var i = start;
+        while (i < end) {
+            var a = f64_abs(load64(src + i * 8));
+            if (f64_gt(a, amax) == 1) { amax = a; }
+            i = i + 1;
+        }
+        store64(scales + bi * 8, amax);
+        var nz = f64_gt(amax, f64_from(0));
+        i = start;
+        while (i < end) {
+            var code = 7;   # the exact 0.0 codebook entry (zero-block default)
+            if (nz == 1) {
+                code = tula_nf4_nearest(f64_div(load64(src + i * 8), amax));
+            }
+            var byi = i / 2;
+            if ((i & 1) == 0) {
+                store8(nibbles + byi, load8(nibbles + byi) | code);
+            } else {
+                store8(nibbles + byi, load8(nibbles + byi) | (code << 4));
+            }
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    return nblocks;
+}
+
+# Unpack NF4 `nibbles` + `scales` back into f64[n] `dst`. Returns n.
+fn tula_nf4_unpack(nibbles, scales, n, block, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var amax = load64(scales + (i / block) * 8);
+        var code = tula_nf4_get(nibbles, i);
+        store64(dst + i * 8, f64_mul(tula_nf4_level(code), amax));
+        i = i + 1;
+    }
+    return n;
+}
+
+# ---------------------------------------------------------------------------
+# payload-length contract (M5 hardening) — the unpack helpers above are pure,
+# caller-driven transforms: they read as many bytes as the element count `n`
+# implies. When `n` is derived from an UNTRUSTED tensor shape, a lying file whose
+# stored `data_len` is smaller than the shape implies could drive an over-read.
+# `tula_validate` bounds `data_off+data_len` and `ndim`, but NOT dim VALUES — so a
+# foreign-checkpoint consumer must cross-check shape against data_len before
+# unpacking. These helpers make that check a one-liner.
+# ---------------------------------------------------------------------------
+
+# Expected packed byte length for `nelems` elements of `dtype` (the payload the
+# unpack helper will read). NF4/ternary return the CODE bytes only — the per-block
+# / per-tensor scale rides in the "<name>.scale" sidecar (ADR 0002). Returns -1
+# for an unknown dtype (no size contract to enforce).
+fn tula_packed_len(dtype, nelems): i64 {
+    if (dtype == TULA_DT_F64)     { return nelems * 8; }
+    if (dtype == TULA_DT_INT8)    { return nelems; }
+    if (dtype == TULA_DT_TERNARY) { return tula_ternary_bytes(nelems); }
+    if (dtype == TULA_DT_NF4)     { return tula_nf4_bytes(nelems); }
+    return 0 - 1;
+}
+
+# 1 if entry `e`'s stored data_len is large enough to unpack its dtype+shape
+# without over-reading, else 0. Overflow-safe: a shape whose element count would
+# exceed TULA_READ_MAX_BYTES (or a negative dim) returns 0. An unknown dtype has
+# no contract, so returns 1. Run this on a foreign entry BEFORE any unpack.
+fn tula_entry_payload_ok(e): i64 {
+    var nd = tula_entry_ndim(e);
+    if (nd == 0) { return 1; }   # no shape contract for a 0-dim entry
+    var n = 1;
+    var k = 0;
+    while (k < nd) {
+        var d = tula_entry_dim(e, k);
+        if (d < 0) { return 0; }
+        if (d == 0) { return 1; }                      # empty tensor: any data_len ok
+        if (n > TULA_READ_MAX_BYTES / d) { return 0; }  # product would overflow the cap
+        n = n * d;
+        k = k + 1;
+    }
+    var need = tula_packed_len(tula_entry_dtype(e), n);
+    if (need < 0) { return 1; }
+    if (tula_entry_data_len(e) < need) { return 0; }
+    return 1;
+}

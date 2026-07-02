@@ -1,0 +1,162 @@
+# programs/bench.cyr — tula throughput bench (M4): write / read (heap) / mmap on a
+# large synthetic file (100s of tensors, ~100 MB). Reports min latency + MB/s per
+# op over a few rounds. Numbers are transcribed into docs/benchmarks.md.
+#
+#   cyrius build programs/bench.cyr build/tula_bench && ./build/tula_bench
+
+include "src/lib.cyr"
+
+enum BenchCfg {
+    BN_TENSORS = 200;        # tensor count (<= TULA_BUILDER_MAX)
+    BN_TSIZE   = 524288;     # 512 KiB per tensor -> ~100 MB payload
+    BN_ROUNDS  = 3;          # rounds per op; report the min
+    BN_PAGE    = 4096;
+}
+
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+# "<label> <ms> ms  <mbps> MB/s\n"
+fn report(label, bytes, ns): i64 {
+    sput(label);
+    fmt_int(ns / 1000000);
+    sput(" ms  ");
+    var mb = bytes / 1000000;
+    var ms = ns / 1000000;
+    var mbps = 0;
+    if (ms > 0) { mbps = mb * 1000 / ms; }
+    fmt_int(mbps);
+    sput(" MB/s\n");
+    return 0;
+}
+
+# Build a ~100 MB tula buffer: BN_TENSORS f64 tensors of BN_TSIZE bytes each,
+# each seeded with a non-zero pattern (so the file isn't sparse).
+fn build_big(): i64 {
+    var b = tula_builder_new();
+    var names = alloc(BN_TENSORS * 8);
+    var i = 0;
+    while (i < BN_TENSORS) {
+        var data = alloc(BN_TSIZE);
+        # touch one word per page so the payload has real (non-zero) content
+        var p = 0;
+        while (p < BN_TSIZE) {
+            store64(data + p, 0x1000000000000000 + i);
+            p = p + BN_PAGE;
+        }
+        var shape = alloc(8);
+        store64(shape + 0, BN_TSIZE / 8);
+        # a distinct name per tensor: "t" + index packed into the name cstring
+        var nm = alloc(16);
+        store8(nm + 0, 116);            # 't'
+        store64(nm + 1, 0);
+        var v = i;
+        var k = 1;
+        if (v == 0) { store8(nm + 1, 48); store8(nm + 2, 0); }
+        else {
+            # write decimal digits
+            var digs = alloc(16);
+            var nd = 0;
+            while (v > 0) { store8(digs + nd, 48 + (v % 10)); v = v / 10; nd = nd + 1; }
+            var j = 0;
+            while (j < nd) { store8(nm + 1 + j, load8(digs + nd - 1 - j)); j = j + 1; }
+            store8(nm + 1 + nd, 0);
+        }
+        tula_builder_add(b, nm, TULA_DT_F64, shape, 1, data, BN_TSIZE);
+        i = i + 1;
+    }
+    return tula_builder_finish(b);
+}
+
+# Touch one byte per page across the whole buffer; returns the checksum (keeps the
+# reads from being optimized away and forces mmap fault-in).
+fn scan(r, total): i64 {
+    var sum = 0;
+    var off = 0;
+    while (off < total) {
+        sum = sum + load8(r + off);
+        off = off + BN_PAGE;
+    }
+    return sum;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sput("building ~100 MB synthetic tula file...\n");
+    var buf = build_big();
+    var total = tula_total_len(buf);
+    sput("  tensors : ");
+    fmt_int(tula_count(buf));
+    sput("\n  bytes   : ");
+    fmt_int(total);
+    sput("\n");
+
+    var path = "/tmp/tula_bench.tula";
+
+    # ---- write ----
+    var wmin = 0;
+    var round = 0;
+    while (round < BN_ROUNDS) {
+        var t0 = now_ns();
+        tula_write_file(path, buf, total);
+        var dt = now_ns() - t0;
+        if (round == 0) { wmin = dt; }
+        if (dt < wmin) { wmin = dt; }
+        round = round + 1;
+    }
+    report("write        : ", total, wmin);
+
+    # ---- read (heap copy) ----
+    var rmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t1 = now_ns();
+        var rr = tula_read_file(path);
+        var dt2 = now_ns() - t1;
+        if (rr == 0) { sput("read FAILED\n"); return 1; }
+        if (round == 0) { rmin = dt2; }
+        if (dt2 < rmin) { rmin = dt2; }
+        round = round + 1;
+    }
+    report("read (heap)  : ", total, rmin);
+
+    # ---- mmap open (lazy) ----
+    var omin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t2 = now_ns();
+        var rm = tula_open_mmap(path);
+        var dt3 = now_ns() - t2;
+        if (rm == 0) { sput("mmap FAILED\n"); return 1; }
+        tula_close_mmap(rm);
+        if (round == 0) { omin = dt3; }
+        if (dt3 < omin) { omin = dt3; }
+        round = round + 1;
+    }
+    report("mmap open    : ", total, omin);
+
+    # ---- mmap scan (fault-in throughput) ----
+    var smin = 0;
+    var chk = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var rm2 = tula_open_mmap(path);
+        var t3 = now_ns();
+        chk = chk + scan(rm2, total);
+        var dt4 = now_ns() - t3;
+        tula_close_mmap(rm2);
+        if (round == 0) { smin = dt4; }
+        if (dt4 < smin) { smin = dt4; }
+        round = round + 1;
+    }
+    report("mmap scan    : ", total, smin);
+    sput("checksum: ");
+    fmt_int(chk);
+    sput(" (ignore; anti-DCE)\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

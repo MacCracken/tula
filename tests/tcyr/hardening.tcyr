@@ -1,0 +1,265 @@
+# tests/tcyr/hardening.tcyr — tula reader hardening (M3): untrusted/lying/
+# truncated input must be REJECTED (a TULA_ERR_* code, tula_open -> 0), never
+# OOB-deref'd or overflowed. The suite running to completion is itself the
+# "no crash" proof. Each case rebuilds a fresh valid buffer, then mutates it.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# A valid 2-tensor buffer: "w.q" f64 [2,3] (48B) + "b0" int8 [4] (4B).
+# Layout: count@16=2, manifest_off@24=64, payload_off@32=352, payload_len@40=56,
+# sig_off@48=0, sig_len@56=0, total=408. entry0@64 (data_off@192, data_len@200,
+# ndim@120, name@64); entry1@208.
+fn build_valid(): i64 {
+    var shapeA = alloc(16);
+    store64(shapeA + 0, 2);
+    store64(shapeA + 8, 3);
+    var dataA = alloc(48);
+    var i = 0;
+    while (i < 6) { store64(dataA + i * 8, 1000 + i); i = i + 1; }
+    var shapeB = alloc(8);
+    store64(shapeB + 0, 4);
+    var dataB = alloc(4);
+    store8(dataB + 0, 10);
+    store8(dataB + 1, 20);
+    store8(dataB + 2, 30);
+    store8(dataB + 3, 40);
+    var b = tula_builder_new();
+    tula_builder_add(b, "w.q", TULA_DT_F64, shapeA, 2, dataA, 48);
+    tula_builder_add(b, "b0", TULA_DT_INT8, shapeB, 1, dataB, 4);
+    return tula_builder_finish(b);
+}
+
+# A valid signed buffer: one f64 [3] tensor. payload_off=208, payload_len=24,
+# content_len=232, sig_off@48=232, sig_len@56=64, total=296.
+fn build_valid_signed(): i64 {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, (i + 1) & 0xFF); i = i + 1; }
+    ed25519_keypair(seed, sk, pk);
+    var shape = alloc(8);
+    store64(shape + 0, 3);
+    var data = alloc(24);
+    var j = 0;
+    while (j < 3) { store64(data + j * 8, 7 + j); j = j + 1; }
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, 24);
+    return tula_builder_finish_signed(b, sk);
+}
+
+# ---- the valid buffer must pass, and open ----
+fn test_valid_baseline() {
+    var buf = build_valid();
+    var total = tula_total_len(buf);
+    assert_eq(total, 408, "valid total = 408");
+    assert_eq(tula_validate(buf, total), TULA_OK, "valid -> TULA_OK");
+    assert(tula_open(buf, total) != 0, "valid -> opens");
+    return 0;
+}
+
+# ---- header-level breaches ----
+fn test_bad_magic() {
+    var buf = build_valid();
+    store64(buf + 0, 0xDEADBEEF);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_MAGIC, "bad magic -> MAGIC");
+    assert_eq(tula_open(buf, 408), 0, "bad magic -> open 0");
+    return 0;
+}
+
+fn test_bad_version() {
+    var buf = build_valid();
+    store64(buf + 8, 999);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_VERSION, "bad version -> VERSION");
+    return 0;
+}
+
+fn test_len_below_header() {
+    var buf = build_valid();
+    assert_eq(tula_validate(buf, 32), TULA_ERR_TRUNCATED, "len<64 -> TRUNCATED");
+    assert_eq(tula_open(buf, 32), 0, "len<64 -> open 0");
+    return 0;
+}
+
+fn test_manifest_off_wrong() {
+    var buf = build_valid();
+    store64(buf + 24, 65);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_HEADER, "manifest_off!=64 -> HEADER");
+    return 0;
+}
+
+fn test_payload_off_mismatch() {
+    var buf = build_valid();
+    store64(buf + 32, 351);   # should be 64 + 2*144 = 352
+    assert_eq(tula_validate(buf, 408), TULA_ERR_HEADER, "payload_off mismatch -> HEADER");
+    return 0;
+}
+
+# ---- count caps ----
+fn test_over_count() {
+    var buf = build_valid();
+    store64(buf + 16, TULA_READ_MAX_TENSORS + 1);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_TOO_MANY, "over-count -> TOO_MANY");
+    return 0;
+}
+
+fn test_negative_count() {
+    var buf = build_valid();
+    store64(buf + 16, 0 - 1);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_TOO_MANY, "negative count -> TOO_MANY");
+    return 0;
+}
+
+# ---- payload bounds / bomb guard ----
+fn test_truncated_payload() {
+    var buf = build_valid();
+    # buffer is 408 bytes but we claim only 407 -> payload's last byte missing
+    assert_eq(tula_validate(buf, 407), TULA_ERR_TRUNCATED, "short len -> TRUNCATED");
+    assert_eq(tula_open(buf, 407), 0, "short len -> open 0");
+    return 0;
+}
+
+fn test_payload_len_negative() {
+    var buf = build_valid();
+    store64(buf + 40, 0 - 1);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_BOUNDS, "neg payload_len -> BOUNDS");
+    return 0;
+}
+
+fn test_payload_len_bomb() {
+    var buf = build_valid();
+    store64(buf + 40, TULA_READ_MAX_BYTES + 1);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_TOO_BIG, "payload_len > cap -> TOO_BIG");
+    return 0;
+}
+
+# ---- lying per-entry offsets ----
+fn test_entry_data_off_past_payload() {
+    var buf = build_valid();
+    store64(buf + 192, 1000);   # entry0 data_off; payload_len is only 56
+    assert_eq(tula_validate(buf, 408), TULA_ERR_BOUNDS, "data_off past payload -> BOUNDS");
+    return 0;
+}
+
+fn test_entry_data_len_lying() {
+    var buf = build_valid();
+    store64(buf + 200, 1000);   # entry0 data_len; way past payload
+    assert_eq(tula_validate(buf, 408), TULA_ERR_BOUNDS, "data_len past payload -> BOUNDS");
+    return 0;
+}
+
+fn test_entry_offsets_overflow() {
+    var buf = build_valid();
+    store64(buf + 192, 0x7FFFFFFFFFFFFFFF);   # near-i64-max data_off
+    store64(buf + 200, 0x7FFFFFFFFFFFFFFF);   # near-i64-max data_len
+    assert_eq(tula_validate(buf, 408), TULA_ERR_BOUNDS, "overflowing offsets -> BOUNDS, no wrap");
+    return 0;
+}
+
+# ---- ndim / name ----
+fn test_ndim_too_big() {
+    var buf = build_valid();
+    store64(buf + 120, 9);   # entry0 ndim; max is 8
+    assert_eq(tula_validate(buf, 408), TULA_ERR_NDIM, "ndim>8 -> NDIM");
+    return 0;
+}
+
+fn test_ndim_negative() {
+    var buf = build_valid();
+    store64(buf + 120, 0 - 1);
+    assert_eq(tula_validate(buf, 408), TULA_ERR_NDIM, "ndim<0 -> NDIM");
+    return 0;
+}
+
+fn test_name_not_terminated() {
+    var buf = build_valid();
+    var i = 0;
+    while (i < 48) { store8(buf + 64 + i, 0x41); i = i + 1; }   # fill entry0 name, no NUL
+    assert_eq(tula_validate(buf, 408), TULA_ERR_NAME_LONG, "name w/o NUL -> NAME_LONG");
+    return 0;
+}
+
+# ---- signature-field consistency ----
+fn test_unsigned_with_sig_off() {
+    var buf = build_valid();
+    store64(buf + 48, 8);   # unsigned (sig_len=0) but sig_off nonzero
+    assert_eq(tula_validate(buf, 408), TULA_ERR_HEADER, "unsigned w/ sig_off -> HEADER");
+    return 0;
+}
+
+fn test_signed_valid() {
+    var buf = build_valid_signed();
+    var total = tula_total_len(buf);
+    assert_eq(total, 296, "signed total = 296");
+    assert_eq(tula_validate(buf, total), TULA_OK, "signed valid -> OK");
+    return 0;
+}
+
+fn test_signed_sig_truncated() {
+    # Valid 64-byte sig_len, but the buffer ends one byte before the sig completes
+    # (len 295, sig needs [232, 296)) -> TRUNCATED, not an OOB read.
+    var buf = build_valid_signed();
+    assert_eq(tula_validate(buf, 295), TULA_ERR_TRUNCATED, "sig cut short -> TRUNCATED");
+    return 0;
+}
+
+fn test_signed_sigoff_wrong() {
+    var buf = build_valid_signed();
+    store64(buf + 48, 100);   # sig_off must equal content_len (232)
+    assert_eq(tula_validate(buf, 296), TULA_ERR_HEADER, "sig_off wrong -> HEADER");
+    return 0;
+}
+
+fn test_signed_siglen_not_64() {
+    # A non-zero sig_len other than 64 must be rejected so tula_verify's fixed
+    # 64-byte read can never OOB (only Ed25519 is defined). Rebuild len so the
+    # 32-byte claim would otherwise "fit": len = content_len + 32 = 264.
+    var buf = build_valid_signed();
+    store64(buf + 56, 32);
+    assert_eq(tula_validate(buf, 264), TULA_ERR_HEADER, "sig_len!=64 -> HEADER");
+    return 0;
+}
+
+# ---- pure garbage: must reject, never crash ----
+fn test_garbage_rejected() {
+    var buf = alloc(128);
+    var i = 0;
+    while (i < 16) { store64(buf + i * 8, 0x1122334455667788); i = i + 1; }
+    assert_eq(tula_open(buf, 128), 0, "garbage -> open 0");
+    # magic-only garbage: valid magic+version, absurd count/offsets -> rejected
+    store64(buf + 0, TULA_MAGIC);
+    store64(buf + 8, TULA_VERSION);
+    assert_eq(tula_open(buf, 128), 0, "magic-only garbage -> open 0");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_valid_baseline();
+    test_bad_magic();
+    test_bad_version();
+    test_len_below_header();
+    test_manifest_off_wrong();
+    test_payload_off_mismatch();
+    test_over_count();
+    test_negative_count();
+    test_truncated_payload();
+    test_payload_len_negative();
+    test_payload_len_bomb();
+    test_entry_data_off_past_payload();
+    test_entry_data_len_lying();
+    test_entry_offsets_overflow();
+    test_ndim_too_big();
+    test_ndim_negative();
+    test_name_not_terminated();
+    test_unsigned_with_sig_off();
+    test_signed_valid();
+    test_signed_sig_truncated();
+    test_signed_sigoff_wrong();
+    test_signed_siglen_not_64();
+    test_garbage_rejected();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

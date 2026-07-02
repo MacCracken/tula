@@ -14,6 +14,10 @@ enum TulaErrCode {
     TULA_ERR_OOM       = 6;    # allocation failed
     TULA_ERR_UNSIGNED  = 7;    # verify requested but file carries no signature
     TULA_ERR_SIG       = 8;    # sigil signature verification failed (M0b)
+    TULA_ERR_BOUNDS    = 9;    # an offset/length field escapes the buffer / overflows (M3)
+    TULA_ERR_NDIM      = 10;   # tensor ndim outside [0, TULA_MAXDIM] (M3)
+    TULA_ERR_HEADER    = 11;   # header structural invariant violated (offsets/sig) (M3)
+    TULA_ERR_TOO_BIG   = 12;   # declared size exceeds a resource cap (bomb guard) (M3)
     TULA_ERR_OTHER     = 99;   # catch-all
 }
 
@@ -28,6 +32,10 @@ fn tula_err_name(code): i64 {
     if (code == TULA_ERR_OOM)       { return "out of memory"; }
     if (code == TULA_ERR_UNSIGNED)  { return "file is unsigned"; }
     if (code == TULA_ERR_SIG)       { return "signature verification failed"; }
+    if (code == TULA_ERR_BOUNDS)    { return "offset/length out of bounds"; }
+    if (code == TULA_ERR_NDIM)      { return "tensor ndim out of range"; }
+    if (code == TULA_ERR_HEADER)    { return "malformed header"; }
+    if (code == TULA_ERR_TOO_BIG)   { return "declared size exceeds cap"; }
     if (code == TULA_ERR_OTHER)     { return "other error"; }
     return "unknown error";
 }

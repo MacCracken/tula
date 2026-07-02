@@ -1,0 +1,245 @@
+# programs/fuzz.cyr — tula reader fuzz harness (M4). Feeds mutated + random bytes
+# through tula_open, every accessor, and tula_verify, asserting the M3 hardening
+# invariants hold under a flood of hostile input:
+#
+#   1. no crash (the process running to completion is the proof), and
+#   2. whenever tula_open succeeds, the buffer is genuinely valid — re-validation
+#      agrees, and every entry's payload range stays inside [buf, buf+len).
+#
+# Deterministic LCG PRNG (fixed seed) -> fully reproducible. Cheap paths run well
+# past 10^6 iterations; the expensive signature-verify path runs at lower count.
+#
+#   cyrius build programs/fuzz.cyr build/tula_fuzz && ./build/tula_fuzz
+
+include "src/lib.cyr"
+
+enum FuzzCfg {
+    FZ_MUT_ITERS    = 1000000;   # structured mutation of a valid buffer
+    FZ_RAND_ITERS   = 1000000;   # pure random bytes
+    FZ_SIGNED_ITERS = 3000;      # mutate a signed buffer + tula_verify (expensive)
+    FZ_MAXBUF       = 4096;
+}
+
+# ---- output helpers -------------------------------------------------------
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+fn kv(label, n): i64 {
+    sput(label);
+    fmt_int(n);
+    sput("\n");
+    return 0;
+}
+
+# ---- LCG PRNG (Knuth/PCG constants; i64 multiply wraps mod 2^64) -----------
+fn rng_next(s): i64 {
+    var x = load64(s);
+    x = x * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    return x;
+}
+fn rng_below(s, n): i64 {
+    if (n <= 0) { return 0; }
+    var v = rng_next(s) & 0x7FFFFFFFFFFFFFFF;
+    return v % n;
+}
+
+# ---- a valid unsigned buffer (2 tensors), copied into scratch each iter ----
+fn build_valid(): i64 {
+    var shapeA = alloc(16);
+    store64(shapeA + 0, 2);
+    store64(shapeA + 8, 3);
+    var dataA = alloc(48);
+    var i = 0;
+    while (i < 6) { store64(dataA + i * 8, 1000 + i); i = i + 1; }
+    var shapeB = alloc(8);
+    store64(shapeB + 0, 4);
+    var dataB = alloc(4);
+    store8(dataB + 0, 10);
+    store8(dataB + 1, 20);
+    store8(dataB + 2, 30);
+    store8(dataB + 3, 40);
+    var b = tula_builder_new();
+    tula_builder_add(b, "w.q", TULA_DT_F64, shapeA, 2, dataA, 48);
+    tula_builder_add(b, "b0", TULA_DT_INT8, shapeB, 1, dataB, 4);
+    return tula_builder_finish(b);
+}
+
+fn build_signed(sk): i64 {
+    var shape = alloc(8);
+    store64(shape + 0, 3);
+    var data = alloc(24);
+    var j = 0;
+    while (j < 3) { store64(data + j * 8, 7 + j); j = j + 1; }
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, 24);
+    return tula_builder_finish_signed(b, sk);
+}
+
+fn memcpy_n(dst, src, n): i64 {
+    var i = 0;
+    while (i < n) { store8(dst + i, load8(src + i)); i = i + 1; }
+    return 0;
+}
+
+# Apply 1..6 random mutations to `scratch` over its first `len0` bytes.
+fn mutate(s, scratch, len0): i64 {
+    var nmut = 1 + rng_below(s, 6);
+    var k = 0;
+    while (k < nmut) {
+        var kind = rng_below(s, 3);
+        if (kind == 0) {
+            store8(scratch + rng_below(s, len0), rng_below(s, 256));
+        }
+        if (kind == 1) {
+            store64(scratch + rng_below(s, len0 / 8) * 8, rng_next(s));
+        }
+        if (kind == 2) {
+            var w = rng_below(s, len0 / 8) * 8;
+            var pick = rng_below(s, 5);
+            var val = 0;
+            if (pick == 1) { val = 0 - 1; }
+            if (pick == 2) { val = 0x7FFFFFFFFFFFFFFF; }
+            if (pick == 3) { val = len0; }
+            if (pick == 4) { val = 0x1000000000000; }
+            store64(scratch + w, val);
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# When tula_open succeeds the buffer MUST be genuinely valid: re-validation
+# agrees, and every accessor stays inside [r, r+len). Returns 1 if sound, else 0.
+fn check_opened(r, len): i64 {
+    var ok = 1;
+    if (tula_validate(r, len) != TULA_OK) { ok = 0; }
+    var c = tula_count(r);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        if (e + TULA_ENTRY_SIZE > r + len) { ok = 0; }
+        var dlen = tula_entry_data_len(e);
+        var dptr = tula_entry_data(r, e);
+        if (dptr < r) { ok = 0; }
+        if (dptr + dlen > r + len) { ok = 0; }
+        # touch metadata + payload edges — must be in-bounds, no crash
+        var dt = tula_entry_dtype(e);
+        var nd = tula_entry_ndim(e);
+        if (nd > 0) { var d0 = tula_entry_dim(e, 0); }
+        if (dlen > 0) {
+            var b0 = load8(dptr);
+            var b1 = load8(dptr + dlen - 1);
+        }
+        i = i + 1;
+    }
+    # exercise find() with a name that may or may not exist
+    var hit = tula_find(r, "w.q");
+    var sig = tula_is_signed(r);
+    return ok;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var s = alloc(8);
+    store64(s, 0x243F6A8885A308D3);   # fixed seed (digits of pi) -> reproducible
+
+    var st = alloc(64);
+    var z = 0;
+    while (z < 8) { store64(st + z * 8, 0); z = z + 1; }
+    # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad
+
+    var buf0 = build_valid();
+    var len0 = tula_total_len(buf0);
+    var scratch = alloc(FZ_MAXBUF);
+
+    var t0 = now_ns();
+
+    # ---- phase A: structured mutation of the valid buffer ----
+    var a = 0;
+    while (a < FZ_MUT_ITERS) {
+        memcpy_n(scratch, buf0, len0);
+        mutate(s, scratch, len0);
+        var testlen = rng_below(s, len0 + 32);
+        var r = tula_open(scratch, testlen);
+        if (r != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(r, testlen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        a = a + 1;
+    }
+
+    # ---- phase B: pure random bytes (occasionally with a real magic prefix) ----
+    var bph = 0;
+    while (bph < FZ_RAND_ITERS) {
+        var blen = rng_below(s, 513);
+        var w = 0;
+        while (w * 8 < blen) { store64(scratch + w * 8, rng_next(s)); w = w + 1; }
+        if (rng_below(s, 4) == 0) {
+            store64(scratch + 0, TULA_MAGIC);
+            store64(scratch + 8, TULA_VERSION);
+        }
+        var r2 = tula_open(scratch, blen);
+        if (r2 != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(r2, blen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        bph = bph + 1;
+    }
+
+    # ---- phase D: mutate a SIGNED buffer + tula_verify (bounded count) ----
+    var sk = alloc(64);
+    var pk = alloc(32);
+    var seed = alloc(32);
+    var q = 0;
+    while (q < 32) { store8(seed + q, (q + 1) & 0xFF); q = q + 1; }
+    ed25519_keypair(seed, sk, pk);
+    var bufs = build_signed(sk);
+    var slen0 = tula_total_len(bufs);
+
+    var d = 0;
+    while (d < FZ_SIGNED_ITERS) {
+        memcpy_n(scratch, bufs, slen0);
+        # mutate less aggressively so open() sometimes still succeeds
+        if (rng_below(s, 2) == 0) { mutate(s, scratch, slen0); }
+        var tl = slen0;
+        if (rng_below(s, 3) == 0) { tl = rng_below(s, slen0 + 8); }
+        var r3 = tula_open(scratch, tl);
+        if (r3 != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(r3, tl) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            var v = tula_verify(r3, pk);
+            if (v == TULA_SIG_UNSIGNED) { store64(st + 24, load64(st + 24) + 1); }
+            if (v == TULA_SIG_OK)       { store64(st + 32, load64(st + 32) + 1); }
+            if (v == TULA_SIG_BAD)      { store64(st + 40, load64(st + 40) + 1); }
+            if (v < 0) { store64(st + 16, load64(st + 16) + 1); }
+            if (v > 2) { store64(st + 16, load64(st + 16) + 1); }
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        d = d + 1;
+    }
+
+    var t1 = now_ns();
+
+    sput("tula fuzz — reader hardening (M3) under hostile input\n");
+    kv("  iterations         : ", load64(st + 0));
+    kv("  opened (accepted)  : ", load64(st + 8));
+    kv("  verify UNSIGNED    : ", load64(st + 24));
+    kv("  verify OK          : ", load64(st + 32));
+    kv("  verify BAD         : ", load64(st + 40));
+    kv("  elapsed ms         : ", (t1 - t0) / 1000000);
+    var fails = load64(st + 16);
+    kv("  invariant failures : ", fails);
+    if (fails == 0) {
+        sput("RESULT: PASS (no crash, every accepted buffer was sound)\n");
+        return 0;
+    }
+    sput("RESULT: FAIL (invariant breach)\n");
+    return 1;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

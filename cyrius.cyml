@@ -23,6 +23,7 @@ modules = [
     "src/format.cyr",
     "src/sign.cyr",
     "src/fileio.cyr",
+    "src/dtype.cyr",
 ]
 
 [deps]

@@ -32,22 +32,35 @@ All fields are i64-aligned little-endian words. The header reserves
 
 ## Status
 
-**0.1.0 released** (M0 + M0b: format + round-trip + Ed25519 signed header via
-sigil). **`[Unreleased]` adds M1 — file I/O**: `tula_write_file` /
-`tula_read_file` (heap) / `tula_open_mmap` (zero-copy) / `tula_close_mmap`; tula
-files are self-describing so reads need no `stat()`. **46/46** assertions across 3
-suites (round-trip, sign, file I/O). Next: M2 (ternary/nf4 payload helpers) — see
-[`docs/development/roadmap.md`](docs/development/roadmap.md).
+**0.1.0 released** (M0 + M0b: format + round-trip + Ed25519 signed header). The
+`[Unreleased]` line is **feature-complete for v1.0** and awaiting the maintainer's
+cut:
 
-Deps: stdlib + **sigil** (Ed25519). Cyrius pin **6.3.27**. CI + release workflows
-in place. VERSION stays 0.1.0 until the next cut.
+- **M1** file I/O — `tula_write_file` / `tula_read_file` (heap) / `tula_open_mmap`
+  (zero-copy) / `tula_close_mmap`; self-describing (no `stat()`).
+- **M2** dtype payload helpers — ternary / int8 / NF4 pack/unpack; scales ride in
+  a `"<name>.scale"` sidecar tensor (ADR 0002 — no format-version bump).
+- **M3** reader hardening — `tula_validate` + a strict `tula_open` reject
+  untrusted/lying/truncated input (overflow-safe, resource-capped).
+- **M4** fuzz (2M+ iters clean) + bench (`docs/benchmarks.md`).
+- **M5** security audit (`docs/audit/`, PASS) + `SECURITY.md`.
+- **v1.0 prep** — `docs/api.md` (frozen surface) + `STABILITY.md` +
+  `examples/consumer.cyr` (end-to-end, CI gate).
+
+**105/105** assertions across 5 suites (round-trip · sign · file-io · dtype ·
+hardening). Deps: stdlib + **sigil** (Ed25519). Cyrius pin **6.3.27**. CI +
+release workflows in place. VERSION stays 0.1.0 until the maintainer's cut. See
+[`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test
 
 ```sh
 make build    # link-check the library via programs/smoke.cyr
-make test     # run tests/tcyr/*.tcyr (M0 round-trip)
+make test     # run tests/tcyr/*.tcyr (5 suites)
 make dist     # regenerate dist/tula.cyr for consumers
+make example  # build + run the end-to-end consumer (examples/consumer.cyr)
+make fuzz     # reader fuzz harness (>10^6 iters)
+make bench    # write/read/mmap throughput -> docs/benchmarks.md
 ```
 
 ## Consumers (planned)

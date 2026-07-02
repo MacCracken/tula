@@ -33,7 +33,7 @@ test: check-lib-wiring
 .PHONY: lint
 lint:
 	@fail=0; \
-	for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do \
+	for f in src/*.cyr programs/*.cyr examples/*.cyr tests/tcyr/*.tcyr; do \
 		out=$$($(CYRIUS) lint $$f 2>&1); echo "$$out"; \
 		echo "$$out" | grep -qE '^\s*warn ' && fail=1; \
 	done; \
@@ -42,7 +42,7 @@ lint:
 .PHONY: fmt-check
 fmt-check:
 	@fail=0; \
-	for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do \
+	for f in src/*.cyr programs/*.cyr examples/*.cyr tests/tcyr/*.tcyr; do \
 		if ! $(CYRIUS) fmt $$f --check > /dev/null 2>&1; then \
 			echo "needs fmt: $$f"; fail=1; \
 		fi; \
@@ -52,6 +52,24 @@ fmt-check:
 .PHONY: vet
 vet:
 	$(CYRIUS) vet programs/smoke.cyr
+
+.PHONY: fuzz
+fuzz: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build programs/fuzz.cyr build/tula_fuzz
+	./build/tula_fuzz
+
+.PHONY: bench
+bench: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build programs/bench.cyr build/tula_bench
+	./build/tula_bench
+
+.PHONY: example
+example: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build examples/consumer.cyr build/tula_consumer
+	./build/tula_consumer
 
 .PHONY: dist
 dist:

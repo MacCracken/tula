@@ -1,0 +1,261 @@
+# tests/tcyr/dtype.tcyr — tula dtype payload helpers (M2): ternary / int8 / nf4
+# pack↔unpack round-trips + the sidecar-scale storage convention (ADR 0002).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# |a - b| < tol  (strict; f64 bit-pattern operands)
+fn fclose(a, b, tol): i64 {
+    return f64_lt(f64_abs(f64_sub(a, b)), tol);
+}
+
+# ================================================================
+# ternary: {-1,0,+1} -> 2-bit packed -> back, exact.
+# ================================================================
+fn test_ternary_roundtrip() {
+    var n = 10;
+    var src = alloc(n * 8);
+    # a varied trit pattern spanning all three symbols + byte boundaries
+    var pat = alloc(n * 8);
+    store64(pat + 0 * 8, 0 - 1);
+    store64(pat + 1 * 8, 0);
+    store64(pat + 2 * 8, 1);
+    store64(pat + 3 * 8, 1);
+    store64(pat + 4 * 8, 0 - 1);
+    store64(pat + 5 * 8, 0);
+    store64(pat + 6 * 8, 0);
+    store64(pat + 7 * 8, 1);
+    store64(pat + 8 * 8, 0 - 1);
+    store64(pat + 9 * 8, 1);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, load64(pat + i * 8)); i = i + 1; }
+
+    var packed = alloc(tula_ternary_bytes(n));
+    assert_eq(tula_ternary_pack(src, n, packed), 3, "ternary packed bytes = ceil(10/4)=3");
+
+    var out = alloc(n * 8);
+    tula_ternary_unpack(packed, n, out);
+    var ok = 1;
+    i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != load64(pat + i * 8)) { ok = 0; }
+        # random-access accessor must agree with the bulk unpack
+        if (tula_ternary_get(packed, i) != load64(pat + i * 8)) { ok = 0; }
+        i = i + 1;
+    }
+    assert(ok, "ternary pack->unpack exact + get() agrees");
+    return 0;
+}
+
+# ================================================================
+# int8: absmax quant -> dequant, within one quantum; signed values survive.
+# ================================================================
+fn test_int8_roundtrip() {
+    var n = 5;
+    var src = alloc(n * 8);
+    store64(src + 0 * 8, f64_from(10));
+    store64(src + 1 * 8, f64_from(0 - 3));
+    store64(src + 2 * 8, f64_from(7));
+    store64(src + 3 * 8, f64_from(0 - 10));
+    store64(src + 4 * 8, f64_from(5));
+
+    var q = alloc(n);
+    var scale = tula_int8_quant(src, n, q);
+    assert(f64_gt(scale, f64_from(0)) == 1, "int8 scale positive");
+    # the absmax element (-10) must map to the -127 rail (two's-complement 0x81)
+    assert_eq(load8(q + 3) & 0xFF, 129, "int8 absmax element -> -127 (0x81)");
+
+    var out = alloc(n * 8);
+    tula_int8_dequant(q, n, scale, out);
+    # dequant error is bounded by one quantum (= scale)
+    var tol = f64_mul(scale, f64_from(2));
+    var ok = 1;
+    var i = 0;
+    while (i < n) {
+        if (fclose(load64(out + i * 8), load64(src + i * 8), tol) != 1) { ok = 0; }
+        i = i + 1;
+    }
+    assert(ok, "int8 dequant within one quantum (signs preserved)");
+    return 0;
+}
+
+# ================================================================
+# nf4: blockwise absmax + NF4 codebook, quant error bounded by the max half-gap
+# (~0.152 * per-block absmax). Two blocks with distinct scales.
+# ================================================================
+fn test_nf4_roundtrip() {
+    var n = 8;
+    var block = 4;
+    var src = alloc(n * 8);
+    store64(src + 0 * 8, f64_from(3));
+    store64(src + 1 * 8, f64_from(0 - 1));
+    store64(src + 2 * 8, f64_from(0));
+    store64(src + 3 * 8, f64_from(2));
+    store64(src + 4 * 8, f64_from(0 - 8));
+    store64(src + 5 * 8, f64_from(4));
+    store64(src + 6 * 8, f64_from(0 - 2));
+    store64(src + 7 * 8, f64_from(1));
+
+    var nblocks = tula_nf4_blocks(n, block);
+    assert_eq(nblocks, 2, "nf4 blocks = ceil(8/4)=2");
+    var scales = alloc(nblocks * 8);
+    var nib = alloc(tula_nf4_bytes(n));
+    assert_eq(tula_nf4_pack(src, n, block, scales, nib), 2, "nf4 pack returns block count");
+    # per-block absmax recorded in scales
+    assert_eq(scales + 0, scales + 0, "scales written");
+    assert(f64_eq(load64(scales + 0 * 8), f64_from(3)) == 1, "block0 absmax = 3");
+    assert(f64_eq(load64(scales + 1 * 8), f64_from(8)) == 1, "block1 absmax = 8");
+
+    var out = alloc(n * 8);
+    tula_nf4_unpack(nib, scales, n, block, out);
+    # the absmax elements map to a codebook endpoint exactly (error 0)
+    var ok = 1;
+    var i = 0;
+    while (i < n) {
+        var amax = load64(scales + (i / block) * 8);
+        # tolerance = 0.2 * absmax  (> max half-gap 0.152)
+        var tol = f64_mul(f64_div(f64_from(2), f64_from(10)), amax);
+        if (fclose(load64(out + i * 8), load64(src + i * 8), tol) != 1) { ok = 0; }
+        i = i + 1;
+    }
+    assert(ok, "nf4 dequant within max half-gap * absmax");
+    return 0;
+}
+
+fn test_nf4_zero_block() {
+    var n = 4;
+    var block = 4;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, f64_from(0)); i = i + 1; }
+    var scales = alloc(8);
+    var nib = alloc(tula_nf4_bytes(n));
+    tula_nf4_pack(src, n, block, scales, nib);
+    assert(f64_eq(load64(scales), f64_from(0)) == 1, "zero block -> scale 0");
+    var out = alloc(n * 8);
+    tula_nf4_unpack(nib, scales, n, block, out);
+    var ok = 1;
+    i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != 0) { ok = 0; }   # 0.0 bit pattern
+        i = i + 1;
+    }
+    assert(ok, "zero block -> all zeros, no div-by-zero");
+    return 0;
+}
+
+# ================================================================
+# Acceptance: full build->write->read of a ternary tensor + its scale sidecar.
+# `w` (dtype TERNARY, logical shape [6], data = packed trits) is paired with
+# `w.scale` (dtype F64, shape [1], gamma) — the ADR 0002 convention.
+# ================================================================
+fn test_ternary_file_with_scale() {
+    var n = 6;
+    var trits = alloc(n * 8);
+    store64(trits + 0 * 8, 1);
+    store64(trits + 1 * 8, 0 - 1);
+    store64(trits + 2 * 8, 0);
+    store64(trits + 3 * 8, 1);
+    store64(trits + 4 * 8, 0);
+    store64(trits + 5 * 8, 0 - 1);
+
+    var packed = alloc(tula_ternary_bytes(n));
+    var plen = tula_ternary_pack(trits, n, packed);
+
+    # gamma = 3/4 = 0.75 (a representative per-tensor scale)
+    var gamma = f64_div(f64_from(3), f64_from(4));
+    var gbuf = alloc(8);
+    store64(gbuf, gamma);
+
+    var shapeW = alloc(8);
+    store64(shapeW, n);
+    var shapeS = alloc(8);
+    store64(shapeS, 1);
+
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_TERNARY, shapeW, 1, packed, plen);
+    tula_builder_add(b, "w.scale", TULA_DT_F64, shapeS, 1, gbuf, 8);
+    var buf = tula_builder_finish(b);
+    var total = tula_total_len(buf);
+
+    var path = "/tmp/tula_m2_ternary.tula";
+    assert_eq(tula_write_file(path, buf, total), total, "wrote ternary + scale");
+    var r = tula_read_file(path);
+    assert(r != 0, "reopen ternary file");
+
+    var ew = tula_find(r, "w");
+    var es = tula_find(r, "w.scale");
+    assert(ew != 0, "found w");
+    assert(es != 0, "found w.scale");
+    assert_eq(tula_entry_dtype(ew), TULA_DT_TERNARY, "w is ternary");
+    assert_eq(tula_entry_dim(ew, 0), n, "w logical shape = 6");
+
+    # unpack trits from the file payload; recover gamma from the sidecar
+    var got = alloc(n * 8);
+    tula_ternary_unpack(tula_entry_data(r, ew), n, got);
+    var g2 = load64(tula_entry_data(r, es));
+    assert(f64_eq(g2, gamma) == 1, "gamma survives sidecar round-trip");
+
+    var ok = 1;
+    var i = 0;
+    while (i < n) {
+        if (load64(got + i * 8) != load64(trits + i * 8)) { ok = 0; }
+        # dequantized weight = trit * gamma
+        var w = f64_mul(f64_from(load64(got + i * 8)), g2);
+        var expect = f64_mul(f64_from(load64(trits + i * 8)), gamma);
+        if (f64_eq(w, expect) != 1) { ok = 0; }
+        i = i + 1;
+    }
+    assert(ok, "ternary trits + dequant reconstruct from file");
+    return 0;
+}
+
+# ================================================================
+# payload-length contract (M5): tula_packed_len + tula_entry_payload_ok guard a
+# foreign consumer against a shape that lies about how many bytes are stored.
+# ================================================================
+fn test_payload_ok() {
+    assert_eq(tula_packed_len(TULA_DT_F64, 3), 24, "packed_len f64[3] = 24");
+    assert_eq(tula_packed_len(TULA_DT_INT8, 5), 5, "packed_len int8[5] = 5");
+    assert_eq(tula_packed_len(TULA_DT_TERNARY, 6), 2, "packed_len ternary[6] = 2");
+    assert_eq(tula_packed_len(TULA_DT_NF4, 10), 5, "packed_len nf4[10] = 5");
+    assert_eq(tula_packed_len(999, 4), 0 - 1, "packed_len unknown dtype = -1");
+
+    # a ternary tensor whose data_len (2) matches shape [6]
+    var n = 6;
+    var trits = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(trits + i * 8, 0); i = i + 1; }
+    var packed = alloc(tula_ternary_bytes(n));
+    var plen = tula_ternary_pack(trits, n, packed);
+    var shape = alloc(8);
+    store64(shape, n);
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_TERNARY, shape, 1, packed, plen);
+    var buf = tula_builder_finish(b);
+    var r = tula_open(buf, tula_total_len(buf));
+    var e = tula_find(r, "w");
+    assert_eq(tula_entry_payload_ok(e), 1, "consistent shape/data_len -> ok");
+
+    # lie: claim shape [100] but only 2 bytes stored -> needs 25 bytes -> not ok
+    store64(e + 64, 100);
+    assert_eq(tula_entry_payload_ok(e), 0, "shape too big for data_len -> not ok");
+
+    # lie: overflowing dim -> not ok, no wrap
+    store64(e + 64, 0x7FFFFFFFFFFFFFFF);
+    assert_eq(tula_entry_payload_ok(e), 0, "overflowing dim -> not ok");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_ternary_roundtrip();
+    test_int8_roundtrip();
+    test_nf4_roundtrip();
+    test_nf4_zero_block();
+    test_ternary_file_with_scale();
+    test_payload_ok();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

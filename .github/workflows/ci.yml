@@ -47,7 +47,7 @@ jobs:
         # notes like pin-drift / large-static are not `warn ` and don't gate.)
         run: |
           fail=0
-          for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do
+          for f in src/*.cyr programs/*.cyr examples/*.cyr tests/tcyr/*.tcyr; do
             [ -e "$f" ] || continue
             out=$(cyrius lint "$f" 2>&1 || true)
             echo "$out"
@@ -60,7 +60,7 @@ jobs:
       - name: Format check
         run: |
           fail=0
-          for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do
+          for f in src/*.cyr programs/*.cyr examples/*.cyr tests/tcyr/*.tcyr; do
             [ -e "$f" ] || continue
             if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
               echo "needs fmt: $f"; fail=1
@@ -93,6 +93,11 @@ jobs:
       - name: Test (CPU-only suites)
         run: |
           for f in tests/tcyr/*.tcyr; do cyrius test "$f" || exit 1; done
+
+      - name: Downstream consumer (v1.0 gate — end-to-end)
+        run: |
+          CYRIUS_DCE=1 cyrius build examples/consumer.cyr build/tula_consumer
+          ./build/tula_consumer
 
   security:
     name: Security Scan
