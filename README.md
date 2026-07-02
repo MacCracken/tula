@@ -32,15 +32,15 @@ All fields are i64-aligned little-endian words. The header reserves
 
 ## Status
 
-**M0 + M0b (v0.1.0, unreleased):** in-memory serialize → parse round-trip
-(bit-identical), magic/version validation, find-by-name, dtype/shape/payload
-accessors, **and the Ed25519 signed header** (sign/verify via sigil over the file
-content; tamper + wrong-key rejected). **30/30** assertions (2 suites). File I/O
-(mmap read / write-to-disk) is the next bite (M1) — see
+**0.1.0 released** (M0 + M0b: format + round-trip + Ed25519 signed header via
+sigil). **`[Unreleased]` adds M1 — file I/O**: `tula_write_file` /
+`tula_read_file` (heap) / `tula_open_mmap` (zero-copy) / `tula_close_mmap`; tula
+files are self-describing so reads need no `stat()`. **46/46** assertions across 3
+suites (round-trip, sign, file I/O). Next: M2 (ternary/nf4 payload helpers) — see
 [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 Deps: stdlib + **sigil** (Ed25519). Cyrius pin **6.3.27**. CI + release workflows
-in place; the **0.1.0 tag is ready to cut** (M0 milestone complete).
+in place. VERSION stays 0.1.0 until the next cut.
 
 ## Build & test
 

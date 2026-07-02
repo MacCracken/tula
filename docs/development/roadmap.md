@@ -16,10 +16,13 @@ Pre-1.0; the public surface moves until v1.0 (no API freeze before then).
   BAD, wrong-key → BAD, unsigned → UNSIGNED.
 - CI + release workflows added; **0.1.0 tag ready to cut** (M0 milestone complete).
 
-## M1 — file I/O
-- `tula_write_file` (serialize → disk) + `tula_open_file` (mmap read, zero-copy).
-- Round-trip an **attn11 checkpoint** through a real file, bit-identical;
-  `e2`-style integrity check.
+## M1 — file I/O ✅ (`[Unreleased]`)
+- `tula_write_file` (serialize→disk) + `tula_read_file` (heap) + `tula_open_mmap`
+  (zero-copy) + `tula_close_mmap`. Self-describing header → no `stat()` needed.
+- `tests/tcyr/fileio.tcyr` (**16**): write→read bit-identical, signed file
+  survives+verifies, mmap round-trip, missing-file → 0. Suite total **46**.
+- Follow-on (deferred): round-trip a real attn11 checkpoint through `tula_*_file`
+  once attn11's checkpoint reader is available.
 
 ## M2 — dtype payload helpers
 - Ternary pack/unpack (tentib interop) + NF4 block layout (anukulana/QLoRA

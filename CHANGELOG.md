@@ -4,7 +4,20 @@ All notable changes to `tula` are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project is SemVer
 (pre-1.0 — the public surface is still moving, no API freeze until v1.0).
 
-## [0.1.0] — Unreleased
+## [Unreleased]
+
+### Added
+- **M1 — file I/O** (`src/fileio.cyr`): `tula_write_file` (serialize→disk),
+  `tula_read_file` (read back into a heap buffer; validates magic/version),
+  `tula_open_mmap` (zero-copy read-only mmap) + `tula_close_mmap`. tula files are
+  self-describing (the header carries the total length), so reads need no `stat()`.
+- `tests/tcyr/fileio.tcyr` (**16 assertions**): write→read bit-identical, signed
+  file survives + verifies, mmap round-trip, missing-file → 0. Suite total now **46**.
+
+_(Un-versioned: VERSION stays 0.1.0 until the next cut — the maintainer bumps
+VERSION + renames this section to `[0.2.0]` + tags.)_
+
+## [0.1.0] — 2026-07-01
 
 **M0 + M0b — the weight-file format, round-trip, and the sigil-signed header.**
 First cut of the sovereign weight-file format with an Ed25519 trust boundary.

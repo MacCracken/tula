@@ -6,16 +6,15 @@
 
 ## Version
 
-**0.1.0** — **unreleased** (not yet tagged). **M0 + M0b: weight-file format,
-in-memory round-trip, and the Ed25519 signed header.** Header + typed 144-byte
-manifest entries + 8-byte-aligned payload; builder/reader; find-by-name;
-magic/version validation; **sigil Ed25519 sign/verify** over the file content
-(`sig_off`/`sig_len` in the header; signature appended). **30 assertions**
-across 2 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8), all green. Builds + tests
-warning-clean.
+**0.1.0 — released 2026-07-01** (M0 + M0b: format + round-trip + Ed25519 signed
+header). **`[Unreleased]` now adds M1 — file I/O**: `tula_write_file` /
+`tula_read_file` (heap) / `tula_open_mmap` (zero-copy) / `tula_close_mmap`; tula
+files are self-describing so reads need no `stat()`. **46 assertions** across 3
+suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16), all green; builds
++ tests warning-clean.
 
-No released tags yet. **The 0.1.0 tag (M0 milestone complete) is ready to cut** —
-CI + release workflows are in place; a `0.1.0` tag triggers the release.
+VERSION stays **0.1.0** until the next cut — the maintainer bumps VERSION,
+renames the CHANGELOG `[Unreleased]` section to `[0.2.0]`, and tags.
 
 ## Toolchain
 
@@ -35,6 +34,7 @@ GitHub** for CI + the release to pass.
 
 ## Next
 
-**M1** — file I/O: `tula_write_file` / `tula_open_file` (mmap), round-trip a real
-attn11 checkpoint through a real file, bit-identical. Then M2 (ternary/nf4 payload
-helpers) → v1.0 (API freeze + fuzz + bench). See `roadmap.md`.
+**M2** — ternary/nf4 payload helpers (tentib + anukūlana/QLoRA interop). Then
+v1.0 (API freeze + `docs/api.md` + fuzz + bench + a downstream consumer). A
+future bite could round-trip a real attn11 checkpoint through `tula_*_file` once
+attn11's checkpoint reader is available. See `roadmap.md`.

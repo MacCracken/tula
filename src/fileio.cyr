@@ -1,0 +1,46 @@
+# @public — tula file I/O (M1): write a serialized buffer to disk, read it back
+# (heap copy) or mmap it (zero-copy). Uses stdlib io + mmap; portable.
+#
+# tula files are self-describing — the 64-byte header carries the total length
+# (payload_off + payload_len + sig_len), so reads need no stat() call.
+
+# Write a serialized tula buffer to `path` (create/truncate). Returns bytes
+# written (== len on success) or a negative io error.
+fn tula_write_file(path, buf, len): i64 {
+    return file_write_all(path, buf, len);
+}
+
+# Read a tula file into a fresh heap buffer; validates magic/version. Returns the
+# buffer (reader handle — use tula_* accessors) or 0 on error.
+fn tula_read_file(path): i64 {
+    var hdr = alloc(TULA_HEADER_SIZE);
+    var n = file_read_all(path, hdr, TULA_HEADER_SIZE);
+    if (n < TULA_HEADER_SIZE) { return 0; }
+    if (load64(hdr + 0) != TULA_MAGIC) { return 0; }
+    var total = load64(hdr + 32) + load64(hdr + 40) + load64(hdr + 56);
+    var buf = alloc(total);
+    var got = file_read_all(path, buf, total);
+    if (got != total) { return 0; }
+    return tula_open(buf, total);
+}
+
+# Zero-copy: mmap a tula file read-only. Returns the mapped buffer (reader
+# handle) or 0. Release with tula_close_mmap when done.
+fn tula_open_mmap(path): i64 {
+    var fd = file_open(path, 0, 0);   # O_RDONLY
+    if (fd < 0) { return 0; }
+    var hdr = alloc(TULA_HEADER_SIZE);
+    var n = file_read(fd, hdr, TULA_HEADER_SIZE);
+    if (n < TULA_HEADER_SIZE) { file_close(fd); return 0; }
+    if (load64(hdr + 0) != TULA_MAGIC) { file_close(fd); return 0; }
+    var total = load64(hdr + 32) + load64(hdr + 40) + load64(hdr + 56);
+    var addr = mmap_file_ro(fd, total);
+    file_close(fd);   # the mapping survives fd close
+    if (addr == 0) { return 0; }
+    return tula_open(addr, total);
+}
+
+# Release a buffer obtained from tula_open_mmap.
+fn tula_close_mmap(r): i64 {
+    return cyr_munmap(r, tula_total_len(r));
+}

@@ -40,6 +40,6 @@ make dist    # cyrius distlib -> dist/tula.cyr
 
 ## Roadmap (see docs/development/roadmap.md)
 
-M0 format + round-trip + M0b sigil-signed header (**both done**) → M1 file I/O
-(mmap read + write-to-disk) → M2 ternary/nf4 payload helpers → v1.0 (API freeze +
-fuzz + bench). Do not commit or push — the user handles all git.
+M0 format + round-trip + M0b sigil-signed header + M1 file I/O (**all done**) →
+M2 ternary/nf4 payload helpers → v1.0 (API freeze + fuzz + bench). VERSION stays
+0.1.0 until the next cut. Do not commit or push — the user handles all git.
