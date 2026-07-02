@@ -1,0 +1,87 @@
+# tests/tcyr/sign.tcyr — tula signed-header (M0b): sigil Ed25519 sign/verify.
+# Deterministic keypairs from fixed seeds (no RNG → reproducible).
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# A deterministic 32-byte seed varied by v.
+fn make_seed(v): i64 {
+    var s = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(s + i, (i + v) & 0xFF); i = i + 1; }
+    return s;
+}
+
+# A builder holding one f64 [3] tensor.
+fn build_one(): i64 {
+    var shape = alloc(8);
+    store64(shape + 0, 3);
+    var data = alloc(24);
+    var i = 0;
+    while (i < 3) { store64(data + i * 8, 7 + i); i = i + 1; }
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, 24);
+    return b;
+}
+
+fn test_sign_verify() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(make_seed(1), sk, pk);
+
+    var buf = tula_builder_finish_signed(build_one(), sk);
+    var r = tula_open(buf, tula_total_len(buf));
+    assert(r != 0, "signed buffer opens");
+    assert_eq(tula_is_signed(r), 64, "signed: sig_len 64");
+    assert_eq(tula_count(r), 1, "one tensor survives signing");
+    assert_eq(tula_verify(r, pk), TULA_SIG_OK, "valid signature verifies");
+    return 0;
+}
+
+fn test_tamper_fails() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(make_seed(1), sk, pk);
+    var buf = tula_builder_finish_signed(build_one(), sk);
+    var r = tula_open(buf, tula_total_len(buf));
+    # flip one payload byte — covered by the signature
+    var po = load64(buf + 32);
+    store8(buf + po, (load8(buf + po) + 1) & 0xFF);
+    assert_eq(tula_verify(r, pk), TULA_SIG_BAD, "tampered payload -> BAD");
+    return 0;
+}
+
+fn test_wrong_key_fails() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(make_seed(1), sk, pk);
+    var buf = tula_builder_finish_signed(build_one(), sk);
+    var r = tula_open(buf, tula_total_len(buf));
+    var sk2 = alloc(64);
+    var pk2 = alloc(32);
+    ed25519_keypair(make_seed(99), sk2, pk2);
+    assert_eq(tula_verify(r, pk2), TULA_SIG_BAD, "wrong key -> BAD");
+    return 0;
+}
+
+fn test_unsigned_verify() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(make_seed(1), sk, pk);
+    var buf = tula_builder_finish(build_one());   # unsigned
+    var r = tula_open(buf, tula_total_len(buf));
+    assert_eq(tula_is_signed(r), 0, "unsigned: is_signed 0");
+    assert_eq(tula_verify(r, pk), TULA_SIG_UNSIGNED, "unsigned -> UNSIGNED");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_sign_verify();
+    test_tamper_fails();
+    test_wrong_key_fails();
+    test_unsigned_verify();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

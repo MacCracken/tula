@@ -109,14 +109,19 @@ fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
     return 0;
 }
 
-# Serialize the builder into a fresh contiguous tula buffer; returns the buf ptr.
-fn tula_builder_finish(b): i64 {
+# Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
+# unsigned file, or 64 to reserve an appended Ed25519 signature block (filled by
+# src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr.
+fn tula_serialize(b, sig_len): i64 {
     var count = load64(b);
     var manifest_off = TULA_HEADER_SIZE;
     var manifest_len = count * TULA_ENTRY_SIZE;
     var payload_off = manifest_off + manifest_len;
     var payload_len = load64(b + 8);
-    var total = payload_off + payload_len;
+    var content_len = payload_off + payload_len;
+    var sig_off = 0;
+    if (sig_len > 0) { sig_off = content_len; }
+    var total = content_len + sig_len;
     var buf = alloc(total);
 
     store64(buf + 0, TULA_MAGIC);
@@ -125,8 +130,8 @@ fn tula_builder_finish(b): i64 {
     store64(buf + 24, manifest_off);
     store64(buf + 32, payload_off);
     store64(buf + 40, payload_len);
-    store64(buf + 48, 0);   # sig_off — unsigned in M0
-    store64(buf + 56, 0);   # sig_len — unsigned in M0
+    store64(buf + 48, sig_off);   # 0 = unsigned; else offset of the sig block
+    store64(buf + 56, sig_len);   # 0 = unsigned; else 64 (Ed25519)
 
     var i = 0;
     var cur = 0;
@@ -157,9 +162,15 @@ fn tula_builder_finish(b): i64 {
     return buf;
 }
 
-# Total serialized length of a finished/opened buffer.
+# Serialize an UNSIGNED buffer. (Signed variant: tula_builder_finish_signed in
+# src/sign.cyr, which reserves sig_len=64 then fills it with an Ed25519 sig.)
+fn tula_builder_finish(b): i64 {
+    return tula_serialize(b, 0);
+}
+
+# Total serialized length of a finished/opened buffer (incl. any signature).
 fn tula_total_len(buf): i64 {
-    return load64(buf + 32) + load64(buf + 40);   # payload_off + payload_len
+    return load64(buf + 32) + load64(buf + 40) + load64(buf + 56);   # payload_off + payload_len + sig_len
 }
 
 # ---------------------------------------------------------------------------
@@ -205,10 +216,9 @@ fn tula_find(r, name): i64 {
     return 0;
 }
 
-# Signature status. M0: unsigned (sig_len == 0). M0b wires sigil verify over
-# (header[0..48] ‖ manifest ‖ payload); until then a present signature reads
-# as unsigned (unverified).
-fn tula_sig_status(r): i64 {
-    if (load64(r + 56) == 0) { return TULA_SIG_UNSIGNED; }
-    return TULA_SIG_UNSIGNED;
+# Whether the file carries a signature: 0 = unsigned, else the signature length
+# in bytes (64 for Ed25519). This is a PRESENCE check only — cryptographic
+# verification is tula_verify(r, pk) in src/sign.cyr.
+fn tula_is_signed(r): i64 {
+    return load64(r + 56);
 }

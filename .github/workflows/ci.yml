@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        # The cyrius.cyml `[package].cyrius` pin is the single source of truth
+        # for the toolchain version — nothing is hardcoded here. Use the
+        # upstream installer so the versioned ~/.cyrius/versions/<ver>/ layout
+        # matches how cyrius resolves the pin.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        # `cyrius deps` reads [deps] from cyrius.cyml: the stdlib set (copied
+        # from the installed toolchain) plus `sigil` (fetched from GitHub via
+        # [deps.sigil] git+tag — the `path = "../sigil"` override only applies
+        # to local dev, where sigil is a sibling checkout). Requires the sigil
+        # tag to exist on GitHub. lib/ must be a real dir, never a symlink.
+        run: |
+          rm -rf lib
+          mkdir lib
+          cyrius deps
+
+      - name: Lint
+        # Hard gate: any `warn ` severity line fails CI. (Build-time `warning:`
+        # notes like pin-drift / large-static are not `warn ` and don't gate.)
+        run: |
+          fail=0
+          for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do
+            [ -e "$f" ] || continue
+            out=$(cyrius lint "$f" 2>&1 || true)
+            echo "$out"
+            if echo "$out" | grep -qE '^[[:space:]]*warn '; then
+              echo "lint: warnings in $f"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
+
+      - name: Format check
+        run: |
+          fail=0
+          for f in src/*.cyr programs/*.cyr tests/tcyr/*.tcyr; do
+            [ -e "$f" ] || continue
+            if ! cyrius fmt "$f" --check > /dev/null 2>&1; then
+              echo "needs fmt: $f"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
+
+      - name: Vet
+        run: cyrius vet programs/smoke.cyr
+
+      - name: Verify dist bundle is in sync with src/
+        run: |
+          cyrius distlib
+          if ! git diff --quiet dist/tula.cyr; then
+            echo "ERROR: dist/tula.cyr is stale. Run 'cyrius distlib' and commit the result."
+            git --no-pager diff dist/tula.cyr | head -40
+            exit 1
+          fi
+          echo "dist/tula.cyr matches src/"
+
+      - name: Build (link-check, DCE on)
+        run: |
+          mkdir -p build
+          CYRIUS_DCE=1 cyrius build programs/smoke.cyr build/tula_smoke
+          echo "smoke: $(wc -c < build/tula_smoke) bytes"
+
+      - name: Verify ELF
+        run: xxd -l 4 build/tula_smoke | grep -q "7f45 4c46"
+
+      - name: Test (CPU-only suites)
+        run: |
+          for f in tests/tcyr/*.tcyr; do cyrius test "$f" || exit 1; done
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for dangerous patterns
+        # Matches code lines only — rejects patterns in # comments.
+        run: |
+          FAIL=0
+          scan() {
+            local label="$1"; shift
+            local pat="$1"; shift
+            local hits
+            hits=$(grep -rn "$pat" src/ programs/ 2>/dev/null | awk -F: '
+              { line=$3; for(i=4;i<=NF;i++) line=line":"$i;
+                sub(/^[[:space:]]+/,"",line);
+                if (substr(line,1,1) != "#") print $1":"$2":"line }')
+            if [ -n "$hits" ]; then
+              echo "FAIL: $label"
+              echo "$hits"
+              FAIL=1
+            fi
+          }
+          scan "raw execve"  'syscall( *59'
+          scan "raw fork"    'syscall( *57'
+          scan "sys_system"  '\bsys_system\s*('
+          echo "security scan complete (fail: $FAIL)"
+          exit $FAIL
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required files
+        run: |
+          MISSING=0
+          for f in README.md CHANGELOG.md VERSION cyrius.cyml; do
+            if [ -f "$f" ]; then echo "  OK: $f"
+            else echo "  MISSING (required): $f"; MISSING=1; fi
+          done
+          for f in CONTRIBUTING.md SECURITY.md LICENSE; do
+            if [ -f "$f" ]; then echo "  OK: $f"
+            else echo "  WARN (optional, not yet present): $f"; fi
+          done
+          exit $MISSING
+
+      - name: Verify version consistency
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          echo "VERSION file: $VERSION"
+          grep -q "^## \[$VERSION\]" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
+          echo "Version consistent (manifest pulls VERSION via \${file:VERSION})"

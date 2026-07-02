@@ -6,24 +6,45 @@
 # `dist/tula.cyr`. Don't add stdlib includes to individual src modules.
 
 # ================================================================
-# Standard library
+# Standard library — the sigil-consumer set (mirrors libro's order).
+# thread.cyr self-includes mmap.cyr + atomic.cyr.
 # ================================================================
-include "lib/string.cyr"
-include "lib/fmt.cyr"
-include "lib/alloc.cyr"
-include "lib/vec.cyr"
-include "lib/str.cyr"
-include "lib/io.cyr"
-include "lib/args.cyr"
-include "lib/syscalls.cyr"
-include "lib/flags.cyr"
 include "lib/assert.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/str.cyr"
+include "lib/string.cyr"
+include "lib/vec.cyr"
+include "lib/hashmap.cyr"
+include "lib/syscalls.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+include "lib/fmt.cyr"
+include "lib/result.cyr"
+include "lib/fnptr.cyr"
+include "lib/bayan.cyr"
+include "lib/chrono.cyr"
+include "lib/tagged.cyr"
+include "lib/process.cyr"
+include "lib/slice.cyr"
+include "lib/ct.cyr"
+include "lib/keccak.cyr"
+include "lib/thread.cyr"
+include "lib/thread_local.cyr"
+include "lib/random.cyr"
 include "lib/bench.cyr"
+
+# ================================================================
+# sigil — the sovereign crypto boundary (Ed25519 sign/verify for the
+# signed header). Resolved from [deps.sigil] into lib/sigil.cyr.
+# ================================================================
+include "lib/sigil.cyr"
 
 # ================================================================
 # tula domain modules — flat, dependency order.
 # error.cyr is dep-free; format.cyr (header + manifest + builder + reader)
-# builds on it.
+# builds on it; sign.cyr adds Ed25519 sign/verify over sigil + format.
 # ================================================================
 include "src/error.cyr"
 include "src/format.cyr"
+include "src/sign.cyr"

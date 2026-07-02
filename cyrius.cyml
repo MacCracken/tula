@@ -5,7 +5,7 @@ description = "tula (तुला — balance / scale; the instrument that weigh
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/tula"
 language = "cyrius"
-cyrius = "6.3.26"
+cyrius = "6.3.27"
 
 # tula is a library — no CLI binary. `cyrius build` targets a smoke program
 # that links the full include chain to prove src/lib.cyr parses/links clean.
@@ -21,29 +21,45 @@ output = "build/tula_smoke"
 modules = [
     "src/error.cyr",
     "src/format.cyr",
+    "src/sign.cyr",
 ]
 
 [deps]
-# M0 is stdlib-only (pure serialization; no inflate, no crypto yet). Base set
-# mirrors chitra's foundation minus sankoch/thread (not needed until the
-# optional compressed-container path lands).
+# M0b wires sigil (Ed25519 signed header), so the stdlib set is now the union
+# of tula's needs and sigil's (see sigil/dist/sigil.deps). Extras are DCE'd.
 stdlib = [
-    "string",
-    "fmt",
-    "alloc",
-    "io",
-    "vec",
-    "str",
-    "syscalls",
     "assert",
+    "alloc",
+    "freelist",
+    "str",
+    "string",
+    "vec",
+    "hashmap",
+    "syscalls",
+    "io",
+    "fs",
+    "fmt",
+    "result",
+    "fnptr",
+    "bayan",
+    "chrono",
+    "tagged",
+    "process",
+    "slice",
+    "ct",
+    "keccak",
+    "thread",
+    "thread_local",
+    "random",
     "bench",
-    "args",
-    "flags",
 ]
 
-# M0b — the sigil-signed header (the trust boundary). The format already
-# RESERVES sig_offset/sig_len (0 = unsigned in M0). Wired next bite:
-# [deps.sigil]
-# git = "https://github.com/MacCracken/sigil"
-# tag = "<pin>"
-# modules = ["dist/sigil.cyr"]
+# sigil — the sovereign crypto boundary (Ed25519 sign/verify for the signed
+# header). git+path+tag: local dev resolves via path=../sigil; CI resolves via
+# git+tag (mirrors libro). tula's own dist/tula.cyr leaves ed25519_* unresolved
+# (consumer supplies sigil) — the standard consumer-bundle pattern.
+[deps.sigil]
+git = "https://github.com/MacCracken/sigil.git"
+path = "../sigil"
+tag = "3.9.9"
+modules = ["dist/sigil.cyr"]

@@ -32,12 +32,15 @@ All fields are i64-aligned little-endian words. The header reserves
 
 ## Status
 
-**M0 (v0.1.0, unreleased):** in-memory serialize → parse round-trip, bit-identical;
-magic/version validation; find-by-name; dtype/shape/payload accessors. **22/22**
-assertions green. File I/O (mmap read / write-to-disk) and the sigil-signed
-header are the next bites — see [`docs/development/roadmap.md`](docs/development/roadmap.md).
+**M0 + M0b (v0.1.0, unreleased):** in-memory serialize → parse round-trip
+(bit-identical), magic/version validation, find-by-name, dtype/shape/payload
+accessors, **and the Ed25519 signed header** (sign/verify via sigil over the file
+content; tamper + wrong-key rejected). **30/30** assertions (2 suites). File I/O
+(mmap read / write-to-disk) is the next bite (M1) — see
+[`docs/development/roadmap.md`](docs/development/roadmap.md).
 
-Pure Cyrius, no external deps (M0 is stdlib-only). Cyrius pin **6.3.26**.
+Deps: stdlib + **sigil** (Ed25519). Cyrius pin **6.3.27**. CI + release workflows
+in place; the **0.1.0 tag is ready to cut** (M0 milestone complete).
 
 ## Build & test
 

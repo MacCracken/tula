@@ -34,12 +34,12 @@ make dist    # cyrius distlib -> dist/tula.cyr
 - **Never `cat file | cycc`** — always `cyrius build`. `lib/` is populated by
   `cyrius deps` from `[deps].stdlib`; it is a build artifact (gitignored),
   never committed, never a symlink to a cyrius checkout.
-- Cyrius pin: `cyrius = "6.3.26"` in `cyrius.cyml` (single source of truth).
+- Cyrius pin: `cyrius = "6.3.27"` in `cyrius.cyml` (single source of truth).
 - Format fields are i64-aligned; use `store64`/`load64` + `store8`/`load8` +
   `memcpy` (all available). Avoid module-scope `var X[N]` array footguns.
 
 ## Roadmap (see docs/development/roadmap.md)
 
-M0 format + in-memory round-trip (**done**) → M0b sigil-signed header → M1 file
-I/O (mmap read + write-to-disk) → M2 ternary/nf4 payload helpers → v1.0 (API
-freeze + fuzz + bench). Do not commit or push — the user handles all git.
+M0 format + round-trip + M0b sigil-signed header (**both done**) → M1 file I/O
+(mmap read + write-to-disk) → M2 ternary/nf4 payload helpers → v1.0 (API freeze +
+fuzz + bench). Do not commit or push — the user handles all git.

@@ -65,7 +65,7 @@ fn test_roundtrip() {
 
     assert_eq(tula_find(r, "b0"), e1, "find b0");
     assert_eq(tula_find(r, "nope"), 0, "find missing -> 0");
-    assert_eq(tula_sig_status(r), TULA_SIG_UNSIGNED, "M0 unsigned");
+    assert_eq(tula_is_signed(r), 0, "unsigned round-trip");
     return 0;
 }
 

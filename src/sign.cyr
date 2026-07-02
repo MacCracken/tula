@@ -1,0 +1,33 @@
+# @public — tula signed-header: Ed25519 sign / verify via sigil.
+#
+# The signature covers the file content [0 .. sig_off) — the header (INCLUDING
+# the sig_off/sig_len fields, so they are tamper-evident), the manifest, and the
+# payload. The 64-byte Ed25519 signature is appended at sig_off. Crypto is
+# sigil's (the sovereign trust boundary); tula owns only the layout + call sites.
+# Keys are the CALLER's — tula does not own key management.
+#
+# sigil contract (sigil/src/ed25519.cyr):
+#   ed25519_keypair(seed[32], sk_out[64], pk_out[32])  -> sk = seed||pk
+#   ed25519_sign(sk[64], msg, msg_len, sig_out[64])
+#   ed25519_verify(pk[32], msg, msg_len, sig[64])      -> 1 valid / 0 invalid
+
+# Serialize the builder AND sign it with a 64-byte Ed25519 secret key
+# (seed||pk, as produced by ed25519_keypair). Returns the signed buffer.
+fn tula_builder_finish_signed(b, sk): i64 {
+    var buf = tula_serialize(b, 64);   # reserves the 64-byte sig block at sig_off
+    var so = load64(buf + 48);          # sig_off == content_len
+    ed25519_sign(sk, buf, so, buf + so);
+    return buf;
+}
+
+# Verify a buffer against a 32-byte Ed25519 public key.
+#   TULA_SIG_UNSIGNED — no signature present
+#   TULA_SIG_OK       — signature valid for this key
+#   TULA_SIG_BAD      — signature present but invalid (wrong key / tampered)
+fn tula_verify(r, pk): i64 {
+    var sl = load64(r + 56);
+    if (sl == 0) { return TULA_SIG_UNSIGNED; }
+    var so = load64(r + 48);
+    if (ed25519_verify(pk, r, so, r + so) != 0) { return TULA_SIG_OK; }
+    return TULA_SIG_BAD;
+}

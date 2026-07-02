@@ -7,11 +7,14 @@ Pre-1.0; the public surface moves until v1.0 (no API freeze before then).
 - Builder (serialize) + reader (validate + accessors) + find-by-name.
 - `programs/smoke.cyr` link-check; `tests/tcyr/roundtrip.tcyr` — **22 assertions**.
 
-## M0b — sigil-signed header (the trust boundary)
-- Wire `[deps.sigil]`; sign over (header[0..48] ‖ manifest ‖ payload) on write;
-  `tula_sig_status` verifies on read (`sig_off`/`sig_len` already reserved).
-- Reject tampered files; `tula_open` gains an optional verify mode.
-- Tests: sign→verify OK; flipped-byte → `TULA_SIG_BAD`; unsigned → `UNSIGNED`.
+## M0b — sigil-signed header (the trust boundary) ✅ (v0.1.0, unreleased)
+- `[deps.sigil]` wired; Ed25519 sign over the content `[0..sig_off)` (header incl.
+  sig fields ‖ manifest ‖ payload); signature appended at `sig_off`.
+- `tula_builder_finish_signed(b, sk)` + `tula_verify(r, pk)` →
+  `TULA_SIG_OK`/`TULA_SIG_BAD`/`TULA_SIG_UNSIGNED`; `tula_is_signed(r)` presence check.
+- `tests/tcyr/sign.tcyr` (**8 assertions**): sign→verify OK, tampered-payload →
+  BAD, wrong-key → BAD, unsigned → UNSIGNED.
+- CI + release workflows added; **0.1.0 tag ready to cut** (M0 milestone complete).
 
 ## M1 — file I/O
 - `tula_write_file` (serialize → disk) + `tula_open_file` (mmap read, zero-copy).
