@@ -596,6 +596,8 @@ fn tula_int8_dequant(src, n, scale, dst): i64 {
 
 # The NF4 codebook: the 16 NormalFloat4 quantiles (bitsandbytes/QLoRA standard),
 # as f64 IEEE-754 bit patterns. Code i in [0,15] -> level in [-1, +1].
+# Source: Dettmers et al. (2023), "QLoRA: Efficient Finetuning of Quantized LLMs"
+# (arXiv:2305.14314); values mirror the bitsandbytes reference. See docs/sources.md.
 fn tula_nf4_level(i): i64 {
     if (i == 0)  { return 0xBFF0000000000000; }   # -1.0
     if (i == 1)  { return 0xBFE6473620000000; }   # -0.6961928009986877

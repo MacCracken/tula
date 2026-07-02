@@ -15,6 +15,18 @@ dtype payload helpers, reader hardening (the untrusted-input trust gate), fuzz +
 bench, and a security audit — with a green end-to-end downstream consumer.
 
 ### Added
+- **First-party documentation scaffold** (per the AGNOS first-party doc standard).
+  Root files completed: `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (all seven required
+  root files now present). `docs/` filled to the standard: `docs/guides/`
+  (`README.md` + `getting-started.md`), `docs/architecture/` (`README.md` +
+  `001-flat-module-layout.md` + `002-accessors-require-validated-buffer.md`),
+  `docs/examples/README.md` (indexes the root `examples/`),
+  [ADR 0003](docs/adr/0003-api-freeze-at-v1.md) recording the 1.0 API + format-v1
+  freeze decision, and `docs/sources.md` citing the quantization schemes (NF4 →
+  QLoRA/bitsandbytes, ternary → BitNet b1.58, int8 → LLM.int8(), Ed25519 → RFC
+  8032) with an inline citation on `tula_nf4_level`. `CLAUDE.md` de-staled: a
+  durable pointer block (→ `state.md` / `CHANGELOG` / `api.md`) + a docs pointer
+  replace the old inline roadmap/version.
 - **v1.0 prep — freeze docs + downstream consumer.** `docs/api.md` documents the
   frozen public surface (format spec, builder, reader, sign, file-I/O, dtype
   helpers, error/dtype/sig constants). `STABILITY.md` states the post-1.0 policy

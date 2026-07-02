@@ -25,3 +25,4 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 |---|---|---|
 | [0001](0001-tula-scope.md) | Accepted | tula scope: the weight-file codec, nothing more |
 | [0002](0002-quant-scales-as-sidecar-tensors.md) | Accepted | Quantization scales are sidecar tensors, not an entry field (no format-version bump) |
+| [0003](0003-api-freeze-at-v1.md) | Accepted | Freeze the public API and on-disk format (v1) at 1.0 |

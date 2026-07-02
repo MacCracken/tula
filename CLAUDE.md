@@ -34,12 +34,28 @@ make dist    # cyrius distlib -> dist/tula.cyr
 - **Never `cat file | cycc`** — always `cyrius build`. `lib/` is populated by
   `cyrius deps` from `[deps].stdlib`; it is a build artifact (gitignored),
   never committed, never a symlink to a cyrius checkout.
-- Cyrius pin: `cyrius = "6.3.27"` in `cyrius.cyml` (single source of truth).
+- Cyrius pin lives in `cyrius.cyml` (`cyrius = "..."`, single source of truth) —
+  read it there, don't inline the number here.
 - Format fields are i64-aligned; use `store64`/`load64` + `store8`/`load8` +
   `memcpy` (all available). Avoid module-scope `var X[N]` array footguns.
 
-## Roadmap (see docs/development/roadmap.md)
+## Current state (pointers — don't inline volatile state)
 
-M0 format + round-trip + M0b sigil-signed header + M1 file I/O (**all done**) →
-M2 ternary/nf4 payload helpers → v1.0 (API freeze + fuzz + bench). VERSION stays
-0.1.0 until the next cut. Do not commit or push — the user handles all git.
+- **Live status** (version, test counts, cycle) → [`docs/development/state.md`](docs/development/state.md).
+- **Release history** → [`CHANGELOG.md`](CHANGELOG.md).
+- **Public API + stability** → [`docs/api.md`](docs/api.md) + [`STABILITY.md`](STABILITY.md)
+  (the surface + on-disk format v1 are frozen at 1.0 — [ADR 0003](docs/adr/0003-api-freeze-at-v1.md)).
+
+## Docs
+
+- **Decisions** → [`docs/adr/`](docs/adr/) (0001 scope · 0002 sidecar scales · 0003 API freeze).
+- **Code invariants** → [`docs/architecture/`](docs/architecture/) (001 flat modules · 002 validated-buffer trust gate).
+- **How-tos** → [`docs/guides/`](docs/guides/) · **runnable examples** → [`examples/`](examples/) (indexed at [`docs/examples/`](docs/examples/)).
+- **Roadmap** → [`docs/development/roadmap.md`](docs/development/roadmap.md) · **benchmarks** → [`docs/benchmarks.md`](docs/benchmarks.md) · **security** → [`SECURITY.md`](SECURITY.md) + [`docs/audit/`](docs/audit/).
+
+## Rules
+
+- **Do not commit, push, or tag** — the maintainer handles all git.
+- **Never use the `gh` CLI** — reach the GitHub API via `curl` if needed.
+- Structure came from `cyrius init` — don't hand-roll the root files or docs
+  skeleton; fix the template and re-propagate.

@@ -63,6 +63,16 @@ make fuzz     # reader fuzz harness (>10^6 iters)
 make bench    # write/read/mmap throughput -> docs/benchmarks.md
 ```
 
+## Documentation
+
+- **[Getting started](docs/guides/getting-started.md)** — build, test, write/read
+  a weight file, consume the bundle. More how-tos in [`docs/guides/`](docs/guides/).
+- **[API reference](docs/api.md)** — the frozen public surface · **[STABILITY.md](STABILITY.md)** — the post-1.0 contract.
+- **[Examples](docs/examples/)** — runnable code ([`examples/consumer.cyr`](examples/consumer.cyr)).
+- **[Decisions](docs/adr/)** (ADRs) · **[Code invariants](docs/architecture/)** (architecture notes).
+- **[Security](SECURITY.md)** + **[audit](docs/audit/)** · **[Benchmarks](docs/benchmarks.md)**.
+- **[Roadmap](docs/development/roadmap.md)** · **[State](docs/development/state.md)** · **[Contributing](CONTRIBUTING.md)**.
+
 ## Consumers (planned)
 
 `rupantara` + `anukulana` (Type-3 pretrained-import), the murti load-seam, and
