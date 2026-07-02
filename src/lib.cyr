@@ -1,0 +1,29 @@
+# @public — tula library include chain.
+# tula (तुला — balance / scale) — sovereign weight-file format.
+#
+# Stdlib includes live ONLY in this file; domain modules (src/*.cyr) are flat
+# so `cyrius distlib` (strip-include concatenation) produces a compile-clean
+# `dist/tula.cyr`. Don't add stdlib includes to individual src modules.
+
+# ================================================================
+# Standard library
+# ================================================================
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/args.cyr"
+include "lib/syscalls.cyr"
+include "lib/flags.cyr"
+include "lib/assert.cyr"
+include "lib/bench.cyr"
+
+# ================================================================
+# tula domain modules — flat, dependency order.
+# error.cyr is dep-free; format.cyr (header + manifest + builder + reader)
+# builds on it.
+# ================================================================
+include "src/error.cyr"
+include "src/format.cyr"

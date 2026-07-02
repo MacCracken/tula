@@ -1,0 +1,33 @@
+# @public — stable API surface for tula error handling.
+# error.cyr — tula weight-file error codes + name lookup.
+#
+# Integer constants; dep-free (format.cyr builds on this). Names never
+# return null — a fallback covers unknown codes.
+
+enum TulaErrCode {
+    TULA_OK            = 0;    # no error
+    TULA_ERR_MAGIC     = 1;    # not a tula file (bad 8-byte magic)
+    TULA_ERR_VERSION   = 2;    # unsupported format version
+    TULA_ERR_TRUNCATED = 3;    # input ends before header/manifest/payload completes
+    TULA_ERR_TOO_MANY  = 4;    # builder tensor cap exceeded
+    TULA_ERR_NAME_LONG = 5;    # tensor name exceeds the 47-byte field
+    TULA_ERR_OOM       = 6;    # allocation failed
+    TULA_ERR_UNSIGNED  = 7;    # verify requested but file carries no signature
+    TULA_ERR_SIG       = 8;    # sigil signature verification failed (M0b)
+    TULA_ERR_OTHER     = 99;   # catch-all
+}
+
+# Error name lookup — returns a cstring (never null).
+fn tula_err_name(code): i64 {
+    if (code == TULA_OK)            { return "ok"; }
+    if (code == TULA_ERR_MAGIC)     { return "bad magic (not a tula file)"; }
+    if (code == TULA_ERR_VERSION)   { return "unsupported format version"; }
+    if (code == TULA_ERR_TRUNCATED) { return "truncated input"; }
+    if (code == TULA_ERR_TOO_MANY)  { return "too many tensors (builder cap)"; }
+    if (code == TULA_ERR_NAME_LONG) { return "tensor name too long"; }
+    if (code == TULA_ERR_OOM)       { return "out of memory"; }
+    if (code == TULA_ERR_UNSIGNED)  { return "file is unsigned"; }
+    if (code == TULA_ERR_SIG)       { return "signature verification failed"; }
+    if (code == TULA_ERR_OTHER)     { return "other error"; }
+    return "unknown error";
+}

@@ -1,0 +1,17 @@
+# programs/smoke.cyr — compile-time proof that src/lib.cyr links clean.
+#
+# tula is a library — no CLI binary. This program lets
+# `cyrius build programs/smoke.cyr build/tula_smoke` verify the full include
+# chain (stdlib + domain modules) parses and links. Writes a banner, exits 0.
+
+include "src/lib.cyr"
+
+fn main(): i64 {
+    alloc_init();
+    var banner = "tula smoke: lib.cyr linked clean\n";
+    syscall(1, 1, banner, strlen(banner));
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

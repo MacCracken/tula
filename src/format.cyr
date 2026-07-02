@@ -1,0 +1,214 @@
+# @public — tula weight-file format: header + typed tensor manifest + payload.
+#
+# Layout (all fields i64-aligned; little-endian i64 words):
+#
+#   HEADER (64 bytes)
+#     +0  magic          (TULA_MAGIC)
+#     +8  version        (TULA_VERSION)
+#     +16 tensor_count
+#     +24 manifest_off   (= 64)
+#     +32 payload_off
+#     +40 payload_len
+#     +48 sig_off        (0 = unsigned in M0)
+#     +56 sig_len        (0 = unsigned in M0)
+#
+#   MANIFEST — tensor_count × ENTRY (144 bytes each), at manifest_off
+#     +0   name[48]      (cstring, null-padded; ≤47 chars)
+#     +48  dtype         (TulaDType)
+#     +56  ndim
+#     +64  shape[8]      (8 × i64; unused dims zero)
+#     +128 data_off      (offset within payload)
+#     +136 data_len      (bytes)
+#
+#   PAYLOAD — raw tensor bytes at payload_off; each tensor 8-byte aligned.
+#
+# M0 = in-memory serialize/parse round-trip (write→read bit-identical). File
+# I/O (mmap read / write to disk) and the sigil-signed header are the next
+# bites; the format already reserves sig_off/sig_len.
+
+enum TulaDType {
+    TULA_DT_F64     = 0;   # raw f64 (IEEE-754 i64 bit patterns)
+    TULA_DT_INT8    = 1;   # int8 activations / quantized
+    TULA_DT_TERNARY = 2;   # packed {-1,0,+1} (tentib)
+    TULA_DT_NF4     = 3;   # 4-bit blockwise NormalFloat (anukulana / QLoRA)
+}
+
+enum TulaSigStatus {
+    TULA_SIG_UNSIGNED = 0;   # no signature present
+    TULA_SIG_OK       = 1;   # sigil signature verified (M0b)
+    TULA_SIG_BAD      = 2;   # signature present but invalid (M0b)
+}
+
+enum TulaFmt {
+    TULA_MAGIC       = 0x54554C41;   # "TULA"
+    TULA_VERSION     = 1;
+    TULA_HEADER_SIZE = 64;
+    TULA_ENTRY_SIZE  = 144;
+    TULA_NAME_CAP    = 48;           # name field width (bytes)
+    TULA_NAME_MAX    = 47;           # max name chars (+1 null)
+    TULA_MAXDIM      = 8;
+    TULA_BUILDER_MAX = 256;          # max tensors per builder
+}
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+# Round n up to the next multiple of 8.
+fn tula_align8(n): i64 {
+    return ((n + 7) / 8) * 8;
+}
+
+# Copy a cstring into a 48-byte name field: truncate to 47, null-pad the rest.
+fn tula_name_write(dst, src): i64 {
+    var n = strlen(src);
+    if (n > TULA_NAME_MAX) { n = TULA_NAME_MAX; }
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    while (i < TULA_NAME_CAP) {
+        store8(dst + i, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Packed version int: major*10000 + minor*100 + patch (0.1.0 -> 100).
+fn tula_version_int(): i64 {
+    return 100;
+}
+
+# ---------------------------------------------------------------------------
+# builder — accumulate tensors, then serialize into one contiguous buffer
+# ---------------------------------------------------------------------------
+# builder layout: +0 count, +8 payload_total, then MAX entries of 48-byte meta
+#   (name_ptr, dtype, ndim, shape_ptr, data_ptr, data_len).
+
+fn tula_builder_new(): i64 {
+    var b = alloc(16 + TULA_BUILDER_MAX * 48);
+    store64(b, 0);       # count
+    store64(b + 8, 0);   # payload_total
+    return b;
+}
+
+# Returns 0 on success, TULA_ERR_TOO_MANY if the cap is hit.
+fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
+    var c = load64(b);
+    if (c >= TULA_BUILDER_MAX) { return TULA_ERR_TOO_MANY; }
+    var m = b + 16 + c * 48;
+    store64(m + 0, name);
+    store64(m + 8, dtype);
+    store64(m + 16, ndim);
+    store64(m + 24, shape);
+    store64(m + 32, data);
+    store64(m + 40, data_len);
+    store64(b, c + 1);
+    store64(b + 8, load64(b + 8) + tula_align8(data_len));
+    return 0;
+}
+
+# Serialize the builder into a fresh contiguous tula buffer; returns the buf ptr.
+fn tula_builder_finish(b): i64 {
+    var count = load64(b);
+    var manifest_off = TULA_HEADER_SIZE;
+    var manifest_len = count * TULA_ENTRY_SIZE;
+    var payload_off = manifest_off + manifest_len;
+    var payload_len = load64(b + 8);
+    var total = payload_off + payload_len;
+    var buf = alloc(total);
+
+    store64(buf + 0, TULA_MAGIC);
+    store64(buf + 8, TULA_VERSION);
+    store64(buf + 16, count);
+    store64(buf + 24, manifest_off);
+    store64(buf + 32, payload_off);
+    store64(buf + 40, payload_len);
+    store64(buf + 48, 0);   # sig_off — unsigned in M0
+    store64(buf + 56, 0);   # sig_len — unsigned in M0
+
+    var i = 0;
+    var cur = 0;
+    while (i < count) {
+        var m = b + 16 + i * 48;
+        var e = buf + manifest_off + i * TULA_ENTRY_SIZE;
+        tula_name_write(e + 0, load64(m + 0));
+        store64(e + 48, load64(m + 8));    # dtype
+        var ndim = load64(m + 16);
+        store64(e + 56, ndim);
+        var shape = load64(m + 24);
+        var k = 0;
+        while (k < TULA_MAXDIM) {
+            if (k < ndim) {
+                store64(e + 64 + k * 8, load64(shape + k * 8));
+            } else {
+                store64(e + 64 + k * 8, 0);
+            }
+            k = k + 1;
+        }
+        var dlen = load64(m + 40);
+        store64(e + 128, cur);
+        store64(e + 136, dlen);
+        memcpy(buf + payload_off + cur, load64(m + 32), dlen);
+        cur = cur + tula_align8(dlen);
+        i = i + 1;
+    }
+    return buf;
+}
+
+# Total serialized length of a finished/opened buffer.
+fn tula_total_len(buf): i64 {
+    return load64(buf + 32) + load64(buf + 40);   # payload_off + payload_len
+}
+
+# ---------------------------------------------------------------------------
+# reader — validate + accessors over a tula buffer
+# ---------------------------------------------------------------------------
+
+# Validate magic + version; returns the buffer (reader handle) or 0.
+fn tula_open(buf, len): i64 {
+    if (len < TULA_HEADER_SIZE)         { return 0; }
+    if (load64(buf + 0) != TULA_MAGIC)  { return 0; }
+    if (load64(buf + 8) != TULA_VERSION) { return 0; }
+    return buf;
+}
+
+fn tula_count(r): i64          { return load64(r + 16); }
+fn tula_format_version(r): i64 { return load64(r + 8); }
+
+# Pointer to manifest entry i.
+fn tula_entry(r, i): i64 {
+    return r + load64(r + 24) + i * TULA_ENTRY_SIZE;
+}
+
+fn tula_entry_name(e): i64     { return e; }              # cstring in place
+fn tula_entry_dtype(e): i64    { return load64(e + 48); }
+fn tula_entry_ndim(e): i64     { return load64(e + 56); }
+fn tula_entry_dim(e, k): i64   { return load64(e + 64 + k * 8); }
+fn tula_entry_data_len(e): i64 { return load64(e + 136); }
+
+# Pointer to the tensor's payload bytes.
+fn tula_entry_data(r, e): i64 {
+    return r + load64(r + 32) + load64(e + 128);   # payload_off + data_off
+}
+
+# Find an entry by name; returns the entry ptr or 0.
+fn tula_find(r, name): i64 {
+    var c = tula_count(r);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        if (streq(tula_entry_name(e), name)) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Signature status. M0: unsigned (sig_len == 0). M0b wires sigil verify over
+# (header[0..48] ‖ manifest ‖ payload); until then a present signature reads
+# as unsigned (unverified).
+fn tula_sig_status(r): i64 {
+    if (load64(r + 56) == 0) { return TULA_SIG_UNSIGNED; }
+    return TULA_SIG_UNSIGNED;
+}

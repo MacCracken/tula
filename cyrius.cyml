@@ -1,0 +1,49 @@
+[package]
+name = "tula"
+version = "${file:VERSION}"
+description = "tula (तुला — balance / scale; the instrument that weighs) — sovereign weight-file format for AGNOS: a typed, mmap-friendly tensor manifest + payload with a sigil-signable header. The safetensors/GGUF analog behind the Type-3 pretrained-import path (anukulana). Pure Cyrius, no external deps in M0."
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/tula"
+language = "cyrius"
+cyrius = "6.3.26"
+
+# tula is a library — no CLI binary. `cyrius build` targets a smoke program
+# that links the full include chain to prove src/lib.cyr parses/links clean.
+# Consumers (rupantara / anukulana / the murti load-seam / the control-plane
+# checkpoint store) pull `dist/tula.cyr` via a `[deps.tula]` git-tag entry.
+[build]
+entry = "programs/smoke.cyr"
+output = "build/tula_smoke"
+
+# `[lib]` feeds `cyrius distlib` — module order matters: error.cyr is dep-free;
+# format.cyr uses it. Don't reorder without re-running `cyrius distlib`.
+[lib]
+modules = [
+    "src/error.cyr",
+    "src/format.cyr",
+]
+
+[deps]
+# M0 is stdlib-only (pure serialization; no inflate, no crypto yet). Base set
+# mirrors chitra's foundation minus sankoch/thread (not needed until the
+# optional compressed-container path lands).
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "io",
+    "vec",
+    "str",
+    "syscalls",
+    "assert",
+    "bench",
+    "args",
+    "flags",
+]
+
+# M0b — the sigil-signed header (the trust boundary). The format already
+# RESERVES sig_offset/sig_len (0 = unsigned in M0). Wired next bite:
+# [deps.sigil]
+# git = "https://github.com/MacCracken/sigil"
+# tag = "<pin>"
+# modules = ["dist/sigil.cyr"]

@@ -1,0 +1,110 @@
+# tests/tcyr/roundtrip.tcyr — tula format in-memory round-trip (M0).
+# Self-contained CPU suite (own main + assert_summary), standalone like
+# chitra's tcyr files: include the lib chain + the assert harness.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# Byte-exact comparison of two buffers.
+fn bytes_eq(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ================================================================
+# Build two tensors, serialize, re-open, and verify bit-identical.
+# ================================================================
+fn test_roundtrip() {
+    # tensor A: "w.q" f64 [2,3] = 6 words (48 bytes)
+    var shapeA = alloc(16);
+    store64(shapeA + 0, 2);
+    store64(shapeA + 8, 3);
+    var dataA = alloc(48);
+    var i = 0;
+    while (i < 6) { store64(dataA + i * 8, 1000 + i); i = i + 1; }
+
+    # tensor B: "b0" int8 [4] = 4 bytes
+    var shapeB = alloc(8);
+    store64(shapeB + 0, 4);
+    var dataB = alloc(4);
+    store8(dataB + 0, 10);
+    store8(dataB + 1, 20);
+    store8(dataB + 2, 30);
+    store8(dataB + 3, 40);
+
+    var b = tula_builder_new();
+    tula_builder_add(b, "w.q", TULA_DT_F64, shapeA, 2, dataA, 48);
+    tula_builder_add(b, "b0", TULA_DT_INT8, shapeB, 1, dataB, 4);
+    var buf = tula_builder_finish(b);
+    var total = tula_total_len(buf);
+
+    var r = tula_open(buf, total);
+    assert(r != 0, "open valid buffer");
+    assert_eq(tula_count(r), 2, "two tensors");
+    assert_eq(tula_format_version(r), TULA_VERSION, "format version");
+
+    var e0 = tula_entry(r, 0);
+    assert(streq(tula_entry_name(e0), "w.q"), "entry0 name");
+    assert_eq(tula_entry_dtype(e0), TULA_DT_F64, "entry0 dtype f64");
+    assert_eq(tula_entry_ndim(e0), 2, "entry0 ndim");
+    assert_eq(tula_entry_dim(e0, 0), 2, "entry0 dim0");
+    assert_eq(tula_entry_dim(e0, 1), 3, "entry0 dim1");
+    assert_eq(tula_entry_data_len(e0), 48, "entry0 data_len");
+    assert(bytes_eq(tula_entry_data(r, e0), dataA, 48), "entry0 data bit-identical");
+
+    var e1 = tula_entry(r, 1);
+    assert(streq(tula_entry_name(e1), "b0"), "entry1 name");
+    assert_eq(tula_entry_dtype(e1), TULA_DT_INT8, "entry1 dtype int8");
+    assert_eq(tula_entry_ndim(e1), 1, "entry1 ndim");
+    assert_eq(tula_entry_dim(e1, 0), 4, "entry1 dim0");
+    assert_eq(tula_entry_data_len(e1), 4, "entry1 data_len");
+    assert(bytes_eq(tula_entry_data(r, e1), dataB, 4), "entry1 data bit-identical");
+
+    assert_eq(tula_find(r, "b0"), e1, "find b0");
+    assert_eq(tula_find(r, "nope"), 0, "find missing -> 0");
+    assert_eq(tula_sig_status(r), TULA_SIG_UNSIGNED, "M0 unsigned");
+    return 0;
+}
+
+# ================================================================
+# A corrupt magic must fail to open (no false accept, no deref).
+# ================================================================
+fn test_bad_magic() {
+    var buf = alloc(64);
+    var j = 0;
+    while (j < 8) { store64(buf + j * 8, 0); j = j + 1; }
+    store64(buf + 0, 12345);   # not TULA_MAGIC
+    assert_eq(tula_open(buf, 64), 0, "bad magic -> 0");
+    return 0;
+}
+
+# ================================================================
+# Too-short buffer must fail to open.
+# ================================================================
+fn test_short_buffer() {
+    var buf = alloc(64);
+    store64(buf + 0, TULA_MAGIC);
+    store64(buf + 8, TULA_VERSION);
+    assert_eq(tula_open(buf, 32), 0, "len < header -> 0");
+    return 0;
+}
+
+fn test_version_int() {
+    assert_eq(tula_version_int(), 100, "version 0.1.0 packs to 100");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_roundtrip();
+    test_bad_magic();
+    test_short_buffer();
+    test_version_int();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);
