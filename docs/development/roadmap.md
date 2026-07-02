@@ -41,7 +41,7 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ---
 
-## Shipped (0.1.0 + `[Unreleased]`)
+## Shipped (1.0.0)
 
 - **M0 ✅** format + in-memory round-trip (builder/reader/find). `roundtrip.tcyr` (22).
 - **M0b ✅** Ed25519 signed header via sigil (`sign`/`verify`/`is_signed`). `sign.tcyr` (8).
@@ -70,16 +70,17 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ## Remaining milestones
 
-### v1.0 — freeze & clean cut ✅ (ready; awaiting the maintainer's cut)
+### v1.0 — freeze & clean cut ✅ (cut at file level; awaiting the git tag)
 - **`docs/api.md`** ✅ documents the frozen public surface (format spec + builder/
   reader/sign/file-io/dtype + constants); **`STABILITY.md`** ✅ (format v1 frozen;
   MINOR additive-only; MAJOR = format/API break).
 - **≥1 downstream consumer green** ✅ — `examples/consumer.cyr` (`make example`):
   quantize → build+sidecar → sign → write → read (untrusted) → verify → payload
   guard → unpack → dequant, end-to-end; wired as a **CI gate**.
-- All v1.0 criteria checked (below); CHANGELOG complete. **Remaining = the
-  maintainer's action only**: bump `VERSION → 1.0.0`, rename `[Unreleased]` →
-  `[1.0.0]`, tag (+ ensure the `sigil` tag exists for CI/release).
+- File-level cut done ✅: `VERSION = 1.0.0`, CHANGELOG `[Unreleased]` → `[1.0.0]`,
+  `tula_version_int()` → `10000` (+ test), docs rolled, all criteria checked.
+  **Remaining = the maintainer's git action only**: tag `1.0.0` (fires
+  `release.yml`) after confirming the `sigil` tag (3.9.9) exists on GitHub.
 
 ---
 
@@ -91,7 +92,7 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 - [x] Bench harness + `docs/benchmarks.md` (write/read/mmap at scale)
 - [x] Security audit report + `SECURITY.md` (`docs/audit/2026-07-01-audit.md`, PASS)
 - [x] ≥1 downstream consumer green (`examples/consumer.cyr`, CI gate)
-- [x] CHANGELOG complete; version consistency (VERSION stays 0.1.0 until the maintainer's cut)
+- [x] CHANGELOG complete; version consistency (VERSION `1.0.0` = CHANGELOG `[1.0.0]`)
 
 ---
 

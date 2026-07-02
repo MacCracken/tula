@@ -6,8 +6,9 @@
 
 ## Version
 
-**0.1.0 — released 2026-07-01** (M0 + M0b: format + round-trip + Ed25519 signed
-header). **`[Unreleased]` now adds M1–M5.** M1 — file I/O: `tula_write_file`
+**1.0.0 — API frozen 2026-07-01** (M0–M5; format **v1**). Prior cut: 0.1.0 (M0 +
+M0b: format + round-trip + Ed25519 signed header). **v1.0 added M1–M5.** M1 —
+file I/O: `tula_write_file`
 / `tula_read_file` (heap) / `tula_open_mmap` (zero-copy) / `tula_close_mmap`; tula
 files are self-describing so reads need no `stat()`. M2 — dtype payload helpers
 (`src/dtype.cyr`): ternary/int8/NF4 pure pack/unpack; scales stored as sidecar
@@ -22,8 +23,9 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION stays **0.1.0** until the next cut — the maintainer bumps VERSION,
-renames the CHANGELOG `[Unreleased]` section to `[0.2.0]`, and tags.
+VERSION is **1.0.0** (`tula_version_int()` returns `10000`). Post-1.0 work
+accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
+the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
 ## Toolchain
 
@@ -46,13 +48,12 @@ GitHub** for CI + the release to pass.
 
 ## Next
 
-**v1.0 is feature-complete under `[Unreleased]`** (M1–M5 + freeze docs +
-consumer): `docs/api.md`, `STABILITY.md`, `docs/audit/2026-07-01-audit.md`,
-`SECURITY.md`, `docs/benchmarks.md`, `examples/consumer.cyr`. All v1.0 criteria in
-`roadmap.md` are checked. **Remaining = the maintainer's cut only**: bump VERSION
-→ 1.0.0, rename the CHANGELOG `[Unreleased]` → `[1.0.0]`, tag (+ confirm the
-`sigil` tag exists for CI/release). **At the cut**, also update the
-version-coupled helper `tula_version_int()` (`src/format.cyr`, currently returns
-`100` for 0.1.0 → `10000`) and its assertion in `roundtrip.tcyr`. A future bite
+**1.0.0 is cut at the file level** — VERSION `1.0.0`, CHANGELOG `[1.0.0]`,
+`tula_version_int()` → `10000`, docs rolled, all criteria checked. **The only
+step left is the maintainer's git action** (Claude does not run git): tag `1.0.0`
+(the `release.yml` workflow fires on the tag) after confirming the `sigil` tag
+(3.9.9) exists on GitHub for CI/release resolution.
+
+Post-1.0, work accretes under `[Unreleased]` and is additive-only. A future bite
 could round-trip a real attn11 checkpoint through `tula_*_file` once attn11's
 checkpoint reader lands.

@@ -93,7 +93,7 @@ fn test_short_buffer() {
 }
 
 fn test_version_int() {
-    assert_eq(tula_version_int(), 100, "version 0.1.0 packs to 100");
+    assert_eq(tula_version_int(), 10000, "version 1.0.0 packs to 10000");
     return 0;
 }
 

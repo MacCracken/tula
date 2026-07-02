@@ -1,10 +1,18 @@
 # Changelog
 
 All notable changes to `tula` are documented here. Format follows
-[Keep a Changelog](https://keepachangelog.com/); this project is SemVer
-(pre-1.0 — the public surface is still moving, no API freeze until v1.0).
+[Keep a Changelog](https://keepachangelog.com/); this project is SemVer. As of
+**v1.0** the public surface is frozen — see [`STABILITY.md`](STABILITY.md)
+(format v1 stable; MINOR = additive-only; MAJOR = format/API break).
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-07-01
+
+**v1.0 — API freeze.** The codec surface is frozen (`docs/api.md` +
+`STABILITY.md`); the on-disk format is **v1**. The march from 0.1.0: file I/O,
+dtype payload helpers, reader hardening (the untrusted-input trust gate), fuzz +
+bench, and a security audit — with a green end-to-end downstream consumer.
 
 ### Added
 - **v1.0 prep — freeze docs + downstream consumer.** `docs/api.md` documents the
@@ -79,9 +87,6 @@ All notable changes to `tula` are documented here. Format follows
   self-describing (the header carries the total length), so reads need no `stat()`.
 - `tests/tcyr/fileio.tcyr` (**16 assertions**): write→read bit-identical, signed
   file survives + verifies, mmap round-trip, missing-file → 0. Suite total now **46**.
-
-_(Un-versioned: VERSION stays 0.1.0 until the next cut — the maintainer bumps
-VERSION + renames this section to `[0.2.0]` + tags.)_
 
 ## [0.1.0] — 2026-07-01
 
