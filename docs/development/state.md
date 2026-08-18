@@ -29,10 +29,12 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
 
 ## Toolchain
 
-Cyrius pin **6.3.27** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
+Cyrius pin **6.5.27** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
 **sigil** (Ed25519). Local dev resolves sigil via `path = "../sigil"`; CI/release
 resolve via `[deps.sigil]` **git+tag** — so **sigil 3.9.9 must be tagged on
 GitHub** for CI + the release to pass.
+
+**Pin bumped to `6.5.27` 2026-08-17** (ecosystem-wide ML/AI-arc realign, ahead of the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib snapshot; suite re-verified green at the new pin.
 
 ## Build artifacts
 

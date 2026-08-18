@@ -7,6 +7,30 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-17
+
+### Changed
+
+- **Cyrius pin `6.3.27` -> `6.5.27`** (2026-08-17, ecosystem-wide ML/AI-arc realign ahead of
+  the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib
+  snapshot.
+- **`[deps.sigil]` tag `3.9.9` -> `3.12.9`.** The declared tag was three minors behind while a
+  `path = "../sigil"` override meant local dev and the 105-assertion suite had been resolving
+  the *working copy* all along — so the tag was never exercised and CI was the only thing that
+  would ever have built the declared graph ([[reference_path_override_disables_the_tag_as_a_test]]).
+  Aligning it makes CI build what dev has been testing. Vendored `lib/sigil.cyr` confirmed at
+  `# Version: 3.12.9`; suite **105/105**, unchanged.
+
+### Fixed
+
+- **The suite was `0 passed / 5 failed` at the old pin — every file a compile error — and the
+  bump is what made it green (5/5, 105 assertions).** The vendored `lib/sigil.cyr` calls
+  `thread_local_alloc`, which the stdlib only gained at cyrius **v6.4.65**; tula's pin was
+  6.3.27, so `lib/thread_local.cyr` was a snapshot that predates the function and every test
+  binary died on `refusing to emit binary with 1 reachable undefined function(s)`. Nothing in
+  tula's own source was wrong — this is the stale-vendored-stdlib trap, and re-syncing at the
+  new pin is the whole fix. The frozen v1 format and the public API are untouched.
+
 ## [1.0.0] — 2026-07-01
 
 **v1.0 — API freeze.** The codec surface is frozen (`docs/api.md` +
