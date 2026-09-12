@@ -63,5 +63,5 @@ stdlib = [
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-tag = "3.12.9"
+tag = "3.12.16"
 modules = ["dist/sigil.cyr"]
