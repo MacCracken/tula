@@ -5,7 +5,7 @@ description = "tula (तुला — balance / scale; the instrument that weigh
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/tula"
 language = "cyrius"
-cyrius = "6.5.27"
+cyrius = "6.6.2"
 
 # tula is a library — no CLI binary. `cyrius build` targets a smoke program
 # that links the full include chain to prove src/lib.cyr parses/links clean.

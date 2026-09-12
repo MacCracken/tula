@@ -7,6 +7,14 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.27` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests, and any bench/fuzz/distlib target the repo ships re-verified at the new pin.
+
+
 ## [1.0.1] — 2026-08-17
 
 ### Changed
