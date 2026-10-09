@@ -105,3 +105,21 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   event.
 - **Ecosystem context:** the AGNOS planning docs `type3-weight-import.md`
   (gap #1) + `software-port-path.md` (Tier A). tula is gap #1's format codec.
+
+## Recorded by cyrius 6.7.6 (2026-10-08) — for the next cyrius pin move
+
+⛔ Needs cyrius >= 6.7.6 — nothing to do until cyrius 6.7.6 is tagged; then at your pin bump:
+
+- **Git first: a `path` beside `git` / `tag` becomes a dev override** (here: `sigil`).
+  From 6.7.6 it is read only in local mode (`CYRIUS_LOCAL=1`, `CYRIUS_LOCAL=<dep,dep>` or `--local`).
+  With no switch, `cyrius deps` / `build` resolve the TAG (commit pin checked) and print one `hint:`
+  line naming the checkout not used, so a local build and CI compile the same code.
+- Local mode prints a `local:` line per override and builds from `build/local-deps/` without writing
+  `lib/` or `cyrius.lock`; a hand-written `include "lib/<dep>.cyr"` sees the override there too (the
+  compiler's `CYRIUS_LIB_OVERLAY`, set by `cyrius`).
+- The first default resolve adds commit pins for these deps to `cyrius.lock` — a one-time diff.
+- CI lock guards and `sed`-the-path-out steps can become `cyrius deps --locked`.
+- `.github/workflows/ci.yml:36-38`'s comment (the `path = "../sigil"` override "only applies to local dev")
+  becomes exact: local dev now means the switch. anukulana and ifran resolve tula from its tag, and from 6.7.6 a
+  dependency resolved from its tag has its own `path` entries ignored.
+- Reference: the cyrius guide's *Git first; local development is a switch (6.7.6)*.
