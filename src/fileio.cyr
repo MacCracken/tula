@@ -219,10 +219,11 @@ fn _tula_sw_pad(sw, n): i64 {
 # tula_serialize lays out (shared layout helpers), signature excluded. Returns
 # content_len, or a negative errno.
 fn _tula_stream(b, sw, sig_len): i64 {
-    var lay[64];
+    var lay[96];
     _tula_layout(b, sig_len, &lay);
     var count = load64(b);
     var tsize = load64(&lay + 48);
+    var msize = load64(&lay + 64);
     var h[64];
     _tula_header_write(&h, &lay);
     _tula_sw_put(sw, &h, TULA_HEADER_SIZE);
@@ -231,9 +232,14 @@ fn _tula_stream(b, sw, sig_len): i64 {
         _tula_sw_put(sw, _tula_bentry(b, i), TULA_ENTRY_SIZE);   # the entry image built at add time
         i = i + 1;
     }
+    if (msize > 0) {
+        var me[144];
+        _tula_meta_entry_write(&me, load64(&lay + 72), msize);
+        _tula_sw_put(sw, &me, TULA_ENTRY_SIZE);
+    }
     if (tsize > 0) {
         var te[144];
-        _tula_names_entry_write(&te, load64(&lay + 56), tsize);
+        _tula_names_entry_write(&te, load64(&lay + 80), tsize);
         _tula_sw_put(sw, &te, TULA_ENTRY_SIZE);
     }
     i = 0;
@@ -244,6 +250,7 @@ fn _tula_stream(b, sw, sig_len): i64 {
         _tula_sw_pad(sw, tula_align8(dlen) - dlen);
         i = i + 1;
     }
+    if (msize > 0) { _tula_stream_meta(b, sw, msize); }
     if (tsize > 0) {
         var nl = load64(b + 40);
         var hdr[16];
@@ -282,6 +289,45 @@ fn _tula_stream(b, sw, sig_len): i64 {
     var content = load64(&lay + 24);
     if (load64(sw + 32) != content) { return 0 - 5; }   # the layout and the stream must agree
     return content;
+}
+
+# The metadata table's payload (ADR 0008) through sw: the same bytes
+# _tula_write_meta lays out in memory.
+fn _tula_stream_meta(b, sw, msize): i64 {
+    var mt = load64(b + 56);
+    var np = load64(mt);
+    var arr = load64(mt + 16);
+    var hdr[16];
+    store64(&hdr, TULA_META_MAGIC);
+    store64(&hdr + 8, np);
+    _tula_sw_put(sw, &hdr, TULA_META_HDR);
+    var rec[32];
+    var cur = TULA_META_HDR + np * TULA_META_REC;
+    var q = 0;
+    while (q < np) {
+        var src = arr + q * 32;
+        var kl = load64(src + 8);
+        var vl = load64(src + 24);
+        store64(&rec, cur);
+        store64(&rec + 8, kl);
+        store64(&rec + 16, cur + kl + 1);
+        store64(&rec + 24, vl);
+        _tula_sw_put(sw, &rec, TULA_META_REC);
+        cur = cur + kl + 1 + vl + 1;
+        q = q + 1;
+    }
+    var nul = 0;
+    q = 0;
+    while (q < np) {
+        var src2 = arr + q * 32;
+        _tula_sw_put(sw, load64(src2), load64(src2 + 8));
+        _tula_sw_put(sw, &nul, 1);
+        _tula_sw_put(sw, load64(src2 + 16), load64(src2 + 24));
+        _tula_sw_put(sw, &nul, 1);
+        q = q + 1;
+    }
+    _tula_sw_pad(sw, tula_align8(msize) - msize);
+    return 0;
 }
 
 # Sign the `content` bytes just written to fd (ADR 0006): map them read-only, run

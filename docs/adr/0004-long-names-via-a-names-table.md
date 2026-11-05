@@ -86,7 +86,8 @@ change: `TULA_VERSION` stays 1, the entry stays 144 bytes.
 
 - **Format v2 with variable-length names** — rejected for now: a MAJOR that every
   consumer must take at once, for something a reserved tensor carries within v1.
-  It stays the fallback (roadmap 2.0) if this proves insufficient.
+  It stays the fallback (the roadmap's v2 potential items) if this proves
+  insufficient.
 - **Field = the truncated name, table maps entry → full name** — rejected: the
   truncated prefix is exactly what collides, so lookup by full name would have to
   scan every candidate's full name, and old readers would still see two tensors

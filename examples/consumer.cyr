@@ -6,6 +6,8 @@
 #   read (untrusted) -> strict validate -> signature required -> scale lookup +
 #   payload-ok guard -> unpack -> dequant.
 #
+# 1.6.0: the file carries metadata (ADR 0008) — what it is and where it came
+# from — signed with the weights and read back with tula_meta_get.
 # 1.3.0: a LoRA adapter tensor whose name is over 47 chars, stored as bf16 —
 # written with tula_builder_add_long, found with tula_find_name (ADR 0004/0005).
 # 1.2.0: written with tula_builder_add_checked (no silent name truncation, no
@@ -105,6 +107,8 @@ fn main(): i64 {
     var lb = alloc(bn * 2);
     tula_bf16_pack(bias, bn, lb);
     if (tula_builder_add_long(b, lora, TULA_DT_BF16, shapeB, 1, lb, bn * 2) != 0) { return 1; }
+    if (tula_builder_set_meta(b, "model.kind", "ternary toy (b1.58-style)") != 0) { return 1; }
+    if (tula_builder_set_meta(b, "model.source", "examples/consumer.cyr") != 0) { return 1; }
     var buf = tula_builder_finish_signed(b, sk);
     var total = tula_total_len(buf);
 
@@ -125,7 +129,12 @@ fn main(): i64 {
     #    bytes. After this, data_len == the dtype's packed length for every entry.
     var src = tula_validate_strict(r, tula_total_len(r));
     if (src != TULA_OK) { sput("FAIL: strict: "); sput(tula_err_name(src)); sput("\n"); return 1; }
-    if (tula_count(r) != 5) { sput("FAIL: tensor count (4 + the names table)\n"); return 1; }
+    if (tula_count(r) != 6) { sput("FAIL: tensor count (4 + metadata + names tables)\n"); return 1; }
+    var kind = tula_meta_get(r, "model.kind");
+    if (kind == 0) { sput("FAIL: metadata missing\n"); return 1; }
+    sput("metadata: model.kind = ");
+    sput(kind);
+    sput("\n");
 
     # 2. authenticity — a stripped (UNSIGNED) file is rejected as firmly as BAD
     if (tula_verify_required(r, pk) != TULA_OK) { sput("FAIL: signature\n"); return 1; }

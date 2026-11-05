@@ -1,0 +1,337 @@
+# tests/tcyr/meta.tcyr — 1.6.0 file metadata (ADR 0008): set / replace / get /
+# iterate; the same pairs give the same bytes in any set order; key rules (the
+# reserved "tula." prefix); UTF-8 validation (overlong, surrogate, > U+10FFFF,
+# stray continuation, truncated); caps; position before the names table; the
+# streaming writers; the reserved tensor name; strict canonical rules under
+# tampering; malformed records read as absent; the signature covers metadata.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn shape1(a): i64 {
+    var p = alloc(8);
+    store64(p, a);
+    return p;
+}
+
+fn bytes_eq(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# A NUL-terminated string from n bytes given as an i64 array.
+fn raw(arr, n): i64 {
+    var p = alloc(n + 1);
+    var i = 0;
+    while (i < n) { store8(p + i, load64(arr + i * 8)); i = i + 1; }
+    store8(p + n, 0);
+    return p;
+}
+
+fn bytes3(a, b, c): i64 {
+    var arr = alloc(24);
+    store64(arr, a);
+    store64(arr + 8, b);
+    store64(arr + 16, c);
+    return raw(arr, 3);
+}
+
+fn opened(buf): i64 {
+    return tula_open(buf, tula_total_len(buf));
+}
+
+fn test_set_get_iterate() {
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "w", TULA_DT_INT8, shape1(2), 1, alloc(8), 2);
+    assert_eq(tula_builder_set_meta(b, "hf.config", "{\"hidden_size\": 4096}"), 0, "set hf.config");
+    assert_eq(tula_builder_set_meta(b, "anukulana.source", "gpt2/model.safetensors"), 0, "set anukulana.source");
+    assert_eq(tula_builder_set_meta(b, "hf.architecture", "GPT2LMHeadModel"), 0, "set hf.architecture");
+    assert_eq(tula_builder_set_meta(b, "license", ""), 0, "an empty value is fine");
+    assert_eq(tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM"), 0, "replace a value");
+    var buf = tula_builder_finish(b);
+    var r = opened(buf);
+    assert(r != 0, "a file with metadata opens");
+    assert_eq(tula_meta_count(r), 4, "4 pairs (the replace did not add one)");
+    assert(streq(tula_meta_get(r, "hf.architecture"), "LlamaForCausalLM"), "get returns the replaced value");
+    assert(streq(tula_meta_get(r, "hf.config"), "{\"hidden_size\": 4096}"), "get hf.config");
+    assert(streq(tula_meta_get(r, "license"), ""), "get an empty value");
+    assert_eq(tula_meta_get(r, "hf"), 0, "a prefix of a key is not a key");
+    assert_eq(tula_meta_get(r, "zzz"), 0, "a missing key -> 0");
+    assert(streq(tula_meta_key(r, 0), "anukulana.source"), "pairs iterate in key order: 0");
+    assert(streq(tula_meta_key(r, 1), "hf.architecture"), "... 1");
+    assert(streq(tula_meta_key(r, 2), "hf.config"), "... 2");
+    assert(streq(tula_meta_key(r, 3), "license"), "... 3");
+    assert(streq(tula_meta_value(r, 0), "gpt2/model.safetensors"), "value 0");
+    assert_eq(tula_meta_key(r, 4), 0, "key past the end -> 0");
+    assert_eq(tula_meta_value(r, 0 - 1), 0, "a negative index -> 0");
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "strict-valid");
+    var e = tula_find(r, "__tula.meta__");
+    assert(e == tula_entry(r, tula_count(r) - 1), "without long names the metadata table is last");
+    assert_eq(tula_entry_dtype(e), TULA_DT_INT8, "... an ordinary int8 tensor to an old reader");
+    var none = tula_builder_finish(tula_builder_new());
+    assert_eq(tula_meta_count(opened(none)), 0, "no metadata -> count 0");
+    assert_eq(tula_meta_get(opened(none), "x"), 0, "no metadata -> get 0");
+    return 0;
+}
+
+fn test_order_independent() {
+    var b1 = tula_builder_new();
+    var b2 = tula_builder_new();
+    tula_builder_set_meta(b1, "c.k", "3");
+    tula_builder_set_meta(b1, "a.k", "1");
+    tula_builder_set_meta(b1, "b.k", "2");
+    tula_builder_set_meta(b2, "b.k", "2");
+    tula_builder_set_meta(b2, "c.k", "old");
+    tula_builder_set_meta(b2, "a.k", "1");
+    tula_builder_set_meta(b2, "c.k", "3");
+    var x = tula_builder_finish(b1);
+    var y = tula_builder_finish(b2);
+    var n = tula_total_len(x);
+    assert_eq(tula_total_len(y), n, "same length");
+    assert(bytes_eq(x, y, n), "the same pairs give the same bytes, whatever the set order");
+    return 0;
+}
+
+fn test_key_rules() {
+    var b = tula_builder_new();
+    assert_eq(tula_builder_set_meta(b, "", "v"), TULA_ERR_META, "an empty key -> META");
+    assert_eq(tula_builder_set_meta(b, "1abc", "v"), TULA_ERR_META, "a key starting with a digit -> META");
+    assert_eq(tula_builder_set_meta(b, ".abc", "v"), TULA_ERR_META, "a key starting with '.' -> META");
+    assert_eq(tula_builder_set_meta(b, "a b", "v"), TULA_ERR_META, "a space -> META");
+    assert_eq(tula_builder_set_meta(b, "a/b", "v"), TULA_ERR_META, "a '/' -> META");
+    assert_eq(tula_builder_set_meta(b, bytes3(97, 0xC3, 0xA9), "v"), TULA_ERR_META, "a non-ASCII key -> META");
+    assert_eq(tula_builder_set_meta(b, "tula.version", "v"), TULA_ERR_META, "the reserved tula. prefix -> META");
+    assert_eq(tula_builder_set_meta(b, "tula", "v"), 0, "'tula' alone is not the prefix");
+    assert_eq(tula_builder_set_meta(b, "tulax.y", "v"), 0, "'tulax.' is not the prefix");
+    assert_eq(tula_builder_set_meta(b, "A-b_c.D9", "v"), 0, "letters, digits, '.', '_', '-'");
+    var k = alloc(300);
+    var i = 0;
+    while (i < 255) { store8(k + i, 97); i = i + 1; }
+    store8(k + 255, 0);
+    assert_eq(tula_builder_set_meta(b, k, "v"), 0, "a 255-byte key");
+    store8(k + 255, 97);
+    store8(k + 256, 0);
+    assert_eq(tula_builder_set_meta(b, k, "v"), TULA_ERR_META, "a 256-byte key -> META");
+    assert_eq(load64(load64(b + 56)), 4, "only the 4 valid keys were set");
+    return 0;
+}
+
+fn test_utf8_values() {
+    var b = tula_builder_new();
+    assert_eq(tula_builder_set_meta(b, "v.ascii", "plain"), 0, "ASCII");
+    assert_eq(tula_builder_set_meta(b, "v.latin", bytes3(0xC3, 0xA9, 0x21)), 0, "2-byte U+00E9");
+    assert_eq(tula_builder_set_meta(b, "v.cjk", bytes3(0xE6, 0x97, 0xA5)), 0, "3-byte U+65E5");
+    var em = alloc(32);
+    store64(em, 0xF0); store64(em + 8, 0x9F); store64(em + 16, 0x98); store64(em + 24, 0x80);
+    assert_eq(tula_builder_set_meta(b, "v.emoji", raw(em, 4)), 0, "4-byte U+1F600");
+    var top = alloc(32);
+    store64(top, 0xF4); store64(top + 8, 0x8F); store64(top + 16, 0xBF); store64(top + 24, 0xBF);
+    assert_eq(tula_builder_set_meta(b, "v.max", raw(top, 4)), 0, "U+10FFFF, the last code point");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0xC0, 0x80, 0x41)), TULA_ERR_META, "overlong C0 80 -> META");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0xE0, 0x80, 0x80)), TULA_ERR_META, "overlong E0 80 80 -> META");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0xED, 0xA0, 0x80)), TULA_ERR_META, "surrogate ED A0 80 -> META");
+    store64(top + 8, 0x90);
+    assert_eq(tula_builder_set_meta(b, "x", raw(top, 4)), TULA_ERR_META, "F4 90 80 80 (past U+10FFFF) -> META");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0xF5, 0x80, 0x80)), TULA_ERR_META, "lead byte F5 -> META");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0x41, 0x80, 0x41)), TULA_ERR_META,
+        "a stray continuation byte -> META");
+    var tr = alloc(16);
+    store64(tr, 0xE6); store64(tr + 8, 0x97);
+    assert_eq(tula_builder_set_meta(b, "x", raw(tr, 2)), TULA_ERR_META, "a truncated sequence -> META");
+    assert_eq(tula_builder_set_meta(b, "x", bytes3(0xE6, 0x41, 0xA5)), TULA_ERR_META, "a bad continuation -> META");
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_meta_count(opened(buf)), 5, "the 5 valid values were stored");
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "... and the file is strict-valid");
+    return 0;
+}
+
+fn test_caps() {
+    var b = tula_builder_new();
+    var k = alloc(16);
+    var i = 0;
+    var bad = 0;
+    while (i < TULA_META_MAX_PAIRS) {
+        store8(k, 107);
+        store8(k + 1, 48 + (i / 1000) % 10);
+        store8(k + 2, 48 + (i / 100) % 10);
+        store8(k + 3, 48 + (i / 10) % 10);
+        store8(k + 4, 48 + i % 10);
+        store8(k + 5, 0);
+        if (tula_builder_set_meta(b, k, "v") != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "4,096 pairs accepted");
+    assert_eq(tula_builder_set_meta(b, "z.one.more", "v"), TULA_ERR_META, "the 4,097th pair -> META");
+    assert_eq(tula_builder_set_meta(b, "k0042", "replaced"), 0, "replacing at the cap is fine");
+    var buf = tula_builder_finish(b);
+    var r = opened(buf);
+    assert_eq(tula_meta_count(r), 4096, "4,096 pairs in the file");
+    assert(streq(tula_meta_get(r, "k0042"), "replaced"), "binary search finds a pair among 4,096");
+    assert(streq(tula_meta_get(r, "k4095"), "v"), "... and the last");
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "a 4,096-pair table is strict-valid");
+    var big = alloc(TULA_META_VALUE_MAX + 2);
+    var j = 0;
+    while (j < TULA_META_VALUE_MAX + 1) { store8(big + j, 97); j = j + 1; }
+    store8(big + TULA_META_VALUE_MAX + 1, 0);
+    assert_eq(tula_builder_set_meta(tula_builder_new(), "big", big), TULA_ERR_META, "a value of 16 MiB + 1 -> META");
+    return 0;
+}
+
+fn lora_a(): i64 { return "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"; }
+
+fn test_with_long_names_and_streaming() {
+    var b = tula_builder_new();
+    tula_builder_add_long(b, lora_a(), TULA_DT_INT8, shape1(2), 1, alloc(8), 2);
+    tula_builder_add_long(b, "bias", TULA_DT_INT8, shape1(2), 1, alloc(8), 2);
+    tula_builder_set_meta(b, "hf.base_model", "meta-llama/Llama-2-7b-hf");
+    tula_builder_set_meta(b, "peft.r", "16");
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    var r = opened(buf);
+    assert_eq(tula_count(r), 4, "2 tensors + the metadata table + the names table");
+    assert(streq(tula_entry_name(tula_entry(r, 2)), "__tula.meta__"), "metadata comes before the names table");
+    assert_eq(tula_has_long_names(r), 1, "the names table is still found (last)");
+    assert(tula_find_name(r, lora_a()) != 0, "the long name still resolves");
+    assert(streq(tula_meta_get(r, "peft.r"), "16"), "metadata reads with a names table present");
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "metadata + long names: strict-valid");
+    var path = "build/test_meta_stream.tula";
+    assert_eq(tula_builder_write_file(b, path), len, "streamed with metadata");
+    var out = alloc(len + 16);
+    assert_eq(file_read_all(path, out, len + 16), len, "... same length");
+    assert(bytes_eq(out, buf, len), "... and the same bytes as tula_builder_finish");
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, i * 5 + 1); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var sb = tula_builder_finish_signed(b, sk);
+    var sl = tula_total_len(sb);
+    assert_eq(tula_builder_write_file_signed(b, path, sk), sl, "streamed signed with metadata");
+    var so = alloc(sl + 16);
+    file_read_all(path, so, sl + 16);
+    assert(bytes_eq(so, sb, sl), "... the same bytes as tula_builder_finish_signed");
+    var rs = opened(sb);
+    assert_eq(tula_verify_required(rs, pk), TULA_OK, "the signature verifies");
+    var v = tula_meta_get(rs, "hf.base_model");
+    store8(v, 77);
+    assert_eq(tula_verify_required(rs, pk), TULA_ERR_SIG, "editing a metadata value breaks the signature");
+    return 0;
+}
+
+fn test_reserved_name() {
+    var d = alloc(8);
+    var b = tula_builder_new();
+    assert_eq(tula_builder_add_long(b, "__tula.meta__", TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+        "add_long refuses the table's name");
+    assert_eq(tula_builder_add_checked(b, "__tula.meta__", TULA_DT_INT8, shape1(1), 1, d, 1), 0,
+        "without metadata it's an ordinary name (1.2 behaviour)");
+    assert_eq(tula_builder_set_meta(b, "a.b", "c"), TULA_ERR_DUP_NAME, "... but then no metadata can be set");
+    var b2 = tula_builder_new();
+    tula_builder_set_meta(b2, "a.b", "c");
+    assert_eq(tula_builder_add_checked(b2, "__tula.meta__", TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+        "with metadata set, add_checked refuses it");
+    var plain = tula_builder_finish(b);
+    assert_eq(tula_meta_count(opened(plain)), 0, "a 1.2-style tensor of that name is not a table");
+    assert_eq(tula_validate_strict(plain, tula_total_len(plain)), TULA_OK, "... and is strict-valid");
+    var only = tula_builder_new();
+    tula_builder_set_meta(only, "only.meta", "yes");
+    var ob = tula_builder_finish(only);
+    assert_eq(tula_count(opened(ob)), 1, "metadata with no tensors: one entry, the table");
+    assert(streq(tula_meta_get(opened(ob), "only.meta"), "yes"), "... that reads back");
+    assert_eq(tula_validate_strict(ob, tula_total_len(ob)), TULA_OK, "... strict-valid");
+    return 0;
+}
+
+# A fresh 3-pair file and its table pointer.
+fn three(): i64 {
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "w", TULA_DT_INT8, shape1(2), 1, alloc(8), 2);
+    tula_builder_set_meta(b, "a.x", "alpha");
+    tula_builder_set_meta(b, "b.y", "beta");
+    tula_builder_set_meta(b, "c.z", "gamma");
+    return tula_builder_finish(b);
+}
+
+fn table(buf): i64 {
+    var r = opened(buf);
+    return tula_entry_data(r, tula_find(r, "__tula.meta__"));
+}
+
+fn test_strict_rules() {
+    var buf = three();
+    var len = tula_total_len(buf);
+    var t = table(buf);
+    # records at t+16, 32 bytes each; record 1 is b.y
+    var k1 = t + load64(t + 16 + 32);
+    store8(k1, 100);                                       # "d.y": a, d, c — out of order
+    assert_eq(tula_validate(buf, len), TULA_OK, "unsorted keys pass validate");
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "unsorted keys -> META");
+
+    buf = three(); t = table(buf);
+    k1 = t + load64(t + 16 + 32);
+    store8(k1, 97);
+    store8(k1 + 2, 120);                                   # "a.x" twice
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "a repeated key -> META");
+
+    buf = three(); t = table(buf);
+    store8(t + load64(t + 16 + 32) + 1, 32);               # "b y": a bad key char
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "a bad key character -> META");
+
+    buf = three(); t = table(buf);
+    var v0 = t + load64(t + 16 + 16);
+    store8(v0, 0xC0);
+    store8(v0 + 1, 0x80);                                  # overlong in "alpha"
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "invalid UTF-8 in a value -> META");
+
+    buf = three(); t = table(buf);
+    v0 = t + load64(t + 16 + 16);
+    store8(v0 + 2, 0);                                     # NUL inside a value
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "a NUL inside a value -> META");
+
+    buf = three(); t = table(buf);
+    store64(t + 16 + 16, load64(t + 16 + 16) + 1);         # val_off not packed
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_META, "a misplaced value -> META");
+
+    buf = three(); t = table(buf);
+    store64(t, 0);                                         # no magic
+    assert_eq(tula_meta_count(opened(buf)), 0, "no magic -> no metadata");
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "... and an ordinary int8 tensor, strict-valid");
+    return 0;
+}
+
+fn test_malformed_records_safe() {
+    var buf = three();
+    var r = opened(buf);
+    var t = table(buf);
+    store64(t + 16 + 32, 0x7FFFFFFFFFFFFF00);              # record 1 key_off far out
+    assert_eq(tula_meta_key(r, 1), 0, "an out-of-range key_off reads as absent");
+    assert_eq(tula_meta_get(r, "b.y"), 0, "... and get stops with absent (no read)");
+    store64(t + 16 + 32, 0 - 4);
+    assert_eq(tula_meta_key(r, 1), 0, "a negative key_off reads as absent");
+    store64(t + 16 + 48, 0x7FFFFFFFFFFFFFFF);              # record 1 val_off far out
+    assert_eq(tula_meta_value(r, 1), 0, "an out-of-range val_off reads as absent");
+    store64(t + 8, 0x1000000);                             # pair count past the table
+    assert_eq(tula_meta_count(r), 0, "a pair count the table can't hold -> no metadata");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_set_get_iterate();
+    test_order_independent();
+    test_key_rules();
+    test_utf8_values();
+    test_caps();
+    test_with_long_names_and_streaming();
+    test_reserved_name();
+    test_strict_rules();
+    test_malformed_records_safe();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

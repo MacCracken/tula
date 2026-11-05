@@ -12,7 +12,10 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
   (`TULA_DT_F64/INT8/TERNARY/NF4`, and from 1.3.0 `F32/F16/BF16` with ADR 0005's
   conversion semantics), the signed-header scheme (Ed25519 over `[0, sig_off)`,
   `sig_len ∈ {0, 64}`), and from 1.3.0 the long-name convention (ADR 0004): the
-  key formula, the `__tula.names__` table layout, and its magic. A file written
+  key formula, the `__tula.names__` table layout, and its magic. From 1.6.0 also
+  the metadata convention (ADR 0008): the `__tula.meta__` table's position,
+  layout and magic, the key rules and the reserved `tula.` prefix, the
+  UTF-8-text values, and the caps (`TULA_META_*`). A file written
   by v1.x opens on any later 1.x, and vice versa. An older reader sees a
   long-named tensor by its key.
 - **Public functions** — the builder, reader, accessors, signature, file-I/O, and

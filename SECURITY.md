@@ -86,6 +86,18 @@ O(n log n) and lookup O(log n) whatever the file holds. The fuzzer builds an
 index for every accepted buffer, under the guard page, and checks that it agrees
 with `tula_find_name`.
 
+**Metadata (1.6.0) is read as untrusted too** (ADR 0008):
+- The table is recognized only by its position, name, dtype, magic and a pair
+  count that fits its bytes.
+- Each record is bounds-checked when read; one that doesn't hold up reads as
+  absent. Values are returned as NUL-terminated pointers into the file.
+- `tula_validate_strict` additionally requires well-formed UTF-8 (no overlongs,
+  surrogates or code points past U+10FFFF) and no NUL. A consumer that parses a
+  value (as JSON, say) should strict-validate first, and still treat the text
+  as input from whoever made the file.
+- The signature covers metadata, so editing a value breaks it.
+- The guard-page fuzzer mutates the table directly (phase G).
+
 **The names table (1.3.0) is read as untrusted too.** It is recognized only by
 its name, dtype, magic and a record count that fits its bytes. Each record is
 bounds-checked when `tula_entry_full_name` reads it; one that doesn't hold up is

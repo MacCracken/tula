@@ -507,6 +507,38 @@ fn main(): i64 {
     report_op("index find(S): ", BN_FIND_N, ismin);
     tula_index_free(ixs);
 
+    # ---- metadata (1.6.0): 64 pairs set, then each read back by key ----
+    var mkeys = alloc(64 * 8);
+    var mb = tula_builder_new();
+    var mi = 0;
+    var t9a = now_ns();
+    while (mi < 64) {
+        var mk = alloc(32);
+        var mkl = cat_into(mk, "bench.key.");
+        mkl = mkl + put_dec(mk + mkl, (mi * 37) % 64);
+        store8(mk + mkl, 0);
+        store64(mkeys + mi * 8, mk);
+        var mv = "{\"value\": \"some config text\"}";
+        if (tula_builder_set_meta(mb, mk, mv) != 0) { sput("set_meta FAILED\n"); return 1; }
+        mi = mi + 1;
+    }
+    var t9b = now_ns();
+    report_op("meta set (64): ", 64, t9b - t9a);
+    var mr = tula_builder_finish(mb);
+    var mgmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t9c = now_ns();
+        var mq = 0;
+        while (mq < 64) {
+            if (tula_meta_get(mr, load64(mkeys + mq * 8)) == 0) { sput("meta_get MISSED\n"); return 1; }
+            mq = mq + 1;
+        }
+        mgmin = min_of(mgmin, round, now_ns() - t9c);
+        round = round + 1;
+    }
+    report_op("meta get (64): ", 64, mgmin);
+
     # ---- scaling: 4,096 tensors, every name looked up once ----
     var bigb = tula_builder_new_cap(4096);
     var bnames = alloc(4096 * 8);

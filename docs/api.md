@@ -59,6 +59,18 @@ name_len}` (i64 each, sorted by entry), then the names, each NUL-terminated.
 Files without long names have no table. Every 1.x reader opens files that have
 one, seeing the keys as names and the table as an ordinary int8 tensor.
 
+### File metadata (1.6.0, ADR 0008)
+
+Key/value text about the file (architecture, config, provenance) lives in the
+**metadata table**, a reserved int8 tensor `__tula.meta__`. It sits after every
+ordinary tensor and before the names table, which stays last, and the signature
+covers it. Its payload is the magic `"tula.mt1"`, a pair count P, then P records
+`{key_off, key_len, val_off, val_len}` sorted by key (unique), then for each
+record the key, a NUL, the value and a NUL. Keys are 1–255 ASCII letters,
+digits, `.`, `_` or `-`, starting with a letter; `tula.*` is reserved. Values
+are well-formed UTF-8 text, no NUL, ≤ 16 MiB. A table holds ≤ 4,096 pairs and
+≤ 64 MiB. Every 1.x reader opens such files and sees an ordinary int8 tensor.
+
 ---
 
 ## Errors — `src/error.cyr`
@@ -78,11 +90,13 @@ one, seeing the keys as names and the table as an ordinary int8 tensor.
 | | | | `TULA_ERR_SHAPE` | 15 |
 | | | | `TULA_ERR_DTYPE` | 16 |
 | | | | `TULA_ERR_NAMES` | 17 |
+| | | | `TULA_ERR_META` | 18 |
 | | | | `TULA_ERR_OTHER` | 99 |
 
 Codes 13–16 are new in 1.2.0, returned by the checked add and the strict
 validator. 17 is new in 1.3.0 (a malformed names table, from the strict
-validator).
+validator). 18 is new in 1.6.0 (a bad metadata key or value from the writer, or
+a malformed metadata table from the strict validator).
 
 ---
 
@@ -123,6 +137,20 @@ validator).
   on keys: two different long names refuse each other only if both their 30-byte
   prefix and their 64-bit hash match. That is loud, never a silent collision.
   Once a builder holds a long name, `add_checked` also refuses `__tula.names__`.
+- `fn tula_builder_set_meta(b, key, value) -> 0 | TULA_ERR_*` *(1.6.0, ADR
+  0008)* — set or replace a metadata pair. Both strings are copied, and the
+  table is written in key order, so the same pairs give the same bytes whatever
+  order they were set in. tula writes no keys of its own. Errors (builder
+  unchanged):
+  - `TULA_ERR_META`: a bad key, the reserved `tula.` prefix, a value that isn't
+    UTF-8 or is over 16 MiB, or past 4,096 pairs or 64 MiB;
+  - `TULA_ERR_DUP_NAME`: the first pair, when the builder already holds a tensor
+    named `__tula.meta__`;
+  - `TULA_ERR_TOO_MANY` / `TULA_ERR_TOO_BIG`: no manifest slot, or the file cap;
+  - `TULA_ERR_OOM`.
+
+  Once metadata is set, `add_checked` refuses `__tula.meta__`; `add_long`
+  always does.
 - `fn tula_builder_finish(b) -> buf | 0` — serialize to one contiguous
   **unsigned** buffer (0 if the allocation fails). Use `tula_total_len(buf)` for
   its length. Every byte is written (alignment padding is zero), so the same
@@ -241,6 +269,9 @@ its total opens, and the readers take exactly the declared bytes.
     That means records out of order or pointing at the table, names not packed
     in record order, a name of 47 bytes or fewer, a NUL inside a name, or an
     entry whose field isn't its name's key.
+  - `TULA_ERR_META` *(1.6.0)*: a metadata table is present but not canonical.
+    That means keys out of order or repeated, a bad key, a value that isn't UTF-8
+    or holds a NUL, not packed in order, or past the caps.
   - `TULA_ERR_DUP_NAME`: two tensors share a name (for long names, a key).
   - `TULA_ERR_OOM`: no memory for the duplicate check (over 512 tensors).
 
@@ -258,6 +289,18 @@ its total opens, and the readers take exactly the declared bytes.
   for `need < 1`. *1.3.0:* "<name>" is the entry's **full** name, and a sidecar
   name over 47 chars is found through the names table. A file without one has no
   such sidecar, so there, as in 1.2.0, a name over 41 chars returns 0.
+
+## Metadata — `src/meta.cyr` *(1.6.0, ADR 0008)*
+
+- `fn tula_meta_count(r) -> P` — number of pairs (0 = none).
+- `fn tula_meta_get(r, key) -> value | 0` — the value under `key`, as a
+  NUL-terminated pointer into the file (zero-copy). A binary search, O(log P).
+- `fn tula_meta_key(r, i) -> key | 0` · `fn tula_meta_value(r, i) -> value | 0` —
+  pair `i`, in key order (`0 ≤ i < tula_meta_count(r)`).
+
+Every record is bounds-checked when read; one that doesn't hold up reads as
+absent. `tula_validate_strict` requires the table to be canonical
+(`TULA_ERR_META` otherwise).
 
 ## Name index — `src/index.cyr` *(1.5.0, ADR 0007)*
 
@@ -339,6 +382,7 @@ Double-quant composes: int8-quantize a `"<name>.scale"` tensor and store its own
 # write
 b = tula_builder_new()                  # or tula_builder_new_cap(n) past 256 tensors
 if (tula_builder_add_checked(b, "w", TULA_DT_F64, shape, ndim, data, len) != 0) { ...fix input... }
+tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM")   # 1.6.0
 buf = tula_builder_finish_signed(b, sk)
 tula_write_file("model.tula", buf, tula_total_len(buf))
 
@@ -350,6 +394,7 @@ if (tula_verify_required(r, pk) != TULA_OK) { ...reject... }
 e = tula_find_name(r, "w")              # any length (1.3.0); tula_find for <= 47
 if (e == 0) { ...reject... }
 # many lookups: ix = tula_index_new(r); e = tula_index_find(ix, name); tula_index_free(ix)
+arch = tula_meta_get(r, "hf.architecture")    # 1.6.0; 0 if absent
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
 # a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
@@ -357,7 +402,7 @@ p = tula_entry_data(r, e)               # in-bounds, zero-copy
 
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
-index is 1.5.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+index is 1.5.0; metadata is 1.6.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

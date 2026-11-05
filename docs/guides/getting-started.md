@@ -89,6 +89,10 @@ if (tula_entry_payload_ok(e) != 1) { return 1; }      # guard before unpack
 var p = tula_entry_data(r, e);                        # in-bounds, zero-copy
 ```
 
+To describe the file (1.6.0), set metadata on the builder:
+`tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM")`. It's signed
+with the weights, and read back with `tula_meta_get(r, "hf.architecture")`.
+
 For checkpoints over 2 GiB (1.4.0), write with `tula_builder_write_file(b, path)`
 (or `_signed`). It streams straight from your tensor buffers and replaces the
 target atomically, so nothing the size of the file is allocated. Read with

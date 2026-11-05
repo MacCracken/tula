@@ -18,7 +18,9 @@
 #               f64 "<name>.scale" sidecar (ADR 0002), the 1-D norms F16: 517.
 #
 # Every payload is a real conversion (tula_*_pack / tula_nf4_pack) of an f64
-# signal. Every tensor is found through the index AND tula_find_name, which must
+# signal. Each file also carries metadata (1.6.0, ADR 0008) — the architecture,
+# a config excerpt, the source — read back after the signed round trip.
+# Every tensor is found through the index AND tula_find_name, which must
 # agree; its rank, dims and dtype are checked; its payload is compared byte for
 # byte with what was written. A real-WEIGHTS round trip is anukulana's (its
 # gpt2-tula demo imports the real checkpoint); see the roadmap.
@@ -287,6 +289,29 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
     if (which == 4) { rm_llama(m); want = 517; }   # 291 + a sidecar for each of the 226 2-D weights
     var n = load64(m + 8);
     if (n != want) { sput("FAIL: tensor count\n"); return 1; }
+    var arch = "GPT2LMHeadModel";
+    var cfg = "{\"n_embd\": 768, \"n_layer\": 12, \"n_head\": 12, \"vocab_size\": 50257}";
+    if (which == 1) {
+        arch = "LlamaForCausalLM";
+        cfg = "{\"hidden_size\": 4096, \"intermediate_size\": 11008, \"num_hidden_layers\": 32}";
+    }
+    if (which == 2) {
+        arch = "MixtralForCausalLM";
+        cfg = "{\"hidden_size\": 4096, \"num_local_experts\": 8, \"num_key_value_heads\": 8}";
+    }
+    if (which == 3) {
+        arch = "PeftModelForCausalLM";
+        cfg = "{\"r\": 16, \"lora_alpha\": 32, \"target_modules\": [\"q_proj\", \"k_proj\", \"v_proj\", \"o_proj\"]}";
+    }
+    if (which == 4) {
+        arch = "LlamaForCausalLM";
+        cfg = "{\"quantization\": \"nf4\", \"block\": 64}";
+    }
+    var bld = load64(m);
+    if (tula_builder_set_meta(bld, "hf.architecture", arch) != 0) { sput("FAIL: set_meta\n"); return 1; }
+    if (tula_builder_set_meta(bld, "hf.config", cfg) != 0) { sput("FAIL: set_meta\n"); return 1; }
+    var note = "dims divided by 64";
+    if (tula_builder_set_meta(bld, "realmodels.scale", note) != 0) { sput("FAIL: set_meta\n"); return 1; }
     var path = "build/tula_realmodel.tula";
     var total = tula_builder_write_file_signed(load64(m), path, sk);
     if (total <= 0) { sput("FAIL: write\n"); return 1; }
@@ -297,8 +322,11 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
     var longs = load64(m + 56);
     var table = 0;
     if (longs > 0) { table = 1; }
-    if (tula_count(r) != n + table) { sput("FAIL: file tensor count\n"); return 1; }
+    if (tula_count(r) != n + table + 1) { sput("FAIL: file tensor count (+ metadata table)\n"); return 1; }
     if (tula_has_long_names(r) != table) { sput("FAIL: names table presence\n"); return 1; }
+    if (tula_meta_count(r) != 3) { sput("FAIL: metadata count\n"); return 1; }
+    if (streq(tula_meta_get(r, "hf.architecture"), arch) == 0) { sput("FAIL: metadata hf.architecture\n"); return 1; }
+    if (streq(tula_meta_get(r, "hf.config"), cfg) == 0) { sput("FAIL: metadata hf.config\n"); return 1; }
     var ti = now_ns();
     var ix = tula_index_new(r);
     var t_ix = now_ns() - ti;
@@ -343,13 +371,15 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
         }
         i = i + 1;
     }
+    var mcount = tula_meta_count(r);
     tula_index_free(ix);
     tula_close_mmap(r);
     xunlink(path);
     sput(label);
     rm_kvs(" tensors ", n);
     rm_kvs(" (long names ", longs);
-    rm_kvs(")  bytes ", total);
+    rm_kvs(")  meta ", mcount);
+    rm_kvs("  bytes ", total);
     rm_kvs("  index build us ", t_ix / 1000);
     rm_kvs("  lookup ns ", t_look / n);
     sput("\n");
@@ -371,7 +401,7 @@ fn main(): i64 {
     var sk = alloc(64);
     var pk = alloc(32);
     ed25519_keypair(seed, sk, pk);
-    sput("tula real-model inventory gate (1.5.0)\n");
+    sput("tula real-model inventory gate (1.5.0; metadata 1.6.0)\n");
     var fails = 0;
     fails = fails + rm_run("  gpt2-small   F32 ", 0, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
     fails = fails + rm_run("  llama-2-7b   F16 ", 1, TULA_DT_F16, TULA_DT_F16, 0, sig, sk, pk);

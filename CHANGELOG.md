@@ -7,6 +7,92 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-04
+
+**File metadata.** An additive MINOR with no format change (ADR 0008). A
+checkpoint can now carry what it is (architecture, config, provenance), signed
+with its tensors. Every 1.5.0 call behaves as before, and output through the
+shared API is **identical** to 1.5.0's (diffed: builder bytes, signatures,
+strict verdicts, find-name and index answers). In the other direction, **1.5.0
+reads 1.6 files**: it opens them, strict-validates and verifies them, resolves
+their long names, and sees the metadata as an ordinary int8 tensor.
+
+### Added
+
+- **The metadata table** (ADR 0008): a reserved int8 tensor `__tula.meta__`
+  holding sorted, unique key/value text pairs. It sits after every ordinary
+  tensor and before the names table (which stays last for 1.3–1.5 readers), and
+  the signature covers it.
+  - Keys are 1–255 ASCII letters, digits, `.`, `_` or `-`, starting with a
+    letter, conventionally `<namespace>.<name>`. The `tula.` prefix is reserved.
+  - Values are well-formed UTF-8 text, no NUL, up to 16 MiB.
+  - A table holds up to 4,096 pairs and 64 MiB.
+- **`tula_builder_set_meta(b, key, value)`** sets or replaces a pair. The table is
+  written in key order, so the same pairs give the same bytes whatever order
+  they were set in. tula writes no keys of its own.
+- **Reading** (`src/meta.cyr`): `tula_meta_count(r)`, `tula_meta_get(r, key)`
+  (zero-copy, binary search), and `tula_meta_key(r, i)` / `tula_meta_value(r, i)`
+  to iterate in key order. Each record is bounds-checked when read; one that
+  doesn't hold up reads as absent.
+- **`TULA_ERR_META` (18)**: from the writer for a bad key or value, and from
+  `tula_validate_strict` for a non-canonical table. Strict checks the exact
+  packing, sorted unique keys, the key charset, UTF-8 values and the caps.
+- **ADR 0008** records the design: where the table sits, the caps, key
+  namespacing, why values are text-only, and why it isn't folded into the
+  names table.
+
+### Changed
+
+- **Layout** (shared by `tula_serialize` and the streaming writer): tensors,
+  then the metadata table, then the names table. A builder without metadata
+  lays out exactly as before.
+- **`tula_builder_add_checked` refuses `__tula.meta__` once metadata is set**
+  (`add_long` always does). Without metadata it behaves as in 1.5.0.
+- **Reference consumer** sets and reads back metadata. **`make realmodels`**
+  gives each of its five inventories three pairs (architecture, a config
+  excerpt, a note) and checks them after the signed round trip.
+- **Fuzz harness**: every accepted buffer has its metadata walked under the
+  guard page. A strict accept must pass a brute-force check: keys strictly
+  increasing, `get(key_i) == value_i`, no NUL or never-valid UTF-8 byte. A new
+  phase G mutates a canonical file holding metadata and a names table, aiming at
+  the metadata.
+- **Bench**: `tula_builder_set_meta` ~850 ns and `tula_meta_get` ~430 ns per
+  operation, with 64 pairs.
+- **Roadmap is future-facing.** The shipped-work list and completed sections are
+  gone (history is this file), and the open work is reorganized:
+  - **1.6.x**: nameless temp files, writers in the fuzzer, cross-target CI.
+  - **1.7.x**: integer and boolean dtypes.
+  - **1.8.x**: FP8 and int4. New dtypes are MINOR-only, so each family opens a
+    minor line.
+  - **1.9.x**: throughput.
+  - **1.x.x**: research.
+  - **v2**: potential items, each needing an ADR.
+
+  `docs/benchmarks.md` no longer calls the name index a roadmap item, and ADR
+  0004 points at the roadmap's v2 section.
+
+### Verified
+
+- Suite **435 → 533** assertions in 12 suites. The new `meta.tcyr` (98) covers:
+  - set, replace, get and iterate;
+  - order-independent bytes;
+  - the key rules and the reserved prefix;
+  - UTF-8 classes: overlong, surrogate, past U+10FFFF, stray continuation,
+    truncated;
+  - the 4,096-pair and 16 MiB caps;
+  - the table's position next to a names table;
+  - streamed output byte-identical to the in-memory writer, signed and unsigned;
+  - the reserved name;
+  - the signature covering a value;
+  - strict under each kind of tampering;
+  - malformed records reading as absent.
+- Mutations are caught: an unsorted insert in the builder, surrogates let
+  through the UTF-8 check, strict skipping key order.
+- `make fuzz`: 2,903,000 iterations, 747,537 accepted buffers, 26,968 strict
+  accepts confirmed by brute force, 0 faults, 0 invariant failures.
+- `make realmodels`, `make bigfile` and `make example` PASS. `fmt`, `lint`, `vet`
+  and `deny` clean. `doc --check` 0 undocumented. `make dist` OK.
+
 ## [1.5.0] - 2026-11-04
 
 **Lookup at scale, and real checkpoint inventories.** An additive MINOR with no

@@ -22,6 +22,12 @@
 #   6. (1.5.0) the name index agrees with the scan: on every accepted buffer an
 #      index is built and tula_index_find must equal tula_find_name for each
 #      entry's full name and stored name, and for a long probe.
+#   7. (1.6.0) metadata never reads out of bounds: every accepted buffer's pairs
+#      are walked (keys and values scanned to their NUL under the guard page,
+#      tula_meta_get per key). On a strict accept, brute force must agree: keys
+#      strictly increasing, get(key_i) == value_i, no NUL and no never-valid
+#      UTF-8 byte (C0, C1, F5..FF) in a value. Phase G mutates a canonical file
+#      holding metadata AND a names table, aiming at the metadata.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -42,6 +48,7 @@ enum FuzzCfg {
     FZ_STRICT_ITERS = 300000;    # phase E: a 40-tensor canonical file, names duplicated
     FZ_STRICT_N     = 40;
     FZ_LONG_ITERS   = 300000;    # phase F: a long-name file, mutations aimed at its table
+    FZ_META_ITERS   = 300000;    # phase G: a metadata + names file, mutations aimed at the metadata
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
     FZ_OUT_ELEMS    = 33024;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
@@ -238,6 +245,26 @@ fn build_long_base(): i64 {
     return tula_builder_finish(b);
 }
 
+# A canonical file with metadata (6 pairs, some multi-byte UTF-8) and a names table.
+fn build_meta_base(): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 2);
+    var data = alloc(8);
+    var lname = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
+    tula_builder_add_long(b, lname, TULA_DT_INT8, shape, 1, data, 2);
+    tula_builder_add_long(b, "bias", TULA_DT_INT8, shape, 1, data, 2);
+    var cjk = alloc(8);
+    store8(cjk, 0xE6); store8(cjk + 1, 0x97); store8(cjk + 2, 0xA5); store8(cjk + 3, 0);
+    tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM");
+    tula_builder_set_meta(b, "hf.config", "{\"hidden_size\": 4096, \"num_layers\": 32}");
+    tula_builder_set_meta(b, "anukulana.source", "model.safetensors");
+    tula_builder_set_meta(b, "license", "llama2");
+    tula_builder_set_meta(b, "note.cjk", cjk);
+    tula_builder_set_meta(b, "peft.r", "16");
+    return tula_builder_finish(b);
+}
+
 # FZ_STRICT_N int8 [1] tensors "t00".."t39", through the checked add: canonical.
 fn build_strict_base(): i64 {
     var b = tula_builder_new();
@@ -283,6 +310,36 @@ fn strict_check(r, len, st): i64 {
         }
         i = i + 1;
     }
+    # metadata, brute force
+    var np = tula_meta_count(r);
+    var q = 0;
+    while (q < np) {
+        var mk = tula_meta_key(r, q);
+        var mv = tula_meta_value(r, q);
+        if (mk == 0) { ok = 0; }
+        if (mv == 0) { ok = 0; }
+        if (mk != 0) {
+            if (mv != 0) {
+                if (tula_meta_get(r, mk) != mv) { ok = 0; }
+                var vl = strlen(mv);
+                var z = 0;
+                while (z < vl) {
+                    var vb = load8(mv + z);
+                    if (vb == 0xC0) { ok = 0; }
+                    if (vb == 0xC1) { ok = 0; }
+                    if (vb >= 0xF5) { ok = 0; }
+                    z = z + 1;
+                }
+                if (q > 0) {
+                    var pkey = tula_meta_key(r, q - 1);
+                    if (pkey != 0) {
+                        if (_tula_bytes_cmp(pkey, strlen(pkey), mk, strlen(mk)) >= 0) { ok = 0; }
+                    }
+                }
+            }
+        }
+        q = q + 1;
+    }
     if (ok == 0) { store64(st + 16, load64(st + 16) + 1); }
     return 0;
 }
@@ -318,6 +375,25 @@ fn check_opened(r, len): i64 {
         }
         i = i + 1;
     }
+    # metadata: walk every pair under the guard page
+    var mc = tula_meta_count(r);
+    var mq = 0;
+    while (mq < mc) {
+        var kq = tula_meta_key(r, mq);
+        var vq = tula_meta_value(r, mq);
+        if (kq != 0) {
+            var kl = strlen(kq);
+            if (kq < r) { ok = 0; }
+            if (kq + kl >= r + len) { ok = 0; }
+            var gq = tula_meta_get(r, kq);
+        }
+        if (vq != 0) {
+            var vlq = strlen(vq);
+            if (vq + vlq >= r + len) { ok = 0; }
+        }
+        mq = mq + 1;
+    }
+    var mmiss = tula_meta_get(r, "hf.architecture");
     var probe = "base_model.model.model.layers.3.mlp.block_sparse_moe.experts.3.w2.weight";
     var lhit = tula_find_name(r, probe);
     var has = tula_has_long_names(r);
@@ -501,6 +577,57 @@ fn main(): i64 {
         }
         store64(st + 0, load64(st + 0) + 1);
         lf = lf + 1;
+    }
+
+    # ---- phase G: metadata + names; mutations aimed at the metadata table ----
+    var bufm = build_meta_base();
+    var mlen = tula_total_len(bufm);
+    var rm0 = tula_open(bufm, mlen);
+    var mte = tula_entry(rm0, tula_count(rm0) - 2);                 # the metadata entry
+    var mt0 = load64(bufm + 32) + load64(mte + 128);                # its payload offset
+    var mtl = load64(mte + 136);
+    var mg = 0;
+    while (mg < FZ_META_ITERS) {
+        memcpy_n(scratch, bufm, mlen);
+        var nmg = 1 + rng_below(s, 4);
+        var mm = 0;
+        while (mm < nmg) {
+            var how = rng_below(s, 5);
+            if (how == 0) { mutate(s, scratch, mlen); }
+            if (how == 1) { store8(scratch + mt0 + rng_below(s, mtl), rng_below(s, 256)); }
+            if (how == 2) {
+                # a record word set to an edge value
+                var wv = rng_below(s, 6);
+                var val = rng_next(s);
+                if (wv == 1) { val = 0 - 1; }
+                if (wv == 2) { val = 0; }
+                if (wv == 3) { val = mtl; }
+                if (wv == 4) { val = 0x7FFFFFFFFFFFFFFF; }
+                if (wv == 5) { val = rng_below(s, mtl); }
+                store64(scratch + mt0 + 8 + rng_below(s, (mtl - 8) / 8) * 8, val);
+            }
+            if (how >= 3) {
+                # a high byte (UTF-8 edge) or NUL into the key/value bytes
+                var hb = 0;
+                var pick = rng_below(s, 6);
+                if (pick == 0) { hb = 0xC0; }
+                if (pick == 1) { hb = 0xED; }
+                if (pick == 2) { hb = 0xF4; }
+                if (pick == 3) { hb = 0x80; }
+                if (pick == 4) { hb = 0xFF; }
+                var dstart = 16 + 6 * 32;
+                store8(scratch + mt0 + dstart + rng_below(s, mtl - dstart), hb);
+            }
+            mm = mm + 1;
+        }
+        var rg = tula_open(place(guard, scratch, mlen), mlen);
+        if (rg != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(rg, mlen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            strict_check(rg, mlen, st);
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        mg = mg + 1;
     }
 
     var t1 = now_ns();

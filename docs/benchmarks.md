@@ -115,6 +115,16 @@ the hash, and the full-name confirm. A long name also pays for its FNV-1a key
 and the names-table record search. In `make realmodels`, Mixtral's 995 tensors
 build in ~0.4 ms and resolve at ~0.8 µs each.
 
+### Added in 1.6.0
+
+| Op | 1.6.0 | Notes |
+|---|---:|---|
+| `tula_builder_set_meta` | ~850 ns | per pair (64 pairs, 31-byte values): key + UTF-8 checks, binary search, copies |
+| `tula_meta_get` | ~430 ns | per lookup among 64 pairs: table recognition + binary search |
+
+Metadata adds about 400 bytes per file in `make realmodels` (3 pairs), and
+nothing measurable to its run.
+
 Earlier result (1.0.0, cyrius 6.3.27, tmpfs `/tmp`, ms resolution): write 34 ms,
 read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O only.
 
@@ -127,6 +137,6 @@ read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O onl
 - **`read (heap)` copies the whole file**, so its cost is linear in size; use it
   for small files, for files others can write, or when you need an owned buffer.
 - **validate is O(tensors), not O(bytes)**: ~14 ns per entry.
-- **`tula_find` is a linear scan**: ~3 ns per entry now. A checkpoint with
-  thousands of tensors, looked up one name at a time, is still O(n²) overall. A
-  name index is on the roadmap.
+- **`tula_find` is a linear scan**: ~3 ns per entry. For many lookups on one
+  file, build the name index (1.5.0): looking up every tensor is then
+  O(n log n) instead of O(n²).

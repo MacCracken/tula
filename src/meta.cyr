@@ -1,0 +1,102 @@
+# @public — tula file metadata (1.6.0, ADR 0008): reading the metadata table.
+#
+# A file's metadata is a reserved int8 tensor "__tula.meta__" — after every
+# ordinary tensor and before the names table (which stays last, for 1.3–1.5
+# readers) — holding sorted, unique key/value text pairs, signed with the rest
+# of the file. Payload:
+#   +0 magic "tula.mt1"   +8 P   +16 P x {key_off, key_len, val_off, val_len}
+#   then, per record in order: the key, NUL, the value, NUL.
+# Files without metadata have no table, and every call here answers "none".
+#
+# Everything here reads an UNTRUSTED file: each record is bounds-checked when
+# used, and one that doesn't hold up reads as absent. tula_validate_strict also
+# requires the table to be canonical (sorted unique keys, the key charset,
+# well-formed UTF-8 values, exact packing).
+
+# The metadata table's entry in an opened buffer, or 0. It is the last entry, or
+# the second-to-last when the last is a names table; named "__tula.meta__",
+# int8, 1-D, at least 16 bytes, starting with the magic, with a pair count that
+# fits: 1 <= P <= (data_len - 16) / 32. Any other tensor of that name is ordinary.
+fn _tula_meta_entry(r): i64 {
+    var c = tula_count(r);
+    var pos = c - 1;
+    if (_tula_names_entry(r) != 0) { pos = c - 2; }
+    if (pos < 0) { return 0; }
+    var e = tula_entry(r, pos);
+    if (streq(tula_entry_name(e), "__tula.meta__") == 0) { return 0; }
+    if (tula_entry_dtype(e) != TULA_DT_INT8) { return 0; }
+    if (tula_entry_ndim(e) != 1) { return 0; }
+    var dlen = tula_entry_data_len(e);
+    if (dlen < TULA_META_HDR) { return 0; }
+    var t = tula_entry_data(r, e);
+    if (load64(t) != TULA_META_MAGIC) { return 0; }
+    var np = load64(t + 8);
+    if (np < 1) { return 0; }
+    if (np > (dlen - TULA_META_HDR) / TULA_META_REC) { return 0; }
+    return e;
+}
+
+# Number of metadata pairs in an opened buffer (0 = none).
+fn tula_meta_count(r): i64 {
+    var me = _tula_meta_entry(r);
+    if (me == 0) { return 0; }
+    return load64(tula_entry_data(r, me) + 8);
+}
+
+# The string a record field pair (offset at rec + w, length at rec + w + 8)
+# names inside table t of dlen bytes: a NUL-terminated pointer, or 0 when the
+# offset or length leaves the table or no NUL ends it.
+fn _tula_meta_str(t, dlen, rec, w): i64 {
+    var off = load64(rec + w);
+    var len = load64(rec + w + 8);
+    if (off < 0) { return 0; }
+    if (len < 0) { return 0; }
+    if (off > dlen) { return 0; }
+    if (len >= dlen - off) { return 0; }   # off + len < dlen: the NUL is inside
+    if (load8(t + off + len) != 0) { return 0; }
+    return t + off;
+}
+
+# Key of metadata pair i (0 <= i < tula_meta_count, in key order), or 0.
+fn tula_meta_key(r, i): i64 {
+    var me = _tula_meta_entry(r);
+    if (me == 0) { return 0; }
+    var t = tula_entry_data(r, me);
+    if (i < 0) { return 0; }
+    if (i >= load64(t + 8)) { return 0; }
+    return _tula_meta_str(t, tula_entry_data_len(me), t + TULA_META_HDR + i * TULA_META_REC, 0);
+}
+
+# Value of metadata pair i (0 <= i < tula_meta_count, in key order), or 0.
+fn tula_meta_value(r, i): i64 {
+    var me = _tula_meta_entry(r);
+    if (me == 0) { return 0; }
+    var t = tula_entry_data(r, me);
+    if (i < 0) { return 0; }
+    if (i >= load64(t + 8)) { return 0; }
+    return _tula_meta_str(t, tula_entry_data_len(me), t + TULA_META_HDR + i * TULA_META_REC, 16);
+}
+
+# The value stored under `key` (a NUL-terminated pointer into the file), or 0.
+# Binary search over the sorted keys: O(log P). A record that doesn't hold up
+# ends the search with "absent".
+fn tula_meta_get(r, key): i64 {
+    var me = _tula_meta_entry(r);
+    if (me == 0) { return 0; }
+    var t = tula_entry_data(r, me);
+    var dlen = tula_entry_data_len(me);
+    var klen = strlen(key);
+    var lo = 0;
+    var hi = load64(t + 8) - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) / 2;
+        var rec = t + TULA_META_HDR + mid * TULA_META_REC;
+        var k = _tula_meta_str(t, dlen, rec, 0);
+        if (k == 0) { return 0; }
+        var c = _tula_bytes_cmp(k, load64(rec + 8), key, klen);
+        if (c == 0) { return _tula_meta_str(t, dlen, rec, 16); }
+        if (c < 0) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return 0;
+}

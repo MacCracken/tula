@@ -215,6 +215,11 @@ fn _tula_strict_unique(buf, count): i64 {
 #                       names not packed in record order, a name of 47 bytes or
 #                       fewer, a NUL inside a name, or an entry whose field is
 #                       not its full name's key (ADR 0004);
+#   TULA_ERR_META     — (1.6.0) a metadata table is present but not canonical:
+#                       keys out of order or repeated, a bad key character or
+#                       length, a value that isn't well-formed UTF-8 or holds a
+#                       NUL, not packed in record order, or past the caps
+#                       (ADR 0008);
 #   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
 #   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To
@@ -239,7 +244,57 @@ fn tula_validate_strict(buf, len): i64 {
     if (cursor != payload_len) { return TULA_ERR_LAYOUT; }
     rc = _tula_strict_names(buf, count);
     if (rc != TULA_OK) { return rc; }
+    rc = _tula_strict_meta(buf);
+    if (rc != TULA_OK) { return rc; }
     return _tula_strict_unique(buf, count);
+}
+
+# The metadata table, if present, is exactly what tula_builder_set_meta + finish
+# write (ADR 0008): within the caps; records in strictly increasing key order;
+# each key valid, each value well-formed UTF-8 without NUL; key NUL value NUL,
+# packed in record order straight after the records, ending at the table's end.
+# Keys starting "tula." are accepted: a later tula may define them.
+fn _tula_strict_meta(buf): i64 {
+    var me = _tula_meta_entry(buf);
+    if (me == 0) { return TULA_OK; }
+    var t = tula_entry_data(buf, me);
+    var dlen = tula_entry_data_len(me);
+    var np = load64(t + 8);
+    if (np > TULA_META_MAX_PAIRS) { return TULA_ERR_META; }
+    if (dlen > TULA_META_MAX_BYTES) { return TULA_ERR_META; }
+    var cur = TULA_META_HDR + np * TULA_META_REC;   # <= dlen: _tula_meta_entry checked np
+    var pk = 0;
+    var pkl = 0;
+    var q = 0;
+    while (q < np) {
+        var rec = t + TULA_META_HDR + q * TULA_META_REC;
+        var ko = load64(rec);
+        var kl = load64(rec + 8);
+        var vo = load64(rec + 16);
+        var vl = load64(rec + 24);
+        if (ko != cur) { return TULA_ERR_META; }
+        if (kl < 1) { return TULA_ERR_META; }
+        if (kl > TULA_META_KEY_MAX) { return TULA_ERR_META; }
+        if (kl >= dlen - ko) { return TULA_ERR_META; }
+        if (_tula_meta_key_ok(t + ko, kl) == 0) { return TULA_ERR_META; }
+        if (load8(t + ko + kl) != 0) { return TULA_ERR_META; }
+        if (q > 0) {
+            if (_tula_bytes_cmp(pk, pkl, t + ko, kl) >= 0) { return TULA_ERR_META; }
+        }
+        cur = ko + kl + 1;
+        if (vo != cur) { return TULA_ERR_META; }
+        if (vl < 0) { return TULA_ERR_META; }
+        if (vl > TULA_META_VALUE_MAX) { return TULA_ERR_META; }
+        if (vl >= dlen - vo) { return TULA_ERR_META; }
+        if (_tula_utf8_ok(t + vo, vl) == 0) { return TULA_ERR_META; }
+        if (load8(t + vo + vl) != 0) { return TULA_ERR_META; }
+        cur = vo + vl + 1;
+        pk = t + ko;
+        pkl = kl;
+        q = q + 1;
+    }
+    if (cur != dlen) { return TULA_ERR_META; }
+    return TULA_OK;
 }
 
 # The names table, if present, is exactly what tula_builder_add_long + finish

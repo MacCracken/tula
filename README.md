@@ -68,8 +68,12 @@ The full march M0→M5:
   five real checkpoint inventories (GPT-2, Llama-2-7B, Mixtral-8x7B, LoRA, QLoRA)
   end to end.
 
-**435/435** assertions across 11 suites (names · builder · strict · dtype · floats ·
-stream · file-io · hardening · round-trip · index · sign) + a
+- **1.6.0** — file metadata: signed key/value text (`tula_builder_set_meta`,
+  `tula_meta_get`) for the architecture, config and provenance, in a table every
+  1.x reader opens.
+
+**533/533** assertions across 12 suites (meta · names · builder · strict · dtype ·
+floats · stream · file-io · hardening · round-trip · index · sign) + a
 >2·10⁶-iteration guard-page fuzz harness, an end-to-end consumer, a real-model
 inventory gate and a 2.42 GB big-file gate, all green. Deps: stdlib + **sigil**
 (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
