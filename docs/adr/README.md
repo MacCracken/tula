@@ -28,3 +28,4 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 | [0003](0003-api-freeze-at-v1.md) | Accepted | Freeze the public API and on-disk format (v1) at 1.0 |
 | [0004](0004-long-names-via-a-names-table.md) | Accepted | Long tensor names live in a names-table tensor; the entry holds a key (no format-version bump) |
 | [0005](0005-f32-f16-bf16-dtypes.md) | Accepted | F32, F16 and BF16 dtypes, converted from f64 in integer arithmetic |
+| [0006](0006-streaming-atomic-writes.md) | Accepted | Big files: stream from caller memory, sign the written file, replace atomically |

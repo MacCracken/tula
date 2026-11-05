@@ -82,6 +82,14 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   - `TULA_DT_F32/F16/BF16` with integer-arithmetic IEEE conversions (D-10, ADR
     0005), exhaustively tested for the 16-bit formats.
   - The builder's output is byte-identical to 1.2.0's. 274 → 388 assertions.
+- **1.4.0** (2026-11-04) — **big files**, no format change (ADR 0006):
+  - `tula_builder_write_file(_signed)` streams the builder's file to disk
+    (payloads straight from caller buffers; signed by mapping what was written),
+    replacing the target atomically.
+  - `tula_write_file_atomic`, `tula_file_len`, `tula_read_file_into`.
+  - A new CI gate, `make bigfile`: 2.42 GB streamed past the 2 GiB allocation
+    cap.
+  - In-memory output byte-identical to 1.3.0's. 388 → 422 assertions.
 
 ---
 
@@ -115,22 +123,17 @@ they landed in 1.3.0 together. Left in the line:
 
 ## 1.4.x — big files
 
-**Goal:** multi-GB checkpoints on both sides of the codec.
+**Goal:** multi-GB checkpoints on both sides of the codec. 1.4.0 shipped all four
+planned pieces (above). The signed stream needed **no** sigil change: the writer
+signs a read-only mapping of the file it just wrote. Left in the line:
 
-- **1.4.0 — streaming writer** (D-3): `tula_builder_write_file(b, path)` writes the
-  header and manifest, then each tensor straight from the caller's memory to the
-  fd, with no whole-file allocation. Today `tula_serialize` needs one allocation
-  of the whole file, and the stdlib caps one at 2 GiB.
-- **1.4.x — signed streaming write**: v1 signs `[0, sig_off)` as one Ed25519
-  message, and a stream can't be signed in one piece. This needs a multi-part
-  `ed25519_sign` from sigil. **File the request with sigil**; the on-disk
-  signature stays identical.
-- **Atomic write** (D-8): `tula_write_file_atomic` (temp file + fsync + rename, via
-  the stdlib's `file_write_atomic`), so a crash never leaves a half file under
-  the final name.
-- **Caller-buffer read** (D-9): `tula_read_file_into(path, buf, cap)`, so a file
-  that fails validation doesn't strand a heap buffer the bump allocator can't
-  free. It also lets the heap path read files over 2 GiB.
+- **1.4.x patches** — fixes as consumers stream real checkpoints; no new surface.
+- **Signing speed is sigil's** (cross-repo): its SHA-512 runs at ~18 MB/s, so
+  Ed25519 over a 14 GB checkpoint takes ~25 min to sign and ~13 to verify. File
+  the throughput issue with sigil, with the numbers in `docs/benchmarks.md`. tula
+  needs no change to benefit.
+- **Consumer migration** (cross-repo): anukulana writes real checkpoints through
+  `tula_builder_write_file_signed` and loads them with `tula_open_mmap`.
 
 ## 1.5.x — lookup at scale, and a real round-trip
 
@@ -175,7 +178,8 @@ never incidental (STABILITY.md).
   `[deps.tula]`. Keep the format stable for them; a format bump is a coordinated
   event. 1.2.0's checked add and strict validator are what anukulana should
   switch to first (see 1.2.x).
-- **Cross-repo asks:** sigil — multi-part Ed25519 sign (1.4.x) and the bayan
-  binary-size issue.
+- **Cross-repo asks:** sigil — SHA-512 throughput (~18 MB/s bounds big-file
+  signing; see 1.4.x) and the bayan binary-size issue. The multi-part Ed25519
+  sign once planned here isn't needed (ADR 0006).
 - **Ecosystem context:** the AGNOS planning docs `type3-weight-import.md`
   (gap #1) + `software-port-path.md` (Tier A). tula is gap #1's format codec.

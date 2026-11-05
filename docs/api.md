@@ -184,10 +184,36 @@ Crypto is `sigil`'s; keys are the caller's (tula owns no key management).
 ## File I/O — `src/fileio.cyr`
 
 - `fn tula_write_file(path, buf, len) -> bytes_written | <0` — create/truncate,
-  write the serialized buffer.
+  write the serialized buffer. Not crash-safe: a failure leaves a truncated file,
+  which the readers then reject.
+- `fn tula_write_file_atomic(path, buf, len) -> len | <0` *(1.4.0)* — crash-safe:
+  the bytes go to a unique sibling temp file, which is fsync'd and renamed over
+  `path` (the stdlib's `file_write_atomic`). On failure `path` is untouched.
+- `fn tula_builder_write_file(b, path) -> file_len | <0` *(1.4.0, ADR 0006)* —
+  **stream** the builder's file to disk: exactly the bytes `tula_builder_finish(b)`
+  returns, never held in memory, so there is no 2 GiB cap. The header, manifest
+  and names table go through a 64 KiB staging buffer; each payload is written
+  straight from the caller's buffer. Atomic: a random `O_EXCL` sibling temp
+  `<path>.tula-<16 hex>.tmp` with the target's mode, written, fsync'd, renamed
+  over `path`, then the directory fsync'd. On any failure the temp is removed and
+  `path` is untouched. A symlink at `path` is replaced, not written through.
+  Returns the file's length or a negative errno.
+- `fn tula_builder_write_file_signed(b, path, sk) -> file_len | <0` *(1.4.0)* —
+  the same, Ed25519-signed: byte-identical to `tula_builder_finish_signed(b, sk)`.
+  The content is written, mapped back read-only and signed (no heap copy), and
+  the signature appended. Signing reads the content twice through sigil's
+  SHA-512 (about 18 MB/s today), so a multi-GB file takes minutes.
 - `fn tula_read_file(path) -> r | 0` — read into a fresh heap buffer, then
   `tula_open` (full validation). The allocation happens only after the file is
-  known to hold the total its header declares.
+  known to hold the total its header declares. One allocation is capped at
+  2 GiB: for bigger files use `tula_open_mmap` or `tula_read_file_into`.
+- `fn tula_file_len(path) -> total | -1` *(1.4.0)* — the total a file's header
+  declares, once the file is known to hold it. That's the buffer size
+  `tula_read_file_into` needs.
+- `fn tula_read_file_into(path, buf, cap) -> buf | 0` *(1.4.0)* — read into the
+  caller's buffer, then validate. Returns 0 if the file is bigger than `cap`. The
+  buffer can be reused across files, and can be bigger than 2 GiB (e.g. an
+  anonymous mapping).
 - `fn tula_open_mmap(path) -> r | 0` — zero-copy read-only mmap, validated. A file
   shorter than its header's total is rejected before mapping, and a mapped file
   that fails validation is unmapped again. Release with `fn tula_close_mmap(r)`

@@ -136,9 +136,9 @@ fn tula_name_write(dst, src): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.3.0 -> 10300).
+# Packed version int: major*10000 + minor*100 + patch (1.4.0 -> 10400).
 fn tula_version_int(): i64 {
-    return 10300;
+    return 10400;
 }
 
 # ---------------------------------------------------------------------------
@@ -423,15 +423,12 @@ fn tula_builder_add_long(b, name, dtype, shape, ndim, data, data_len): i64 {
     return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 2);
 }
 
-# Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
-# unsigned file, or 64 to reserve an appended Ed25519 signature block (filled by
-# src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr,
-# or 0 if the allocation fails. Every byte is written — the alignment padding
-# after each tensor and the reserved signature block are zeroed — so the output
-# is a pure function of the builder's inputs, whatever the allocator hands back.
-# A builder holding long names (tula_builder_add_long) gets the names table
-# appended as the last tensor (ADR 0004).
-fn tula_serialize(b, sig_len): i64 {
+# The file layout a builder serializes to (shared by tula_serialize and the
+# streaming writer, so both produce the same bytes). Fills `lay` (8 words):
+#   +0 count_out (tensors + the names table, if any)   +8  payload_off
+#   +16 payload_len   +24 content_len (= sig_off when signed)   +32 sig_off
+#   +40 sig_len       +48 names table bytes (0 = none)          +56 payload_user
+fn _tula_layout(b, sig_len, lay): i64 {
     var count = load64(b);
     var nl = load64(b + 40);
     var tsize = 0;
@@ -440,31 +437,73 @@ fn tula_serialize(b, sig_len): i64 {
         tsize = _tula_names_size(nl, load64(b + 48));
         count_out = count + 1;
     }
-    var manifest_off = TULA_HEADER_SIZE;
-    var manifest_len = count_out * TULA_ENTRY_SIZE;
-    var payload_off = manifest_off + manifest_len;
+    var payload_off = TULA_HEADER_SIZE + count_out * TULA_ENTRY_SIZE;
     var payload_user = load64(b + 8);
     var payload_len = payload_user + tula_align8(tsize);
     var content_len = payload_off + payload_len;
     var sig_off = 0;
     if (sig_len > 0) { sig_off = content_len; }
-    var total = content_len + sig_len;
-    var buf = alloc(total);
+    store64(lay + 0, count_out);
+    store64(lay + 8, payload_off);
+    store64(lay + 16, payload_len);
+    store64(lay + 24, content_len);
+    store64(lay + 32, sig_off);
+    store64(lay + 40, sig_len);
+    store64(lay + 48, tsize);
+    store64(lay + 56, payload_user);
+    return 0;
+}
+
+# The 64-byte header for layout `lay`, at h.
+fn _tula_header_write(h, lay): i64 {
+    store64(h + 0, TULA_MAGIC);
+    store64(h + 8, TULA_VERSION);
+    store64(h + 16, load64(lay + 0));
+    store64(h + 24, TULA_HEADER_SIZE);
+    store64(h + 32, load64(lay + 8));
+    store64(h + 40, load64(lay + 16));
+    store64(h + 48, load64(lay + 32));   # 0 = unsigned; else offset of the sig block
+    store64(h + 56, load64(lay + 40));   # 0 = unsigned; else 64 (Ed25519)
+    return 0;
+}
+
+# The names table's manifest entry (ADR 0004) at e: its payload is tsize bytes at
+# payload offset `off`.
+fn _tula_names_entry_write(e, off, tsize): i64 {
+    _tula_zero(e, TULA_ENTRY_SIZE);
+    tula_name_write(e, "__tula.names__");
+    store64(e + 48, TULA_DT_INT8);
+    store64(e + 56, 1);
+    store64(e + 64, tsize);
+    store64(e + 128, off);
+    store64(e + 136, tsize);
+    return 0;
+}
+
+# Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
+# unsigned file, or 64 to reserve an appended Ed25519 signature block (filled by
+# src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr,
+# or 0 if the allocation fails. Every byte is written — the alignment padding
+# after each tensor and the reserved signature block are zeroed — so the output
+# is a pure function of the builder's inputs, whatever the allocator hands back.
+# A builder holding long names (tula_builder_add_long) gets the names table
+# appended as the last tensor (ADR 0004). The whole file is one allocation, so
+# the stdlib's 2 GiB per-allocation cap bounds it; tula_builder_write_file
+# streams the same bytes to disk with no such bound (ADR 0006).
+fn tula_serialize(b, sig_len): i64 {
+    var lay[64];
+    _tula_layout(b, sig_len, &lay);
+    var payload_off = load64(&lay + 8);
+    var content_len = load64(&lay + 24);
+    var tsize = load64(&lay + 48);
+    var buf = alloc(content_len + sig_len);
     if (buf == 0) { return 0; }
-
-    store64(buf + 0, TULA_MAGIC);
-    store64(buf + 8, TULA_VERSION);
-    store64(buf + 16, count_out);
-    store64(buf + 24, manifest_off);
-    store64(buf + 32, payload_off);
-    store64(buf + 40, payload_len);
-    store64(buf + 48, sig_off);   # 0 = unsigned; else offset of the sig block
-    store64(buf + 56, sig_len);   # 0 = unsigned; else 64 (Ed25519)
-
+    _tula_header_write(buf, &lay);
+    var count = load64(b);
     var i = 0;
     while (i < count) {
         var m = _tula_bentry(b, i);
-        var e = buf + manifest_off + i * TULA_ENTRY_SIZE;
+        var e = buf + TULA_HEADER_SIZE + i * TULA_ENTRY_SIZE;
         _tula_copy(e, m, TULA_ENTRY_SIZE);     # the entry image built at add time
         var dlen = load64(m + 136);
         var dst = buf + payload_off + load64(m + 128);
@@ -473,25 +512,18 @@ fn tula_serialize(b, sig_len): i64 {
         _tula_zero(dst + dlen, padded - dlen);   # 0..7 padding bytes
         i = i + 1;
     }
-    if (nl > 0) {
-        var te = buf + manifest_off + count * TULA_ENTRY_SIZE;   # the table's entry: last
-        _tula_write_names(b, te, buf + payload_off, payload_user, tsize);
+    if (tsize > 0) {
+        var off = load64(&lay + 56);
+        _tula_names_entry_write(buf + TULA_HEADER_SIZE + count * TULA_ENTRY_SIZE, off, tsize);
+        _tula_write_names(b, buf + payload_off + off, tsize);
     }
-    if (sig_len > 0) { _tula_zero(buf + sig_off, sig_len); }
+    if (sig_len > 0) { _tula_zero(buf + content_len, sig_len); }
     return buf;
 }
 
-# The names table (ADR 0004): its manifest entry `e` (the last) and its payload
-# at payload + off, tsize bytes, from the builder's long names in entry order.
-fn _tula_write_names(b, e, payload, off, tsize): i64 {
-    _tula_zero(e, TULA_ENTRY_SIZE);
-    tula_name_write(e, "__tula.names__");
-    store64(e + 48, TULA_DT_INT8);
-    store64(e + 56, 1);
-    store64(e + 64, tsize);
-    store64(e + 128, off);
-    store64(e + 136, tsize);
-    var t = payload + off;
+# The names table's payload (ADR 0004) at t, tsize bytes, from the builder's long
+# names in entry order, then its zero padding.
+fn _tula_write_names(b, t, tsize): i64 {
     var nl = load64(b + 40);
     store64(t, TULA_NAMES_MAGIC);
     store64(t + 8, nl);

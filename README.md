@@ -59,12 +59,16 @@ The full march M0→M5:
   `__tula.names__` table (`tula_builder_add_long`, `tula_find_name`), and
   `TULA_DT_F32/F16/BF16` with exact IEEE conversions. Still format v1.
 
-**388/388** assertions across 9 suites (names · builder · strict · dtype · floats ·
-file-io · hardening · round-trip · sign) + a >2·10⁶-iteration guard-page fuzz
-harness and an end-to-end consumer, all green. Deps: stdlib + **sigil**
-(Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
-place. Post-1.0 changes are additive-only (SemVer); next is 1.4.0 (big files).
-See
+- **1.4.0** — big files: `tula_builder_write_file(_signed)` streams checkpoints of
+  any size straight from tensor buffers and replaces the target atomically;
+  `tula_read_file_into` reads them into a buffer of your own.
+
+**422/422** assertions across 10 suites (names · builder · strict · dtype · floats ·
+stream · file-io · hardening · round-trip · sign) + a >2·10⁶-iteration guard-page
+fuzz harness, an end-to-end consumer, and a 2.42 GB big-file gate, all green.
+Deps: stdlib + **sigil** (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI +
+release workflows in place. Post-1.0 changes are additive-only (SemVer); next is
+1.5.0 (lookup at scale). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test

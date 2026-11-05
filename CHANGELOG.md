@@ -7,6 +7,86 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-04
+
+**Big files.** An additive MINOR with no format change (ADR 0006). Checkpoints
+of any size up to the 1 TiB read cap can now be written, signed, replaced
+atomically and read on the heap. That closes audit D-3, D-8 and D-9. Every 1.3.0
+call behaves as before, and in-memory output is **byte-identical** to 1.3.0's
+(diffed: random builders mixing all three add kinds, names tables, signatures,
+strict verdicts, the F16/BF16/F32 conversions).
+
+### Added
+
+- **`tula_builder_write_file(b, path)`** streams the builder's file to disk
+  without ever holding it. The header, manifest and names table go through a
+  64 KiB staging buffer (a private mapping); each payload is written straight from
+  the caller's buffer. It writes exactly the bytes `tula_builder_finish` returns,
+  with no 2 GiB cap.
+- **`tula_builder_write_file_signed(b, path, sk)`** does the same, Ed25519-signed,
+  and is byte-identical to `tula_builder_finish_signed`. It writes the content,
+  maps it back read-only, signs the mapping, and appends the signature.
+  `ed25519_sign` streams its message through SHA-512 without a copy, so **no new
+  sigil API was needed**. The roadmap's multi-part-sign request is dropped.
+- **Atomic replace for both streaming writers.** Each writes a sibling temp
+  `<path>.tula-<16 hex>.tmp`:
+  - created with `O_CREAT|O_EXCL`, so a planted name is never opened and another
+    name is tried;
+  - named with 64 random bits from `getrandom`;
+  - given the existing target's mode, so it is never more permissive than the
+    result.
+
+  The writer then fsyncs and renames it over `path`, and fsyncs the directory. On
+  any failure the temp is removed and `path` is untouched. A symlink at `path` is
+  replaced, not written through.
+- **`tula_write_file_atomic(path, buf, len)`**: the same guarantee for an
+  in-memory buffer (the stdlib's `file_write_atomic`).
+- **`tula_file_len(path)`** returns the total a file declares, once the file is
+  known to hold it. **`tula_read_file_into(path, buf, cap)`** reads into the
+  caller's buffer, which can be reused and can be larger than 2 GiB, so heap reads
+  work for any file size and leave no buffer stuck in the bump allocator.
+- **`make bigfile`**, a new CI gate: a 2.42 GB checkpoint (36 × 64 MiB tensors,
+  short and LoRA-length names) is refused by the in-memory path, streamed in
+  5.6 s, mapped, strict-validated, spot-checked by full name, refused by
+  `tula_read_file`, and read through `tula_read_file_into`. **`make
+  bigfile-signed`** does the same signed and verified (locally; see below).
+- **ADR 0006** records the design.
+
+### Changed
+
+- **`tula_serialize`** and the streaming writer share one layout calculation,
+  header writer and names-table entry writer, so they can't drift apart.
+- **Bench**: a streaming-write op: 100 MB in 289 ms (363 MB/s) including fsync.
+
+### Notes
+
+- **Signing big files is bound by sigil's SHA-512**, measured at ~18 MB/s.
+  Ed25519 hashes the message twice to sign and once to verify. For 2.42 GB:
+  sign 266–274 s, verify 127–129 s (two runs). A 14 GB checkpoint would take about 25 minutes to
+  sign. tula adds only the write and one mapping. Crypto is sigil's (ADR 0001),
+  so this is now a cross-repo ask on the roadmap. It is why the signed big-file
+  gate runs locally rather than in CI.
+
+### Verified
+
+- Suite **388 → 422** assertions in 10 suites. The new `stream.tcyr` (34)
+  checks:
+  - **Streamed equals in-memory, byte for byte**, unsigned and signed, over 12
+    randomized builders: long names, empty and 0-dim tensors, a payload larger
+    than the staging buffer.
+  - **Atomic replace**: the old file is kept when the target directory is missing
+    or the target is a directory, and no temp file is left behind.
+  - **Mode and symlinks**: a 0600 target stays 0600, and a symlinked target is
+    replaced while the link's target is untouched.
+  - **Reading**: `tula_file_len` and `tula_read_file_into` (exact and short
+    buffers, reuse across files, truncated files).
+- Mutations are caught: dropping the payload padding breaks byte equality, and
+  skipping the temp cleanup leaves a file the test sees.
+- `make bigfile` PASS. `make bigfile-signed` PASS (2,415,925,104 bytes, signed
+  and verified). `make fuzz` PASS (0 faults, 0 invariant failures).
+- `fmt`, `lint`, `vet` and `deny` clean. `doc --check` 0 undocumented.
+  `make example` PASS. `make dist` OK.
+
 ## [1.3.0] - 2026-11-04
 
 **Real names, real dtypes.** An additive MINOR with no format bump: two new

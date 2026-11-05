@@ -1,0 +1,161 @@
+# programs/bigfile.cyr — the 1.4.0 big-file gate (ADR 0006), end to end on a
+# checkpoint larger than the stdlib's 2 GiB per-allocation cap:
+#
+#   1. the in-memory writer refuses it (tula_builder_finish returns 0 — the cap);
+#   2. tula_builder_write_file streams it to disk (built with -D TULA_BIG_SIGNED:
+#      tula_builder_write_file_signed, signed);
+#   3. tula_file_len agrees; tula_open_mmap + tula_validate_strict accept it (and,
+#      signed, tula_verify_required); every tensor is spot-checked by full name;
+#   4. tula_read_file refuses it (one heap allocation can't hold it), and
+#      tula_read_file_into reads it into a caller-provided mapping.
+#
+# 36 tensors x 64 MiB (f64 [8 Mi]) = 2.25 GiB of payload. The tensors are views
+# into one 64 MiB + 288-byte buffer at 8-byte steps, so each tensor's data is
+# distinct (its first word is its index) while the program holds only ~64 MiB.
+# Writes ~2.3 GB under build/ and removes it.
+#
+#   make bigfile          # unsigned: seconds (the CI gate)
+#   make bigfile-signed   # signed: minutes — bound by sigil's SHA-512 (~18 MB/s
+#                         # measured; Ed25519 signs in two passes, verifies in one)
+
+include "src/lib.cyr"
+
+enum BigCfg {
+    BG_TENSORS = 36;
+    BG_ELEMS   = 8388608;          # 8 Mi f64 = 64 MiB per tensor
+}
+
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn kv(label, n): i64 {
+    sput(label);
+    fmt_int(n);
+    sput("\n");
+    return 0;
+}
+
+fn fail(msg): i64 {
+    sput("FAIL: ");
+    sput(msg);
+    sput("\n");
+    return 1;
+}
+
+# Name of tensor t: short "layer.<t>.w" for most, a 62-char LoRA name for every 6th.
+fn tname(buf, t): i64 {
+    var pre = "layer.";
+    var suf = ".w";
+    if (t % 6 == 5) {
+        pre = "base_model.model.model.layers.";
+        suf = ".self_attn.q_proj.lora_A.weight";
+    }
+    var k = 0;
+    while (load8(pre + k) != 0) { store8(buf + k, load8(pre + k)); k = k + 1; }
+    store8(buf + k, 48 + t / 10);
+    store8(buf + k + 1, 48 + t % 10);
+    k = k + 2;
+    var j = 0;
+    while (load8(suf + j) != 0) { store8(buf + k + j, load8(suf + j)); j = j + 1; }
+    store8(buf + k + j, 0);
+    return buf;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var bytes = BG_ELEMS * 8;
+    var span = bytes + BG_TENSORS * 8;
+    var base = mmap_anon(span);
+    if (base == 0) { return fail("could not map the source buffer"); }
+    var w = 0;
+    while (w < span / 8) { store64(base + w * 8, w); w = w + 1; }   # word i = i
+
+    var b = tula_builder_new_cap(BG_TENSORS);
+    var shape = alloc(8);
+    store64(shape, BG_ELEMS);
+    var nm = alloc(96);
+    var t = 0;
+    while (t < BG_TENSORS) {
+        if (tula_builder_add_long(b, tname(nm, t), TULA_DT_F64, shape, 1, base + t * 8, bytes) != 0) {
+            return fail("add");
+        }
+        t = t + 1;
+    }
+    sput("tula big-file gate (ADR 0006)\n");
+
+    # 1. the in-memory path is capped
+    if (tula_builder_finish(b) != 0) { return fail("tula_builder_finish should refuse > 2 GiB"); }
+    sput("  in-memory finish     : refused (over the 2 GiB allocation cap), as expected\n");
+
+    # 2. stream it, signed
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, i + 101); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var path = "build/tula_bigfile.tula";
+    var t0 = now_ns();
+    var total = 0;
+    #ifdef TULA_BIG_SIGNED
+    total = tula_builder_write_file_signed(b, path, sk);
+    #endif
+    #ifndef TULA_BIG_SIGNED
+    total = tula_builder_write_file(b, path);
+    #endif
+    var t1 = now_ns();
+    if (total <= 0x80000000) { return fail("streaming write"); }
+    kv("  file bytes           : ", total);
+    kv("  write(+sign)+fsync ms: ", (t1 - t0) / 1000000);
+
+    # 3. read it back through the mapping
+    if (tula_file_len(path) != total) { return fail("tula_file_len"); }
+    var r = tula_open_mmap(path);
+    if (r == 0) { return fail("tula_open_mmap"); }
+    var t2 = now_ns();
+    if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { return fail("tula_validate_strict"); }
+    var t3 = now_ns();
+    kv("  strict validate ms   : ", (t3 - t2) / 1000000);
+    #ifdef TULA_BIG_SIGNED
+    if (tula_verify_required(r, pk) != TULA_OK) { return fail("tula_verify_required"); }
+    var t4 = now_ns();
+    kv("  verify ms            : ", (t4 - t3) / 1000000);
+    #endif
+    #ifndef TULA_BIG_SIGNED
+    if (tula_is_signed(r) != 0) { return fail("unsigned file carries a signature"); }
+    #endif
+    t = 0;
+    while (t < BG_TENSORS) {
+        var e = tula_find_name(r, tname(nm, t));
+        if (e == 0) { return fail("a tensor not found by full name"); }
+        var p = tula_entry_data(r, e);
+        if (load64(p) != t) { return fail("a tensor's first word"); }
+        if (load64(p + bytes - 8) != t + BG_ELEMS - 1) { return fail("a tensor's last word"); }
+        t = t + 1;
+    }
+    sput("  36 tensors           : found by full name, first + last words exact\n");
+    tula_close_mmap(r);
+
+    # 4. heap reads: one allocation can't, a caller's mapping can
+    if (tula_read_file(path) != 0) { return fail("tula_read_file should refuse > 2 GiB"); }
+    var into = mmap_anon(total);
+    if (into == 0) { return fail("could not map the read buffer"); }
+    var t5 = now_ns();
+    var ri = tula_read_file_into(path, into, total);
+    var t6 = now_ns();
+    if (ri != into) { return fail("tula_read_file_into"); }
+    var e9 = tula_find_name(ri, tname(nm, 35));
+    if (load64(tula_entry_data(ri, e9)) != 35) { return fail("read_into data"); }
+    kv("  read_into ms         : ", (t6 - t5) / 1000000);
+    cyr_munmap(into, total);
+
+    xunlink(path);
+    cyr_munmap(base, span);
+    sput("RESULT: PASS — a 2.3 GB checkpoint streamed, validated and read without a whole-file allocation\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

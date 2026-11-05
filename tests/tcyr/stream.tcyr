@@ -1,0 +1,228 @@
+# tests/tcyr/stream.tcyr — the 1.4.0 big-file paths (ADR 0006): the streaming
+# writers produce exactly the in-memory writer's bytes (unsigned and signed, over
+# randomized builders with long names, empty and 0-dim tensors, and payloads
+# bigger than the 64 KiB staging buffer); the atomic replace keeps the old file
+# on failure, leaves no temp behind, keeps the target's mode and replaces a
+# symlink rather than writing through it; tula_file_len and tula_read_file_into.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    return (x >> 33) & 0x7FFFFFFF;
+}
+
+fn bytes_eq(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Read the whole file at path into a fresh buffer of `want` (+1) bytes; returns the
+# byte count read (or a negative errno) via the first word of `out`, buffer in +8.
+fn slurp(path, want, out): i64 {
+    var buf = alloc(want + 16);
+    store64(out, file_read_all(path, buf, want + 16));
+    store64(out + 8, buf);
+    return 0;
+}
+
+# A randomized builder: 1..60 tensors, lengths 0..300 (one ~200 KiB payload, past
+# the staging buffer), every rank 0..8, short and long names (add_long).
+fn random_builder(s): i64 {
+    var b = tula_builder_new_cap(64);
+    var nt = 1 + lcg(s) % 60;
+    var t = 0;
+    var nm = alloc(96);
+    while (t < nt) {
+        var len = lcg(s) % 301;
+        if (t == 3) { len = 200000 + lcg(s) % 1000; }
+        var d = alloc(len + 1);
+        var k = 0;
+        while (k < len) { store8(d + k, lcg(s) & 0xFF); k = k + 1; }
+        var nd = lcg(s) % 9;
+        var sh = alloc(72);
+        k = 0;
+        while (k < 9) { store64(sh + k * 8, lcg(s) % 7); k = k + 1; }
+        var nl = 1 + lcg(s) % 80;                  # up to 80: long names too
+        k = 0;
+        while (k < nl) { store8(nm + k, 97 + lcg(s) % 26); k = k + 1; }
+        store8(nm + nl, 0);
+        tula_builder_add_long(b, nm, lcg(s) % 7, sh, nd, d, len);
+        t = t + 1;
+    }
+    return b;
+}
+
+fn test_stream_equals_memory() {
+    var s = alloc(8);
+    store64(s, 31337);
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, 5 * i + 9); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var out = alloc(16);
+    var same_u = 0;
+    var same_s = 0;
+    var longs = 0;
+    var rep = 0;
+    while (rep < 12) {
+        var b = random_builder(s);
+        var mem = tula_builder_finish(b);
+        var mlen = tula_total_len(mem);
+        var path = "build/test_stream.tula";
+        var wl = tula_builder_write_file(b, path);
+        slurp(path, mlen, out);
+        if (wl == mlen) {
+            if (load64(out) == mlen) {
+                if (bytes_eq(load64(out + 8), mem, mlen) == 1) { same_u = same_u + 1; }
+            }
+        }
+        var smem = tula_builder_finish_signed(b, sk);
+        var slen = tula_total_len(smem);
+        var wls = tula_builder_write_file_signed(b, path, sk);
+        slurp(path, slen, out);
+        if (wls == slen) {
+            if (load64(out) == slen) {
+                if (bytes_eq(load64(out + 8), smem, slen) == 1) { same_s = same_s + 1; }
+            }
+        }
+        if (tula_has_long_names(tula_open(mem, mlen)) == 1) { longs = longs + 1; }
+        rep = rep + 1;
+    }
+    assert_eq(same_u, 12, "streamed unsigned file == tula_builder_finish bytes (12 random builders)");
+    assert_eq(same_s, 12, "streamed signed file == tula_builder_finish_signed bytes (Ed25519 is deterministic)");
+    assert(longs > 6, "most random builders carried a names table");
+    var r = tula_read_file("build/test_stream.tula");
+    assert(r != 0, "the last streamed (signed) file reads back");
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "... and its signature verifies");
+    return 0;
+}
+
+fn small_builder(v): i64 {
+    var b = tula_builder_new();
+    var sh = alloc(8);
+    store64(sh, 4);
+    var d = alloc(8);
+    store64(d, v);
+    tula_builder_add_checked(b, "w", TULA_DT_INT8, sh, 1, d, 4);
+    return b;
+}
+
+fn test_atomic_replace() {
+    var path = "build/test_stream_replace.tula";
+    var n1 = tula_builder_write_file(small_builder(0x11111111), path);
+    assert(n1 > 0, "first write");
+    var n2 = tula_builder_write_file(small_builder(0x22222222), path);
+    assert_eq(n2, n1, "second write, same size");
+    var r = tula_read_file(path);
+    assert_eq(load8(tula_entry_data(r, tula_find(r, "w"))), 0x22, "the file now holds the second write");
+    # a failing write leaves the old file: the target's directory doesn't exist
+    var bad = tula_builder_write_file(small_builder(0x33333333), "build/no_such_dir/x.tula");
+    assert(bad < 0, "a write into a missing directory fails (negative errno)");
+    # a target that is a directory: the temp is written, the rename fails, the temp goes
+    xmkdir("build/test_stream_dir", 0x1ED);
+    xmkdir("build/test_stream_dir/target", 0x1ED);
+    var bad2 = tula_builder_write_file(small_builder(0x44), "build/test_stream_dir/target");
+    assert(bad2 < 0, "renaming over a directory fails");
+    var ents = dir_list(str_from("build/test_stream_dir"));
+    assert_eq(vec_len(ents), 1, "... and leaves no temp file behind (only 'target' remains)");
+    return 0;
+}
+
+fn test_mode_and_symlink() {
+    var path = "build/test_stream_mode.tula";
+    tula_builder_write_file(small_builder(1), path);
+    sys_chmod(path, 0x180);                                   # 0600
+    tula_builder_write_file(small_builder(2), path);
+    var st = alloc(144);
+    xstat(path, st);
+    assert_eq(load32(st + STAT_MODE) & 0x1FF, 0x180, "a replaced file keeps its 0600 mode");
+    # a symlink at the target is replaced by the file, not written through
+    var victim = "build/test_stream_victim.bin";
+    file_write_all(victim, "untouched", 9);
+    var link = "build/test_stream_link.tula";
+    xunlink(link);
+    xsymlink("test_stream_victim.bin", link);
+    var n = tula_builder_write_file(small_builder(3), link);
+    assert(n > 0, "a write to a symlinked path succeeds");
+    var vb = alloc(32);
+    assert_eq(file_read_all(victim, vb, 32), 9, "the link's target keeps its 9 bytes");
+    assert(bytes_eq(vb, "untouched", 9), "... unchanged");
+    assert(tula_read_file(link) != 0, "the path is now a tula file");
+    return 0;
+}
+
+fn test_write_file_atomic() {
+    var buf = tula_builder_finish(small_builder(0x55));
+    var len = tula_total_len(buf);
+    var path = "build/test_stream_atomic_buf.tula";
+    assert_eq(tula_write_file_atomic(path, buf, len), len, "tula_write_file_atomic returns len");
+    var r = tula_read_file(path);
+    assert(r != 0, "... and the file reads back");
+    assert(tula_write_file_atomic("build/no_such_dir/y.tula", buf, len) < 0, "a missing directory -> negative errno");
+    return 0;
+}
+
+fn test_read_into_and_len() {
+    var p1 = "build/test_stream_into1.tula";
+    var p2 = "build/test_stream_into2.tula";
+    var b1 = small_builder(0x66);
+    var lname = "base_model.model.model.layers.9.self_attn.k_proj.lora_B.weight";
+    tula_builder_add_long(b1, lname, TULA_DT_F16, alloc(8), 0, alloc(8), 2);
+    var l1 = tula_builder_write_file(b1, p1);
+    var l2 = tula_builder_write_file(small_builder(0x77), p2);
+    assert_eq(tula_file_len(p1), l1, "tula_file_len == the written length");
+    assert_eq(tula_file_len(p2), l2, "... for a second file too");
+    assert_eq(tula_file_len("build/test_stream_missing.tula"), 0 - 1, "missing file -> -1");
+    var cap = 4096;
+    var buf = alloc(cap);
+    var r1 = tula_read_file_into(p1, buf, cap);
+    assert(r1 == buf, "read_into returns the caller's buffer");
+    assert(tula_find_name(r1, lname) != 0, "... a valid reader (long name found)");
+    var r2 = tula_read_file_into(p2, buf, cap);
+    assert(r2 == buf, "the same buffer, reused for another file");
+    assert_eq(load8(tula_entry_data(r2, tula_find(r2, "w"))), 0x77, "... holding that file now");
+    assert_eq(tula_read_file_into(p1, buf, l1 - 1), 0, "a buffer one byte short -> 0");
+    assert(tula_read_file_into(p1, buf, l1) == buf, "an exact-size buffer works");
+    assert_eq(tula_read_file_into(p1, 0, cap), 0, "a null buffer -> 0");
+    # truncated file: len refuses it, read_into refuses it
+    var full = alloc(l1);
+    file_read_all(p1, full, l1);
+    var pt = "build/test_stream_trunc.tula";
+    tula_write_file(pt, full, l1 - 3);
+    assert_eq(tula_file_len(pt), 0 - 1, "a truncated file -> tula_file_len -1");
+    assert_eq(tula_read_file_into(pt, buf, cap), 0, "... and read_into 0");
+    return 0;
+}
+
+fn test_empty_builder_streams() {
+    var b = tula_builder_new();
+    var mem = tula_builder_finish(b);
+    var n = tula_builder_write_file(b, "build/test_stream_empty.tula");
+    assert_eq(n, tula_total_len(mem), "an empty builder streams a 64-byte header");
+    var r = tula_read_file("build/test_stream_empty.tula");
+    assert(r != 0, "... that reads back");
+    assert_eq(tula_count(r), 0, "... with no tensors");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_stream_equals_memory();
+    test_atomic_replace();
+    test_mode_and_symlink();
+    test_write_file_atomic();
+    test_read_into_and_len();
+    test_empty_builder_streams();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

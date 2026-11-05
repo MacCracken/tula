@@ -187,6 +187,17 @@ fn main(): i64 {
     }
     report_mb("write        : ", total, wmin);
 
+    # ---- streaming write (1.4.0): builder -> disk, atomic (temp + fsync + rename) ----
+    var smin2 = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var ts = now_ns();
+        if (tula_builder_write_file(bb, "build/tula_bench_stream.tula") != total) { sput("stream FAILED\n"); return 1; }
+        smin2 = min_of(smin2, round, now_ns() - ts);
+        round = round + 1;
+    }
+    report_mb("stream write : ", total, smin2);
+
     # ---- read (heap copy) ----
     var rmin = 0;
     round = 0;

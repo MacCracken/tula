@@ -7,6 +7,8 @@
 #   make test    — CPU test suites (tests/tcyr/*.tcyr)
 #   make dist    — regenerate dist/tula.cyr via `cyrius distlib`
 #   make lint / fmt-check / vet  — quality gates
+#   make bigfile — 1.4.0 gate: a 2.3 GB file streamed, validated, read (CI)
+#   make bigfile-signed — the same, signed + verified (minutes: sigil's SHA-512)
 #   make clean   — scrub build/
 
 CYRIUS ?= cyrius
@@ -65,6 +67,18 @@ bench: check-lib-wiring
 	@mkdir -p build
 	CYRIUS_DCE=1 $(CYRIUS) build programs/bench.cyr build/tula_bench
 	./build/tula_bench
+
+.PHONY: bigfile
+bigfile: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build programs/bigfile.cyr build/tula_bigfile
+	./build/tula_bigfile
+
+.PHONY: bigfile-signed
+bigfile-signed: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build -D TULA_BIG_SIGNED programs/bigfile.cyr build/tula_bigfile_signed
+	./build/tula_bigfile_signed
 
 .PHONY: example
 example: check-lib-wiring

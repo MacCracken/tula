@@ -101,6 +101,14 @@ jobs:
           CYRIUS_DCE=1 cyrius build examples/consumer.cyr build/tula_consumer
           ./build/tula_consumer
 
+      - name: Big file (1.4.0 gate — a 2.3 GB file streamed past the 2 GiB allocation cap)
+        # Unsigned: seconds. The signed variant (make bigfile-signed) takes minutes,
+        # bound by sigil's SHA-512, and runs locally; signed streaming is checked
+        # byte-for-byte against the in-memory writer in tests/tcyr/stream.tcyr.
+        run: |
+          CYRIUS_DCE=1 cyrius build programs/bigfile.cyr build/tula_bigfile
+          ./build/tula_bigfile
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest

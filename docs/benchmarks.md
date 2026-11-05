@@ -82,6 +82,23 @@ IEEE rounding does. Everything else goes through the general conversion. That's
 about 2.2× the per-element scalar calls (46 → 102 Melem/s pack, 68 → 138 unpack)
 and bit-identical (tested on every 16-bit code and midpoint, and 300k F32 cases).
 
+### Added in 1.4.0
+
+| Op | 1.4.0 | Notes |
+|---|---:|---|
+| `tula_builder_write_file`, 100 MB | 289 ms · 363 MB/s | streamed + fsync + rename; vs serialize (27 ms) + plain write (195 ms), which doesn't fsync |
+| `make bigfile`: stream 2.42 GB | 5.6 s · ~430 MB/s | past the 2 GiB allocation cap; strict validate < 1 ms; mmap; spot checks |
+| `tula_read_file_into`, 2.42 GB | 315 ms | page-cache warm, into a caller's anonymous mapping |
+| `make bigfile-signed`: write + sign 2.42 GB | 266–274 s | two SHA-512 passes in `ed25519_sign` (two runs) |
+| `tula_verify_required`, 2.42 GB | 127–129 s | one SHA-512 pass |
+| sigil SHA-512 (measured directly) | ~18 MB/s | 64 MiB in 3.6 s; `ed25519_sign` 7.2 s, `ed25519_verify` 3.6 s |
+
+**Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
+14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
+adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is
+there: a tuned SHA-512 runs at hundreds of MB/s. It's on the roadmap as a
+cross-repo ask.
+
 Earlier result (1.0.0, cyrius 6.3.27, tmpfs `/tmp`, ms resolution): write 34 ms,
 read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O only.
 

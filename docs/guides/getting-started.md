@@ -89,6 +89,12 @@ if (tula_entry_payload_ok(e) != 1) { return 1; }      # guard before unpack
 var p = tula_entry_data(r, e);                        # in-bounds, zero-copy
 ```
 
+For checkpoints over 2 GiB (1.4.0), write with `tula_builder_write_file(b, path)`
+(or `_signed`). It streams straight from your tensor buffers and replaces the
+target atomically, so nothing the size of the file is allocated. Read with
+`tula_open_mmap`, or `tula_read_file_into` with a buffer sized by
+`tula_file_len`.
+
 For large files prefer `tula_open_mmap` (zero-copy; sub-millisecond regardless of
 size) + `tula_close_mmap`. See [benchmarks](../benchmarks.md). A mapping shows the
 file as it is *now*: map only files nobody else is writing. For a file another
