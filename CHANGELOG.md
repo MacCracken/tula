@@ -7,6 +7,32 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-11-04
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.20`.** No source change. `lib/` re-resolved by `cyrius deps` from the
+  6.6.20 snapshot (52 files, `deps --verify` clean).
+- **`[deps.sigil]` tag `3.12.16` → `3.13.10`**, the last sigil tag pinned within 6.6.x (it pins
+  6.6.18; 3.13.11 moves to 6.7.5). It's the same sigil `ifran` pins at 6.6.20. tula's Ed25519 calls
+  (`ed25519_keypair` / `_sign` / `_verify`) are unchanged across the range.
+- **`[deps].stdlib` gains `sys`.** sigil 3.13.10's `dist/sigil.deps` lists it. The leaves sigil's
+  sidecar dropped at 3.13.10 (`assert`, `bench`, `fnptr`, `fs`, `result`, `str`) were already in
+  tula's own list, so nothing else moves.
+- **`dist/tula.deps` removed by `cyrius distlib`.** Since 6.6.18 the sidecar lists only the leaves
+  its compile check proves the bundle needs. Every leaf `dist/tula.cyr` reaches comes in through
+  sigil's sidecar, which consumers already resolve because they supply `ed25519_*`. With nothing
+  left to list, distlib deletes the file (`sidecar: removed dist/tula.deps (no stdlib leaves
+  remain)`). `dist/tula.cyr` changes only in its version lines.
+
+### Verified
+
+- Verified against the **tagged** sigil, the graph CI builds. `path = "../sigil"` still wins under
+  6.6.20 (git-first only arrives in 6.7.6), and the sibling checkout is at 3.13.15, which pins
+  6.7.9. So the run was done with the override dropped. Suite **105/105** (5 suites). Lint, fmt and
+  vet clean. `make example` PASS. `make fuzz` 2,003,000 iterations, 0 invariant failures.
+  `make bench` and `make dist` OK.
+
 ## [1.0.2] - 2026-09-11
 
 ### Changed

@@ -1,6 +1,6 @@
 # tula — Current State
 
-> **Last refresh**: 2026-07-01 | **Cadence**: every release.
+> **Last refresh**: 2026-11-04 | **Cadence**: every release.
 > `CLAUDE.md` is preferences / process (durable); this file is **state**
 > (volatile) — version, sizes, counts.
 
@@ -23,18 +23,27 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.0.0** (`tula_version_int()` returns `10000`). Post-1.0 work
+VERSION is **1.0.3** (`tula_version_int()` returns `10003`). 1.0.1–1.0.3 are
+toolchain/dep realigns with no source or format change (see `CHANGELOG.md`). Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
 ## Toolchain
 
-Cyrius pin **6.5.27** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
-**sigil** (Ed25519). Local dev resolves sigil via `path = "../sigil"`; CI/release
-resolve via `[deps.sigil]` **git+tag** — so **sigil 3.9.9 must be tagged on
-GitHub** for CI + the release to pass.
+Cyrius pin **6.6.20** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
+**sigil 3.13.10** (Ed25519), the last sigil tag pinned within 6.6.x. Local dev
+resolves sigil via `path = "../sigil"`; CI/release resolve via `[deps.sigil]`
+**git+tag** — so the sigil tag must exist on GitHub for CI + the release to pass.
 
-**Pin bumped to `6.5.27` 2026-08-17** (ecosystem-wide ML/AI-arc realign, ahead of the arc reopening). `cyrius lib sync --full` re-vendored the whole version-matched stdlib snapshot; suite re-verified green at the new pin.
+**Under 6.6.x the `path` override wins**, even when it isn't the declared tag. So a
+local `cyrius build` / `test` builds whatever `../sigil` is checked out at. To test
+the declared graph, drop the `path` line for the run (or move `../sigil` to the tag).
+The 6.7.6 note in `roadmap.md` makes the tag the default.
+
+**Pin history:** 6.3.27 → 6.5.27 (2026-08-17) → 6.6.2 (2026-09-11) → **6.6.20**
+(2026-11-04). Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the
+bundle itself needs. tula needs none beyond what sigil's sidecar brings, so there is
+no `dist/tula.deps`.
 
 ## Build artifacts
 
