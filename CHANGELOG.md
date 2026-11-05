@@ -7,6 +7,38 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-04
+
+### Changed
+
+- **Toolchain `6.7.9` → `6.7.18`.** No source change; nothing in the 6.7.10–6.7.18 migration
+  notes touches tula's Linux code paths. `lib/` re-resolved by `cyrius deps` from the 6.7.18
+  snapshot (`deps --verify` 60/60). The snapshot now carries `lib/unicode/`, see Binary below.
+- **Deps at their latest releases.** sigil **3.13.15** is still sigil's newest tag on GitHub, so
+  `[deps.sigil]` doesn't move. It's now also exactly the copy the 6.7.18 toolchain bundles, so
+  1.1.0's `./lib/ shadows version-pinned … sigil` build warning is gone.
+- **Local `cyrius.lock` regenerated.** It still held a sigil 3.13.10 commit pin beside 3.13.15's
+  (left by the 1.0.3 resolve), which 6.7.18 reports as `cyrius.lock keeps sigil@3.13.10's pin …
+  fail-closed`. Deleting and re-resolving leaves one pin, 3.13.15 at `3c47656`. The lock is
+  gitignored, so other checkouts and CI never saw it. If you have a lock from before 1.1.1 and
+  see that note, delete it.
+
+### Binary
+
+- **Smoke binary 251,280 → 590,952 B**, all of it data. The code segment is ~100 KB; the RW
+  segment grew to 488 KB. bayan 1.9.0, folded into cyrius 6.7.13, made `lib/bayan.cyr` require
+  `lib/unicode/` (~300 KB of string tables). DCE removes functions, not global initializers, so
+  the tables stay in any binary that includes bayan. tula's own code makes no bayan calls: it
+  arrives through `dist/sigil.cyr`'s `# Requires` block. So the fix is sigil's, tracked in sigil's
+  open issue `2026-11-01-sigil-mldsa-pulls-bayans-unicode-tables.md`. kybernet, libro and
+  argonaut recorded the same jump. Consumers of `dist/tula.cyr` already pay it through sigil.
+
+### Verified
+
+- Suite **105/105** (5 suites). Builds and tests warning-free. Lint, fmt and vet clean.
+  `make example` PASS. `make fuzz` 2,003,000 iterations, 0 invariant failures. `make bench` and
+  `make dist` OK (`dist/tula.cyr` changes only in its version lines).
+
 ## [1.1.0] - 2026-11-04
 
 No API addition and no format change. The public surface and on-disk format v1 are

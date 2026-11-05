@@ -23,15 +23,15 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.1.0** (`tula_version_int()` returns `10100`). 1.0.1–1.1.0 are
+VERSION is **1.1.1** (`tula_version_int()` returns `10101`). 1.0.1–1.1.1 are
 toolchain/dep realigns with no API or format change (see `CHANGELOG.md`). Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
 ## Toolchain
 
-Cyrius pin **6.7.9** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
-**sigil 3.13.15** (Ed25519), the sigil release that pins 6.7.9. Every build resolves
+Cyrius pin **6.7.18** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
+**sigil 3.13.15** (Ed25519), sigil's latest release and the copy 6.7.18 bundles. Every build resolves
 `[deps.sigil]` **git+tag**, local and CI alike (cyrius ≥ 6.7.6, git first). The sigil
 tag must exist on GitHub for CI + the release to pass.
 
@@ -39,13 +39,15 @@ tag must exist on GitHub for CI + the release to pass.
 tree under `build/local-deps/`; `lib/` and `cyrius.lock` stay the tag's. Without the
 switch a build prints one `hint:` line naming the unused checkout.
 
-**Expected warning:** `./lib/ shadows version-pinned …/6.7.9/lib … sigil 3.13.15
-(pinned: 3.13.11)`. The toolchain ships an older sigil copy; the declared tag wins.
-
 **Pin history:** 6.3.27 → 6.5.27 (2026-08-17) → 6.6.2 (2026-09-11) → 6.6.20
-(2026-11-04, 1.0.3) → **6.7.9** (2026-11-04, 1.1.0). Since 6.6.18, `cyrius distlib`
-writes a sidecar only for leaves the bundle itself needs. tula needs none beyond what
-sigil's sidecar brings, so there is no `dist/tula.deps`. Smoke binary: 251,280 B.
+(2026-11-04, 1.0.3) → 6.7.9 (2026-11-04, 1.1.0) → **6.7.18** (2026-11-04, 1.1.1).
+Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the bundle itself needs.
+tula needs none beyond what sigil's sidecar brings, so there is no `dist/tula.deps`.
+
+**Smoke binary: 590,952 B** (~100 KB code, 488 KB data). Most of the data is bayan's
+`lib/unicode/` tables, which sigil's bundle pulls in. DCE can't drop global initializers,
+and tula itself makes no bayan calls. It shrinks when sigil's open issue
+`2026-11-01-sigil-mldsa-pulls-bayans-unicode-tables.md` lands.
 
 ## Build artifacts
 
