@@ -55,11 +55,16 @@ The full march M0→M5:
   names, shape ↔ size), `tula_verify_required`, `tula_find_scale`,
   `tula_entry_nelems`.
 
-**274/274** assertions across 7 suites (builder · strict · round-trip · sign ·
-file-io · dtype · hardening) + a >2·10⁶-iteration guard-page fuzz harness and an
-end-to-end consumer, all green. Deps: stdlib + **sigil** (Ed25519); the cyrius
-pin lives in `cyrius.cyml`. CI + release workflows in place. Post-1.0 changes are
-additive-only (SemVer); next is 1.3.0 (long names, F32/F16/BF16). See
+- **1.3.0** — real names, real dtypes: tensor names of any length via the
+  `__tula.names__` table (`tula_builder_add_long`, `tula_find_name`), and
+  `TULA_DT_F32/F16/BF16` with exact IEEE conversions. Still format v1.
+
+**388/388** assertions across 9 suites (names · builder · strict · dtype · floats ·
+file-io · hardening · round-trip · sign) + a >2·10⁶-iteration guard-page fuzz
+harness and an end-to-end consumer, all green. Deps: stdlib + **sigil**
+(Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
+place. Post-1.0 changes are additive-only (SemVer); next is 1.4.0 (big files).
+See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test

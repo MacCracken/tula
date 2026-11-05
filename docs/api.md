@@ -41,9 +41,23 @@ SIGNATURE (Ed25519, 64 B) at sig_off = payload_off + payload_len, covering [0, s
 | `TULA_DT_INT8`    | 1 | int8 (two's-complement bytes), `data_len = nelems` |
 | `TULA_DT_TERNARY` | 2 | 2-bit packed {−1,0,+1}, `data_len = ceil(nelems/4)` |
 | `TULA_DT_NF4`     | 3 | 4-bit NF4 codes, `data_len = ceil(nelems/2)` |
+| `TULA_DT_F32`     | 4 | IEEE binary32, LE, `data_len = nelems*4` *(1.3.0)* |
+| `TULA_DT_F16`     | 5 | IEEE binary16, LE, `data_len = nelems*2` *(1.3.0)* |
+| `TULA_DT_BF16`    | 6 | bfloat16 (binary32's top half), LE, `data_len = nelems*2` *(1.3.0)* |
 
 Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 `"<name>.scale"` (ADR 0002) — the codec never interprets it.
+
+### Long names (1.3.0, ADR 0004)
+
+A tensor name over 47 bytes doesn't fit the 48-byte field. Its entry stores a
+47-byte **key** instead: the name's first 30 bytes, `~`, then 16 lowercase hex
+digits of FNV-1a-64 of the name. The full names live in the **names table**, a
+reserved int8 tensor `__tula.names__` that is always the last entry. Its payload
+is the magic `"tula.nm1"`, a record count L, L records `{entry_index, name_off,
+name_len}` (i64 each, sorted by entry), then the names, each NUL-terminated.
+Files without long names have no table. Every 1.x reader opens files that have
+one, seeing the keys as names and the table as an ordinary int8 tensor.
 
 ---
 
@@ -63,10 +77,12 @@ Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 | | | | `TULA_ERR_LAYOUT` | 14 |
 | | | | `TULA_ERR_SHAPE` | 15 |
 | | | | `TULA_ERR_DTYPE` | 16 |
+| | | | `TULA_ERR_NAMES` | 17 |
 | | | | `TULA_ERR_OTHER` | 99 |
 
 Codes 13–16 are new in 1.2.0, returned by the checked add and the strict
-validator.
+validator. 17 is new in 1.3.0 (a malformed names table, from the strict
+validator).
 
 ---
 
@@ -96,6 +112,17 @@ validator.
   add, through a name index. A builder fed only through this, with each
   `data_len` equal to `tula_packed_len(dtype, nelems)`, writes files
   `tula_validate_strict` accepts.
+- `fn tula_builder_add_long(b, name, dtype, shape, ndim, data, data_len) -> 0 |
+  TULA_ERR_*` *(1.3.0)* — names of **any length**. A name of 47 chars or fewer
+  is added exactly as `tula_builder_add_checked` adds it. A longer name is
+  stored whole in the names table, which `finish` appends after every other
+  tensor, and its entry holds the key. Errors are those of `add_checked` except
+  `TULA_ERR_NAME_LONG`, plus `TULA_ERR_DUP_NAME` for the name `__tula.names__`
+  itself, or for a first long name when the builder already holds a tensor of
+  that name, and `TULA_ERR_OOM` if the name copy fails. Duplicates are checked
+  on keys: two different long names refuse each other only if both their 30-byte
+  prefix and their 64-bit hash match. That is loud, never a silent collision.
+  Once a builder holds a long name, `add_checked` also refuses `__tula.names__`.
 - `fn tula_builder_finish(b) -> buf | 0` — serialize to one contiguous
   **unsigned** buffer (0 if the allocation fails). Use `tula_total_len(buf)` for
   its length. Every byte is written (alignment padding is zero), so the same
@@ -125,6 +152,16 @@ validator.
 - `fn tula_find(r, name) -> e | 0` — first entry with that name (exact match; a
   query over 47 chars never matches, since no stored name is that long).
 - `fn tula_is_signed(r) -> 0 | 64` — signature **presence** (length), not validity.
+- `fn tula_find_name(r, name) -> e | 0` *(1.3.0, `src/names.cyr`)* — find by
+  **full** name, any length. A name of 47 chars or fewer is matched in place
+  (never against a long-named entry's key); a longer one through its key,
+  accepted only if the names table confirms the full name. A hash collision can't
+  return the wrong tensor.
+- `fn tula_entry_full_name(r, e) -> cstring` *(1.3.0)* — the full name: a pointer
+  into the names table for a long-named entry, else `tula_entry_name(e)`. Each
+  record is bounds-checked when read; one that doesn't hold up is treated as
+  absent, and the key comes back.
+- `fn tula_has_long_names(r) -> 1 | 0` *(1.3.0)* — whether a names table is present.
 - `fn tula_entry_nelems(e) -> n | -1` *(1.2.0, `src/dtype.cyr`)* — element count:
   the product of the dims, so 1 for a 0-dim entry (a scalar) and 0 for an empty
   tensor. −1 for a negative dim or a product over `TULA_READ_MAX_BYTES`
@@ -174,7 +211,11 @@ its total opens, and the readers take exactly the declared bytes.
   - `TULA_ERR_DTYPE`: an unknown dtype.
   - `TULA_ERR_SHAPE`: a negative dim, a non-zero dim past `ndim`, or `data_len` ≠
     `tula_packed_len(dtype, nelems)` (a 0-dim entry holds one element).
-  - `TULA_ERR_DUP_NAME`: two tensors share a name.
+  - `TULA_ERR_NAMES` *(1.3.0)*: a names table is present but not canonical.
+    That means records out of order or pointing at the table, names not packed
+    in record order, a name of 47 bytes or fewer, a NUL inside a name, or an
+    entry whose field isn't its name's key.
+  - `TULA_ERR_DUP_NAME`: two tensors share a name (for long names, a key).
   - `TULA_ERR_OOM`: no memory for the duplicate check (over 512 tensors).
 
   Duplicates are found by a heapsort of (name hash, entry) records, worst case
@@ -188,8 +229,9 @@ its total opens, and the readers take exactly the declared bytes.
   must exist, be f64, pass `tula_entry_payload_ok`, and hold at least `need`
   elements in at least `need * 8` bytes. `need` is 1 for a per-tensor scale, the
   row count for per-row, or `tula_nf4_blocks(nelems, block)` for NF4. Returns 0
-  for `need < 1`, or for a name over 41 chars, whose sidecar name couldn't be
-  stored untruncated.
+  for `need < 1`. *1.3.0:* "<name>" is the entry's **full** name, and a sidecar
+  name over 47 chars is found through the names table. A file without one has no
+  such sidecar, so there, as in 1.2.0, a name over 41 chars returns 0.
 
 ## dtype payload helpers — `src/dtype.cyr`
 
@@ -217,6 +259,22 @@ unpacking a foreign tensor, call `tula_entry_payload_ok(e)` first** (see below).
   nothing for `block <= 0`.
 - `fn tula_nf4_get(nibbles, i) -> code 0..15` · `fn tula_nf4_level(i) -> f64` (the
   codebook). `TULA_NF4_BLOCK = 64` (typical block size).
+
+**F32 / F16 / BF16** *(1.3.0, ADR 0005)*: IEEE 754 conversions to and from f64,
+done in integer arithmetic, so the bytes never depend on the process's FP mode.
+- f64 → narrow is round to nearest, ties to even, **directly from the f64** (BF16
+  and F16 are not rounded through F32). Overflow gives ±inf, underflow the
+  correctly rounded subnormal or ±0 (no flush), the sign of zero is kept, and NaN
+  stays NaN with its sign and top payload bits, quiet.
+- narrow → f64 is exact; NaN comes back quiet with its payload.
+- These are the same results as x86/aarch64 hardware in the default mode. F16
+  and BF16 are checked exhaustively (all 65,536 codes and every midpoint), F32
+  against the hardware.
+- Scalars: `tula_f64_to_f32(x)` / `tula_f32_to_f64(h)`, `tula_f64_to_f16` /
+  `tula_f16_to_f64`, `tula_f64_to_bf16` / `tula_bf16_to_f64`. Bit patterns in an
+  i64; the narrow side uses its low 32 or 16 bits.
+- Arrays: `tula_f32_pack(src_f64, n, dst) -> n*4` · `tula_f32_unpack(src, n,
+  dst_f64) -> n`, and the same for `f16` / `bf16` (`-> n*2`). Little-endian.
 
 **Payload-length guard** (untrusted-input discipline):
 - `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length.
@@ -246,14 +304,15 @@ r = tula_read_file("model.tula")        # 0 if malformed
 if (r == 0) { ...reject... }
 if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { ...reject... }
 if (tula_verify_required(r, pk) != TULA_OK) { ...reject... }
-e = tula_find(r, "w")
+e = tula_find_name(r, "w")              # any length (1.3.0); tula_find for <= 47
 if (e == 0) { ...reject... }
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
 # a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
 ```
 
-`tula_validate_strict` and `tula_verify_required` are 1.2.0. On 1.0–1.1, use
-`tula_verify(r, pk) != TULA_SIG_OK` and check the consistency rules yourself.
+`tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
+and `tula_builder_add_long` are 1.3.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

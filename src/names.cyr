@@ -1,0 +1,123 @@
+# @public — tula long names (1.3.0, ADR 0004): reading the names table.
+#
+# A tensor whose full name is over 47 bytes stores a 47-byte KEY in its entry's
+# name field (the name's first 30 bytes, '~', 16 hex digits of its FNV-1a-64),
+# and its full name in the names table: the reserved int8 tensor
+# "__tula.names__", always the last entry. Layout of the table's payload:
+#   +0 magic "tula.nm1"   +8 L   +16 L x {entry_index, name_off, name_len}
+#   then the names, each NUL-terminated, in record order.
+# Files without long names have no table, and every name is in place, as in 1.0.
+#
+# Everything here reads an UNTRUSTED file: each record is bounds-checked when
+# used, and one that doesn't hold up is treated as absent. Lookups by name
+# verify the full name, so a key collision can never return the wrong tensor.
+# tula_validate_strict additionally requires the table to be canonical.
+
+# The names table's entry in an opened buffer, or 0 when there is none. The last
+# entry is the table iff it is named "__tula.names__", int8, 1-D, at least 16
+# bytes, its payload starts with the magic, and its record count fits:
+# 1 <= L <= (data_len - 16) / 24. Any other tensor of that name is ordinary.
+fn _tula_names_entry(r): i64 {
+    var c = tula_count(r);
+    if (c < 1) { return 0; }
+    var e = tula_entry(r, c - 1);
+    if (streq(tula_entry_name(e), "__tula.names__") == 0) { return 0; }
+    if (tula_entry_dtype(e) != TULA_DT_INT8) { return 0; }
+    if (tula_entry_ndim(e) != 1) { return 0; }
+    var dlen = tula_entry_data_len(e);
+    if (dlen < TULA_NAMES_HDR) { return 0; }
+    var t = tula_entry_data(r, e);
+    if (load64(t) != TULA_NAMES_MAGIC) { return 0; }
+    var nl = load64(t + 8);
+    if (nl < 1) { return 0; }
+    if (nl > (dlen - TULA_NAMES_HDR) / TULA_NAMES_REC) { return 0; }
+    return e;
+}
+
+# 1 if the opened buffer has a names table (it holds long names), else 0.
+fn tula_has_long_names(r): i64 {
+    if (_tula_names_entry(r) == 0) { return 0; }
+    return 1;
+}
+
+# The full name of entry `e` (1.3.0): for a long-named entry, a NUL-terminated
+# pointer into the names table; otherwise the entry's in-place name (exactly
+# tula_entry_name). The record is found by binary search on entry_index. A
+# record that does not hold up — offset or length out of the table, no NUL at
+# its end — is treated as absent, so the in-place key comes back. Never reads
+# outside the buffer.
+fn tula_entry_full_name(r, e): i64 {
+    var te = _tula_names_entry(r);
+    if (te == 0) { return e; }
+    var t = tula_entry_data(r, te);
+    var dlen = tula_entry_data_len(te);
+    var idx = (e - (r + load64(r + 24))) / TULA_ENTRY_SIZE;
+    var lo = 0;
+    var hi = load64(t + 8) - 1;
+    while (lo <= hi) {
+        var mid = (lo + hi) / 2;
+        var rec = t + TULA_NAMES_HDR + mid * TULA_NAMES_REC;
+        var ei = load64(rec);
+        if (ei == idx) {
+            var off = load64(rec + 8);
+            var len = load64(rec + 16);
+            if (off < 0) { return e; }
+            if (len < 0) { return e; }
+            if (off > dlen) { return e; }
+            if (len >= dlen - off) { return e; }   # off + len < dlen: the NUL is inside
+            if (load8(t + off + len) != 0) { return e; }
+            return t + off;
+        }
+        if (ei < idx) { lo = mid + 1; }
+        else          { hi = mid - 1; }
+    }
+    return e;
+}
+
+# The entry whose FULL name is a[0..alen) ‖ b[0..blen), or 0. A name of 47 bytes
+# or fewer is matched in place; a longer one through its key, accepted only if
+# the names table holds exactly that name for the entry found.
+fn _tula_find_name2(r, a, alen, b, blen): i64 {
+    var n = alen + blen;
+    if (n <= TULA_NAME_MAX) {
+        var q[48];
+        var i = 0;
+        while (i < alen) { store8(&q + i, load8(a + i)); i = i + 1; }
+        var j = 0;
+        while (j < blen) { store8(&q + alen + j, load8(b + j)); j = j + 1; }
+        store8(&q + n, 0);
+        var e = tula_find(r, &q);
+        if (e == 0) { return 0; }
+        # A long-named entry's field is its key: a short query equal to a key
+        # does not name that tensor (its full name is longer).
+        if (tula_entry_full_name(r, e) != e) { return 0; }
+        return e;
+    }
+    var k[48];
+    _tula_key2(&k, a, alen, b, blen);
+    var e2 = tula_find(r, &k);
+    if (e2 == 0) { return 0; }
+    var full = tula_entry_full_name(r, e2);
+    if (full == e2) { return 0; }   # no record: a key-shaped short name, not this one
+    var p = 0;
+    while (p < alen) {
+        if (load8(full + p) != load8(a + p)) { return 0; }
+        p = p + 1;
+    }
+    p = 0;
+    while (p < blen) {
+        if (load8(full + alen + p) != load8(b + p)) { return 0; }
+        p = p + 1;
+    }
+    if (load8(full + n) != 0) { return 0; }
+    return e2;
+}
+
+# Find an entry by its FULL name (1.3.0), any length. A name of 47 chars or fewer
+# is matched in place, as tula_find does (but never against a long-named
+# entry's key). A longer one is looked up through its key and accepted only if
+# the names table confirms the full name, so a hash collision can't return the
+# wrong tensor. Returns the entry or 0.
+fn tula_find_name(r, name): i64 {
+    return _tula_find_name2(r, name, strlen(name), "", 0);
+}

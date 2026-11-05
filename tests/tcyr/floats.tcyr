@@ -1,0 +1,389 @@
+# tests/tcyr/floats.tcyr — the 1.3.0 F32 / F16 / BF16 conversions (ADR 0005).
+# F16 and BF16 are checked EXHAUSTIVELY: every one of the 65,536 codes widens and
+# narrows back to itself (NaNs come back quiet), and every midpoint between two
+# neighbouring codes — and one f64 ulp either side — rounds the IEEE way, ties
+# to the even code. F32 is checked against the hardware conversion (cyrius
+# f32_from / f32_to: cvtsd2ss / cvtss2sd in the default FP mode) on random inputs,
+# all specials, and midpoints. BF16 is also checked against the classic
+# "+0x7FFF + lsb" rounding of F32 bits, for inputs exact in F32.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# An f64-typed builtin result as plain bits, so comparisons are bit comparisons.
+fn bits(x): i64 {
+    return x;
+}
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    var z = (x ^ ((x >> 30) & 0x3FFFFFFFF)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ ((z >> 27) & 0x1FFFFFFFFF)) * 0x94D049BB133111EB;
+    return z ^ ((z >> 31) & 0x1FFFFFFFF);
+}
+
+fn is_nan16(h, ebits, mbits): i64 {
+    var e = (h >> mbits) & ((1 << ebits) - 1);
+    var m = h & ((1 << mbits) - 1);
+    if (e == (1 << ebits) - 1) { if (m != 0) { return 1; } }
+    return 0;
+}
+
+fn narrow(x, which): i64 {
+    if (which == 0) { return tula_f64_to_f16(x); }
+    return tula_f64_to_bf16(x);
+}
+
+fn widen(h, which): i64 {
+    if (which == 0) { return tula_f16_to_f64(h); }
+    return tula_bf16_to_f64(h);
+}
+
+# Exhaustive round trip of one 16-bit format.
+fn roundtrip16(which, ebits, mbits): i64 {
+    var bad = 0;
+    var quiet = 1 << (mbits - 1);
+    var h = 0;
+    while (h < 65536) {
+        var back = narrow(widen(h, which), which);
+        if (is_nan16(h, ebits, mbits) == 1) {
+            if (back != (h | quiet)) { bad = bad + 1; }
+        } else {
+            if (back != h) { bad = bad + 1; }
+        }
+        h = h + 1;
+    }
+    return bad;
+}
+
+# Every midpoint between neighbouring positive finite codes h and h+1 (h+1 may be
+# inf for the largest finite), at both signs: the midpoint goes to the even code,
+# one f64 ulp below to h, one above to h+1.
+fn midpoints16(which, ebits, mbits): i64 {
+    var bad = 0;
+    var signbit = 1 << (ebits + mbits);
+    var maxfin = ((((1 << ebits) - 2)) << mbits) | ((1 << mbits) - 1);
+    var h = 0;
+    while (h < maxfin) {
+        var a = widen(h, which);
+        var b = widen(h + 1, which);
+        var mid = bits(f64_div(f64_add(a, b), f64_from(2)));
+        var even = h;
+        if ((h & 1) == 1) { even = h + 1; }
+        var lo = mid - 1;
+        if (mid == 0) { lo = 0; }
+        var sgn = 0;
+        while (sgn < 2) {
+            var sm = 0;
+            if (sgn == 1) { sm = 0x8000000000000000; }
+            var sh = 0;
+            if (sgn == 1) { sh = signbit; }
+            if (narrow(mid | sm, which) != (even | sh)) { bad = bad + 1; }
+            if (mid != 0) {
+                if (narrow(lo | sm, which) != (h | sh)) { bad = bad + 1; }
+            }
+            if (narrow((mid + 1) | sm, which) != ((h + 1) | sh)) { bad = bad + 1; }
+            sgn = sgn + 1;
+        }
+        h = h + 1;
+    }
+    # the largest finite code against overflow: its midpoint with 2^(emax+1) and
+    # anything above go to inf; just below the midpoint stays finite
+    var big = widen(maxfin, which);
+    var ulp = f64_sub(big, widen(maxfin - 1, which));
+    var omid = bits(f64_add(big, f64_div(ulp, f64_from(2))));
+    var inf = ((1 << ebits) - 1) << mbits;
+    if (narrow(omid, which) != inf) { bad = bad + 1; }
+    if (narrow(omid - 1, which) != maxfin) { bad = bad + 1; }
+    if (narrow(0x7FEFFFFFFFFFFFFF, which) != inf) { bad = bad + 1; }                  # f64 max
+    if (narrow(0xFFEFFFFFFFFFFFFF, which) != (inf | signbit)) { bad = bad + 1; }
+    return bad;
+}
+
+fn test_f16_exhaustive() {
+    assert_eq(roundtrip16(0, 5, 10), 0, "f16: all 65,536 codes round-trip (NaNs come back quiet)");
+    assert_eq(midpoints16(0, 5, 10), 0, "f16: every neighbour midpoint rounds to even, +-1 ulp to the neighbours");
+    assert_eq(tula_f64_to_f16(f64_from(1)), 0x3C00, "f16 1.0 = 0x3C00");
+    assert_eq(tula_f64_to_f16(f64_from(65504)), 0x7BFF, "f16 65504 = max finite");
+    assert_eq(tula_f64_to_f16(f64_from(65520)), 0x7C00, "f16 65520 (the overflow midpoint) -> inf");
+    assert_eq(tula_f16_to_f64(0x0001), 0x3E70000000000000, "f16 smallest subnormal = 2^-24, exactly");
+    assert_eq(tula_f64_to_f16(0x3E60000000000000), 0, "2^-25 (half the smallest subnormal) -> +0 (ties to even)");
+    assert_eq(tula_f64_to_f16(0x8000000000000000), 0x8000, "f16 keeps -0");
+    assert_eq(tula_f64_to_f16(0x7FF4000000000001), 0x7F00, "f16 sNaN -> quiet NaN, top payload kept");
+    return 0;
+}
+
+fn test_bf16_exhaustive() {
+    assert_eq(roundtrip16(1, 8, 7), 0, "bf16: all 65,536 codes round-trip (NaNs come back quiet)");
+    assert_eq(midpoints16(1, 8, 7), 0, "bf16: every neighbour midpoint rounds to even, +-1 ulp to the neighbours");
+    assert_eq(tula_f64_to_bf16(f64_from(1)), 0x3F80, "bf16 1.0 = 0x3F80");
+    # one rounding, not two (ADR 0005): x = 1 + 2^-8 + 2^-30
+    var x = 0x3FF0100004000000;
+    assert_eq(tula_f64_to_bf16(x), 0x3F81, "bf16 of 1 + 2^-8 + 2^-30 rounds up (direct from f64)");
+    var via = bits(f32_from(x));
+    var twice = ((via + 0x7FFF + ((via >> 16) & 1)) >> 16) & 0xFFFF;
+    assert_eq(twice, 0x3F80, "... where rounding through f32 first would give 0x3F80");
+    return 0;
+}
+
+fn test_bf16_vs_f32_rounding() {
+    # For inputs exact in f32, the classic RNE of f32 bits is the right answer.
+    var s = alloc(8);
+    store64(s, 0x1234567);
+    var bad = 0;
+    var tried = 0;
+    var k = 0;
+    while (k < 300000) {
+        var v = lcg(s) & 0xFFFFFFFF;
+        var e = (v >> 23) & 0xFF;
+        var m = v & 0x7FFFFF;
+        var nan = 0;
+        if (e == 0xFF) { if (m != 0) { nan = 1; } }
+        if (nan == 0) {
+            var want = ((v + 0x7FFF + ((v >> 16) & 1)) >> 16) & 0xFFFF;
+            if (tula_f64_to_bf16(tula_f32_to_f64(v)) != want) { bad = bad + 1; }
+            tried = tried + 1;
+        }
+        k = k + 1;
+    }
+    assert(tried > 290000, "bf16 oracle: ~300k random f32 inputs");
+    assert_eq(bad, 0, "bf16 == the +0x7FFF+lsb rounding of f32 bits, for every f32-exact input");
+    return 0;
+}
+
+fn test_f32_vs_hardware() {
+    var s = alloc(8);
+    store64(s, 0xC0FFEE);
+    var bad_n = 0;
+    var bad_w = 0;
+    var k = 0;
+    while (k < 300000) {
+        var r = lcg(s);
+        var x = r;
+        if ((k & 1) == 0) {
+            # biased toward f32's range: f64 exponent 1023 +- ~160 (subnormal..overflow)
+            var ex = 1023 - 160 + ((r >> 52) & 0x1FF) % 300;
+            x = (r & 0x800FFFFFFFFFFFFF) | (ex << 52);
+        }
+        if (tula_f64_to_f32(x) != bits(f32_from(x))) { bad_n = bad_n + 1; }
+        var h = lcg(s) & 0xFFFFFFFF;
+        if (tula_f32_to_f64(h) != bits(f32_to(h))) { bad_w = bad_w + 1; }
+        k = k + 1;
+    }
+    assert_eq(bad_n, 0, "f64 -> f32 == hardware on 300k inputs (half in f32's exponent range)");
+    assert_eq(bad_w, 0, "f32 -> f64 == hardware on 300k random f32 codes (subnormals, NaNs too)");
+    # specials
+    var sp = alloc(14 * 8);
+    store64(sp, 0); store64(sp + 8, 0x8000000000000000);
+    store64(sp + 16, 0x7FF0000000000000); store64(sp + 24, 0xFFF0000000000000);
+    store64(sp + 32, 0x7FF8000000000000); store64(sp + 40, 0x7FF4000000000001);
+    store64(sp + 48, 0xFFFFFFFFFFFFFFFF); store64(sp + 56, 0x0000000000000001);
+    store64(sp + 64, 0x36A0000000000000); store64(sp + 72, 0x3690000000000000);
+    store64(sp + 80, 0x3690000000000001); store64(sp + 88, 0x47EFFFFFE0000000);
+    store64(sp + 96, 0x47EFFFFFF0000000); store64(sp + 104, 0x380FFFFFF0000000);
+    var bad_s = 0;
+    var q = 0;
+    while (q < 14) {
+        var v = load64(sp + q * 8);
+        if (tula_f64_to_f32(v) != bits(f32_from(v))) { bad_s = bad_s + 1; }
+        q = q + 1;
+    }
+    assert_eq(bad_s, 0, "f32 specials == hardware (zeros, infs, NaNs, subnormal edges, overflow edge)");
+    return 0;
+}
+
+fn test_f32_midpoints() {
+    var s = alloc(8);
+    store64(s, 77);
+    var bad = 0;
+    var k = 0;
+    while (k < 100000) {
+        var h = lcg(s) & 0x7F7FFFFE;           # positive, finite, below the max
+        var a = tula_f32_to_f64(h);
+        var b = tula_f32_to_f64(h + 1);
+        var mid = bits(f64_div(f64_add(a, b), f64_from(2)));
+        var even = h;
+        if ((h & 1) == 1) { even = h + 1; }
+        if (tula_f64_to_f32(mid) != even) { bad = bad + 1; }
+        if (mid != 0) { if (tula_f64_to_f32(mid - 1) != h) { bad = bad + 1; } }
+        if (tula_f64_to_f32(mid + 1) != h + 1) { bad = bad + 1; }
+        k = k + 1;
+    }
+    assert_eq(bad, 0, "f32: 100k random neighbour midpoints round to even, +-1 ulp to the neighbours");
+    return 0;
+}
+
+fn test_arrays_and_layout() {
+    var n = 1000;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(src + i * 8, f64_div(f64_from(i * 37 - 18000), f64_from(97)));
+        i = i + 1;
+    }
+    var p32 = alloc(n * 4);
+    var p16 = alloc(n * 2);
+    var pb = alloc(n * 2);
+    assert_eq(tula_f32_pack(src, n, p32), n * 4, "f32 pack returns n*4");
+    assert_eq(tula_f16_pack(src, n, p16), n * 2, "f16 pack returns n*2");
+    assert_eq(tula_bf16_pack(src, n, pb), n * 2, "bf16 pack returns n*2");
+    var out = alloc(n * 8);
+    var bad = 0;
+    tula_f32_unpack(p32, n, out);
+    i = 0;
+    while (i < n) {
+        var rt = tula_f32_to_f64(tula_f64_to_f32(load64(src + i * 8)));
+        if (load64(out + i * 8) != rt) { bad = bad + 1; }
+        i = i + 1;
+    }
+    tula_f16_unpack(p16, n, out);
+    i = 0;
+    while (i < n) {
+        var rt = tula_f16_to_f64(tula_f64_to_f16(load64(src + i * 8)));
+        if (load64(out + i * 8) != rt) { bad = bad + 1; }
+        i = i + 1;
+    }
+    tula_bf16_unpack(pb, n, out);
+    i = 0;
+    while (i < n) {
+        var rt = tula_bf16_to_f64(tula_f64_to_bf16(load64(src + i * 8)));
+        if (load64(out + i * 8) != rt) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "pack + unpack == the scalar conversions, all three formats");
+    var one = alloc(8);
+    store64(one, f64_from(1));
+    var b2 = alloc(8);
+    tula_f16_pack(one, 1, b2);
+    assert(load8(b2) == 0x00 && load8(b2 + 1) == 0x3C, "f16 1.0 is stored little-endian: 00 3C");
+    tula_f32_pack(one, 1, b2);
+    assert(load8(b2 + 2) == 0x80 && load8(b2 + 3) == 0x3F, "f32 1.0 is stored little-endian: 00 00 80 3F");
+    return 0;
+}
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn test_dtype_sizes_and_strict() {
+    assert_eq(tula_packed_len(TULA_DT_F32, 10), 40, "f32: 4 bytes each");
+    assert_eq(tula_packed_len(TULA_DT_F16, 10), 20, "f16: 2 bytes each");
+    assert_eq(tula_packed_len(TULA_DT_BF16, 10), 20, "bf16: 2 bytes each");
+    assert_eq(tula_packed_len(7, 10), 0 - 1, "dtype 7 is still unknown");
+    var data = alloc(64);
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "a", TULA_DT_F32, shape1(10), 1, data, 40);
+    tula_builder_add_checked(b, "h", TULA_DT_F16, shape1(10), 1, data, 20);
+    tula_builder_add_checked(b, "g", TULA_DT_BF16, shape1(3), 1, data, 6);
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "f32 / f16 / bf16 tensors are strict-valid");
+    assert_eq(tula_entry_payload_ok(tula_find(buf, "h")), 1, "f16 [10] in 20 bytes passes payload_ok");
+    var b2 = tula_builder_new();
+    tula_builder_add(b2, "h", TULA_DT_F16, shape1(10), 1, data, 19);
+    var buf2 = tula_builder_finish(b2);
+    assert_eq(tula_entry_payload_ok(tula_find(buf2, "h")), 0, "f16 [10] in 19 bytes fails payload_ok");
+    var b3 = tula_builder_new();
+    tula_builder_add(b3, "h", TULA_DT_F16, shape1(10), 1, data, 22);
+    var buf3 = tula_builder_finish(b3);
+    assert_eq(tula_validate_strict(buf3, tula_total_len(buf3)), TULA_ERR_SHAPE, "f16 [10] in 22 bytes -> SHAPE");
+    return 0;
+}
+
+# The array pack/unpack take inline fast paths; they must give the scalar
+# conversions' bits on every input class. 16-bit formats: every code (unpack)
+# and every code's value, neighbour midpoints and +-1 ulp, at both signs (pack).
+fn array16_vs_scalar(which, ebits, mbits): i64 {
+    var bad = 0;
+    var codes = alloc(65536 * 2);
+    var h = 0;
+    while (h < 65536) { store16(codes + h * 2, h); h = h + 1; }
+    var wide = alloc(65536 * 8);
+    if (which == 0) { tula_f16_unpack(codes, 65536, wide); }
+    else            { tula_bf16_unpack(codes, 65536, wide); }
+    h = 0;
+    while (h < 65536) {
+        if (load64(wide + h * 8) != widen(h, which)) { bad = bad + 1; }
+        h = h + 1;
+    }
+    # pack inputs: each code's value, the midpoint to its successor and +-1 ulp
+    var n = 65536 * 4;
+    var src = alloc(n * 8);
+    var k = 0;
+    h = 0;
+    while (h < 65536) {
+        var a = widen(h, which);
+        var b = widen((h + 1) & 0xFFFF, which);
+        var mid = bits(f64_div(f64_add(a, b), f64_from(2)));
+        store64(src + k * 8, a); k = k + 1;
+        store64(src + k * 8, mid); k = k + 1;
+        store64(src + k * 8, mid - 1); k = k + 1;
+        store64(src + k * 8, mid + 1); k = k + 1;
+        h = h + 1;
+    }
+    var packed = alloc(n * 2);
+    if (which == 0) { tula_f16_pack(src, n, packed); }
+    else            { tula_bf16_pack(src, n, packed); }
+    k = 0;
+    while (k < n) {
+        if ((load16(packed + k * 2) & 0xFFFF) != narrow(load64(src + k * 8), which)) { bad = bad + 1; }
+        k = k + 1;
+    }
+    return bad;
+}
+
+fn test_array_fast_paths() {
+    assert_eq(array16_vs_scalar(0, 5, 10), 0,
+      "f16 pack/unpack arrays == scalar on every code + midpoint (fast paths exact)");
+    assert_eq(array16_vs_scalar(1, 8, 7), 0,
+      "bf16 pack/unpack arrays == scalar on every code + midpoint (fast paths exact)");
+    var s = alloc(8);
+    store64(s, 0xF00D);
+    var n = 300000;
+    var codes = alloc(n * 4);
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store32(codes + i * 4, lcg(s) & 0xFFFFFFFF);
+        var r = lcg(s);
+        if ((i % 3) == 0) {
+            var ex = 1023 - 160 + ((r >> 52) & 0x1FF) % 300;
+            r = (r & 0x800FFFFFFFFFFFFF) | (ex << 52);
+        }
+        if ((i % 3) == 1) {
+            r = tula_f32_to_f64(lcg(s) & 0xFFFFFFFF);   # exact in f32
+        }
+        store64(src + i * 8, r);
+        i = i + 1;
+    }
+    var wide = alloc(n * 8);
+    tula_f32_unpack(codes, n, wide);
+    var packed = alloc(n * 4);
+    tula_f32_pack(src, n, packed);
+    var bad = 0;
+    i = 0;
+    while (i < n) {
+        if (load64(wide + i * 8) != tula_f32_to_f64(load32(codes + i * 4))) { bad = bad + 1; }
+        if ((load32(packed + i * 4) & 0xFFFFFFFF) != tula_f64_to_f32(load64(src + i * 8))) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "f32 pack/unpack arrays == scalar on 300k codes and values (fast paths exact)");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_f16_exhaustive();
+    test_bf16_exhaustive();
+    test_bf16_vs_f32_rounding();
+    test_f32_vs_hardware();
+    test_f32_midpoints();
+    test_arrays_and_layout();
+    test_array_fast_paths();
+    test_dtype_sizes_and_strict();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

@@ -14,6 +14,11 @@
 #      dtype's packed length, no two names equal. Phase E feeds it a 40-tensor
 #      canonical file (past the 32-tensor pairwise threshold, so the heapsort
 #      duplicate check runs) with duplicate names injected.
+#   5. (1.3.0) long names never read out of bounds and never resolve wrongly:
+#      tula_entry_full_name runs on every entry of every accepted buffer (its
+#      result is scanned to the NUL under the guard page), and on a strict
+#      accept, tula_find_name(tula_entry_full_name(e)) must be e for every
+#      entry. Phase F mutates a canonical file holding a names table.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -33,6 +38,7 @@ enum FuzzCfg {
     FZ_SIGNED_ITERS = 3000;      # mutate a signed buffer + tula_verify (expensive)
     FZ_STRICT_ITERS = 300000;    # phase E: a 40-tensor canonical file, names duplicated
     FZ_STRICT_N     = 40;
+    FZ_LONG_ITERS   = 300000;    # phase F: a long-name file, mutations aimed at its table
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
     FZ_OUT_ELEMS    = 33024;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
@@ -141,7 +147,7 @@ fn consume(r, st, out, scl): i64 {
         var dt = tula_entry_dtype(e);
         var nd = tula_entry_ndim(e);
         var known = 0;
-        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_NF4) { known = 1; } }
+        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_BF16) { known = 1; } }
         if (known == 1) {
             if (nd > 0) {
                 if (tula_entry_payload_ok(e) == 1) {
@@ -161,6 +167,9 @@ fn consume(r, st, out, scl): i64 {
                         if (dt == TULA_DT_INT8)    { tula_int8_dequant(p, n, f64_from(1), out); }
                         if (dt == TULA_DT_TERNARY) { tula_ternary_unpack(p, n, out); }
                         if (dt == TULA_DT_NF4)     { tula_nf4_unpack(p, scl, n, TULA_NF4_BLOCK, out); }
+                        if (dt == TULA_DT_F32)     { tula_f32_unpack(p, n, out); }
+                        if (dt == TULA_DT_F16)     { tula_f16_unpack(p, n, out); }
+                        if (dt == TULA_DT_BF16)    { tula_bf16_unpack(p, n, out); }
                         done = done + 1;
                     }
                 }
@@ -198,6 +207,34 @@ fn mutate(s, scratch, len0): i64 {
     return 0;
 }
 
+# A canonical file with a names table: 6 long names (LoRA / MoE style) and 2 short.
+fn build_long_base(): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 2);
+    var data = alloc(8);
+    store8(data, 1);
+    store8(data + 1, 2);
+    var nm = alloc(96);
+    var pre = "base_model.model.model.layers.";
+    var i = 0;
+    while (i < 6) {
+        var k = 0;
+        while (load8(pre + k) != 0) { store8(nm + k, load8(pre + k)); k = k + 1; }
+        store8(nm + k, 48 + i);
+        var suf = ".self_attn.q_proj.lora_A.weight";
+        if ((i & 1) == 1) { suf = ".mlp.block_sparse_moe.experts.3.w2.weight"; }
+        var j = 0;
+        while (load8(suf + j) != 0) { store8(nm + k + 1 + j, load8(suf + j)); j = j + 1; }
+        store8(nm + k + 1 + j, 0);
+        tula_builder_add_long(b, nm, TULA_DT_INT8, shape, 1, data, 2);
+        i = i + 1;
+    }
+    tula_builder_add_long(b, "bias", TULA_DT_F16, shape, 1, data, 4);
+    tula_builder_add_long(b, "norm", TULA_DT_BF16, shape, 1, data, 4);
+    return tula_builder_finish(b);
+}
+
 # FZ_STRICT_N int8 [1] tensors "t00".."t39", through the checked add: canonical.
 fn build_strict_base(): i64 {
     var b = tula_builder_new();
@@ -232,6 +269,7 @@ fn strict_check(r, len, st): i64 {
     var i = 0;
     while (i < c) {
         var e = tula_entry(r, i);
+        if (tula_find_name(r, tula_entry_full_name(r, e)) != e) { ok = 0; }
         var n = tula_entry_nelems(e);
         if (n < 0) { ok = 0; }
         if (tula_entry_data_len(e) != tula_packed_len(tula_entry_dtype(e), n)) { ok = 0; }
@@ -268,8 +306,17 @@ fn check_opened(r, len): i64 {
             var b0 = load8(dptr);
             var b1 = load8(dptr + dlen - 1);
         }
+        # the full name, scanned to its NUL: under the guard page an over-read faults
+        var fname = tula_entry_full_name(r, e);
+        var fl = strlen(fname);
+        if (fname != e) {
+            if (fname < r) { ok = 0; }
+            if (fname + fl >= r + len) { ok = 0; }
+        }
         i = i + 1;
     }
+    var lhit = tula_find_name(r, "base_model.model.model.layers.3.mlp.block_sparse_moe.experts.3.w2.weight");
+    var has = tula_has_long_names(r);
     # exercise find() with a name that may or may not exist
     var hit = tula_find(r, "w.q");
     var sig = tula_is_signed(r);
@@ -395,6 +442,47 @@ fn main(): i64 {
         }
         store64(st + 0, load64(st + 0) + 1);
         ep = ep + 1;
+    }
+
+    # ---- phase F: a long-name file; mutations aimed at the names table ----
+    var bufl = build_long_base();
+    var llen = tula_total_len(bufl);
+    var lt = load64(bufl + 32) + load64(tula_entry(bufl, tula_count(bufl) - 1) + 128);   # table offset
+    var lf = 0;
+    while (lf < FZ_LONG_ITERS) {
+        memcpy_n(scratch, bufl, llen);
+        var nm2 = 1 + rng_below(s, 4);
+        var mk = 0;
+        while (mk < nm2) {
+            var where = rng_below(s, 4);
+            if (where == 0) { mutate(s, scratch, llen); }
+            if (where >= 1) {
+                # inside the table: a byte, or a record word set to an edge value
+                var tl = llen - lt;
+                if (rng_below(s, 2) == 0) {
+                    store8(scratch + lt + rng_below(s, tl), rng_below(s, 256));
+                } else {
+                    var wv = rng_below(s, 6);
+                    var val = rng_next(s);
+                    if (wv == 1) { val = 0 - 1; }
+                    if (wv == 2) { val = 0; }
+                    if (wv == 3) { val = tl; }
+                    if (wv == 4) { val = 0x7FFFFFFFFFFFFFFF; }
+                    if (wv == 5) { val = rng_below(s, 16); }
+                    store64(scratch + lt + 8 + rng_below(s, (tl - 8) / 8) * 8, val);
+                }
+            }
+            mk = mk + 1;
+        }
+        var rl = tula_open(place(guard, scratch, llen), llen);
+        if (rl != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(rl, llen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            store64(st + 48, load64(st + 48) + consume(rl, st, out, scl));
+            strict_check(rl, llen, st);
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        lf = lf + 1;
     }
 
     var t1 = now_ns();

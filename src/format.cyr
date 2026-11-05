@@ -33,6 +33,22 @@ enum TulaDType {
     TULA_DT_INT8    = 1;   # int8 activations / quantized
     TULA_DT_TERNARY = 2;   # packed {-1,0,+1} (tentib)
     TULA_DT_NF4     = 3;   # 4-bit blockwise NormalFloat (anukulana / QLoRA)
+    TULA_DT_F32     = 4;   # IEEE binary32, 4 bytes LE (1.3.0, ADR 0005)
+    TULA_DT_F16     = 5;   # IEEE binary16, 2 bytes LE (1.3.0, ADR 0005)
+    TULA_DT_BF16    = 6;   # bfloat16 (binary32's top half), 2 bytes LE (1.3.0, ADR 0005)
+}
+
+# The long-name table (1.3.0, ADR 0004): a reserved int8 tensor named
+# "__tula.names__", the last manifest entry, whose payload is the magic, a record
+# count L, L records {entry_index, name_off, name_len}, then the names (each
+# NUL-terminated). An entry with a long name stores its KEY in the 48-byte field:
+# the name's first TULA_NAMES_PREFIX bytes, '~', 16 lowercase hex digits of the
+# name's FNV-1a-64.
+enum TulaNames {
+    TULA_NAMES_MAGIC  = 0x316D6E2E616C7574;   # "tula.nm1", little-endian
+    TULA_NAMES_HDR    = 16;                   # magic + record count
+    TULA_NAMES_REC    = 24;                   # entry_index, name_off, name_len
+    TULA_NAMES_PREFIX = 30;                   # name bytes kept in its key
 }
 
 enum TulaSigStatus {
@@ -120,9 +136,9 @@ fn tula_name_write(dst, src): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.2.0 -> 10200).
+# Packed version int: major*10000 + minor*100 + patch (1.3.0 -> 10300).
 fn tula_version_int(): i64 {
-    return 10200;
+    return 10300;
 }
 
 # ---------------------------------------------------------------------------
@@ -130,13 +146,17 @@ fn tula_version_int(): i64 {
 # ---------------------------------------------------------------------------
 # Builder layout (private; only the +0 count and +8 payload_total words are
 # relied on outside this file, by the tests):
-#   +0  count            +8  payload_total (sum of 8-aligned data_len)
+#   +0  count            +8  payload_total (sum of 8-aligned data_len, without
+#                            the names table, which serialize appends)
 #   +16 cap              +24 name-index table ptr      +32 index mask
-#   +48 entries, TULA_BENTRY_SIZE each:
+#   +40 long names held  +48 their bytes, NULs included (1.3.0)
+#   +64 entries, TULA_BENTRY_SIZE each:
 #       [0, 144)  the tensor's manifest entry, ready to copy into the file —
-#                 name (truncated to 47, zero-padded), dtype, ndim, shape (unused
-#                 dims zero), data_off (the payload cursor at add time), data_len
+#                 name (truncated to 47, zero-padded) or, for a long name, its
+#                 key; dtype, ndim, shape (unused dims zero), data_off (the
+#                 payload cursor at add time), data_len
 #       +144      data ptr (borrowed until finish)
+#       +152      the full name's builder-owned copy (a long name only), +160 its length
 # The name and shape are COPIED at add time (1.2.0), so a caller can reuse one
 # name or shape buffer for every add; only the payload bytes stay borrowed.
 #
@@ -146,8 +166,52 @@ fn tula_version_int(): i64 {
 # side never hashes untrusted names (tula_validate_strict sorts them instead).
 
 enum TulaBuilderLayout {
-    TULA_BHDR_SIZE   = 48;
-    TULA_BENTRY_SIZE = 152;
+    TULA_BHDR_SIZE   = 64;
+    TULA_BENTRY_SIZE = 168;
+}
+
+# FNV-1a-64 over the bytes a[0..alen) then b[0..blen) (ADR 0004's key hash).
+fn _tula_fnv2(a, alen, b, blen): i64 {
+    var h = 0xCBF29CE484222325;
+    var i = 0;
+    while (i < alen) {
+        h = (h ^ load8(a + i)) * 0x100000001B3;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < blen) {
+        h = (h ^ load8(b + i)) * 0x100000001B3;
+        i = i + 1;
+    }
+    return h;
+}
+
+# Write into the 48-byte field `dst` the key of the full name a ‖ b, which must
+# be longer than 47 bytes (ADR 0004): its first TULA_NAMES_PREFIX bytes, '~',
+# 16 lowercase hex digits of its FNV-1a-64, NUL. Returns dst.
+fn _tula_key2(dst, a, alen, b, blen): i64 {
+    var k = 0;
+    while (k < TULA_NAMES_PREFIX) {
+        if (k < alen) { store8(dst + k, load8(a + k)); }
+        else          { store8(dst + k, load8(b + k - alen)); }
+        k = k + 1;
+    }
+    store8(dst + TULA_NAMES_PREFIX, 126);   # '~'
+    var h = _tula_fnv2(a, alen, b, blen);
+    var d = 0;
+    while (d < 16) {
+        var nib = (h >> (60 - d * 4)) & 0xF;
+        if (nib < 10) { store8(dst + TULA_NAMES_PREFIX + 1 + d, 48 + nib); }
+        else          { store8(dst + TULA_NAMES_PREFIX + 1 + d, 87 + nib); }
+        d = d + 1;
+    }
+    store8(dst + TULA_NAME_MAX, 0);
+    return dst;
+}
+
+# Bytes in the names table holding `nl` long names of `nb` bytes (NULs included).
+fn _tula_names_size(nl, nb): i64 {
+    return TULA_NAMES_HDR + nl * TULA_NAMES_REC + nb;
 }
 
 # Allocate an empty builder (room for TULA_BUILDER_MAX tensors). 0 if the
@@ -175,7 +239,9 @@ fn tula_builder_new_cap(max): i64 {
     store64(b + 16, max);        # cap
     store64(b + 24, tab);        # name index
     store64(b + 32, slots - 1);  # index mask
-    store64(b + 40, 0);
+    store64(b + 40, 0);          # long names held
+    store64(b + 48, 0);          # their bytes
+    store64(b + 56, 0);
     return b;
 }
 
@@ -220,30 +286,77 @@ fn _tula_bidx_slot(b, k): i64 {
     return 0;
 }
 
-# The shared add. `checked` = 1 also refuses a name over 47 chars and a name the
-# builder already holds. On any error the builder is unchanged.
-fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, checked): i64 {
+# The shared add. `mode` 0 = plain, 1 = checked (also refuses a name over 47
+# chars and a name the builder already holds), 2 = long (as checked, but a name
+# over 47 chars goes to the names table under its key). On any error the
+# builder is unchanged.
+fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, mode): i64 {
     var c = load64(b);
     if (c >= load64(b + 16))   { return TULA_ERR_TOO_MANY; }
     if (ndim < 0)              { return TULA_ERR_NDIM; }
     if (ndim > TULA_MAXDIM)    { return TULA_ERR_NDIM; }
     if (data_len < 0)          { return TULA_ERR_BOUNDS; }
-    # data_len <= cap first, so the sum below cannot overflow.
+    # data_len <= cap first, so the sums below cannot overflow.
     if (data_len > TULA_READ_MAX_BYTES) { return TULA_ERR_TOO_BIG; }
+    var nlen = 0;
+    if (mode >= 1) { nlen = strlen(name); }
+    if (nlen > TULA_READ_MAX_BYTES) { return TULA_ERR_TOO_BIG; }
+    if (mode == 1) {
+        if (nlen > TULA_NAME_MAX) { return TULA_ERR_NAME_LONG; }
+    }
+    var is_long = 0;
+    if (mode == 2) {
+        if (nlen > TULA_NAME_MAX) { is_long = 1; }
+    }
+    var nl = load64(b + 40);
+    var nb = load64(b + 48);
+    # With long names the file gets one more tensor, the names table, after
+    # every other: it needs a manifest slot and room under the size cap.
+    var tbl = 0;
+    if (nl + is_long > 0) {
+        if (c + 1 >= TULA_READ_MAX_TENSORS) { return TULA_ERR_TOO_MANY; }
+        tbl = _tula_names_size(nl + is_long, nb);
+        if (is_long == 1) { tbl = tbl + nlen + 1; }
+    }
     var cur = load64(b + 8);
     var grown = cur + tula_align8(data_len);
-    if (grown > TULA_READ_MAX_BYTES)    { return TULA_ERR_TOO_BIG; }
-    if (checked == 1) {
-        if (strlen(name) > TULA_NAME_MAX) { return TULA_ERR_NAME_LONG; }
-    }
+    if (grown + tula_align8(tbl) > TULA_READ_MAX_BYTES) { return TULA_ERR_TOO_BIG; }
     # Stage the entry in slot c (not yet counted), then look its name up.
     var m = _tula_bentry(b, c);
-    tula_name_write(m, name);
+    if (is_long == 1) { _tula_key2(m, name, nlen, "", 0); }
+    else              { tula_name_write(m, name); }
+    if (mode >= 1) {
+        # The table's own name: refused by the long add always, and by the
+        # checked add once a long name is held (the table will take it). The
+        # first-byte test keeps the string compare off the common path.
+        if (load8(m) == 95) {
+            if (streq(m, "__tula.names__")) {
+                if (mode == 2) { return TULA_ERR_DUP_NAME; }
+                if (nl > 0)    { return TULA_ERR_DUP_NAME; }
+            }
+        }
+    }
+    if (is_long == 1) {
+        if (nl == 0) {
+            # The first long name needs the table's name free.
+            var rk[48];
+            tula_name_write(&rk, "__tula.names__");
+            var rs = _tula_bidx_slot(b, &rk);
+            if (load64(load64(b + 24) + rs * 8) != 0) { return TULA_ERR_DUP_NAME; }
+        }
+    }
     var s = _tula_bidx_slot(b, m);
     var tab = load64(b + 24);
     var seen = load64(tab + s * 8);
-    if (checked == 1) {
+    if (mode >= 1) {
         if (seen != 0) { return TULA_ERR_DUP_NAME; }
+    }
+    var fp = 0;
+    if (is_long == 1) {
+        fp = alloc(nlen + 1);
+        if (fp == 0) { return TULA_ERR_OOM; }
+        _tula_copy(fp, name, nlen);
+        store8(fp + nlen, 0);
     }
     store64(m + 48, dtype);
     store64(m + 56, ndim);
@@ -256,6 +369,14 @@ fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, checked): i64 
     store64(m + 128, cur);        # data_off
     store64(m + 136, data_len);
     store64(m + 144, data);
+    store64(m + 152, fp);
+    if (is_long == 1) {
+        store64(m + 160, nlen);
+        store64(b + 40, nl + 1);
+        store64(b + 48, nb + nlen + 1);
+    } else {
+        store64(m + 160, 0);
+    }
     if (seen == 0) { store64(tab + s * 8, c + 1); }
     store64(b, c + 1);
     store64(b + 8, grown);
@@ -285,18 +406,45 @@ fn tula_builder_add_checked(b, name, dtype, shape, ndim, data, data_len): i64 {
     return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 1);
 }
 
+# Append a tensor whose name may be any length (1.3.0, ADR 0004). A name of 47
+# chars or fewer is added exactly as tula_builder_add_checked adds it. A longer
+# name is stored whole in the file's names table — the reserved
+# "__tula.names__" tensor, which finish appends after every other tensor — and
+# its entry holds the name's 47-byte key. Read it back with tula_find_name /
+# tula_entry_full_name. Errors (builder unchanged): every
+# tula_builder_add_checked error except TULA_ERR_NAME_LONG, and
+#   TULA_ERR_DUP_NAME — the stored name (or key) is already held; the name is
+#                       "__tula.names__"; or this is the first long name and
+#                       the builder already holds a tensor of that name;
+#   TULA_ERR_OOM      — the long name's copy could not be allocated.
+# Two different long names refuse each other only if they share their first 30
+# bytes AND their 64-bit hash: loud, never a silent collision.
+fn tula_builder_add_long(b, name, dtype, shape, ndim, data, data_len): i64 {
+    return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 2);
+}
+
 # Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
 # unsigned file, or 64 to reserve an appended Ed25519 signature block (filled by
 # src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr,
 # or 0 if the allocation fails. Every byte is written — the alignment padding
 # after each tensor and the reserved signature block are zeroed — so the output
 # is a pure function of the builder's inputs, whatever the allocator hands back.
+# A builder holding long names (tula_builder_add_long) gets the names table
+# appended as the last tensor (ADR 0004).
 fn tula_serialize(b, sig_len): i64 {
     var count = load64(b);
+    var nl = load64(b + 40);
+    var tsize = 0;
+    var count_out = count;
+    if (nl > 0) {
+        tsize = _tula_names_size(nl, load64(b + 48));
+        count_out = count + 1;
+    }
     var manifest_off = TULA_HEADER_SIZE;
-    var manifest_len = count * TULA_ENTRY_SIZE;
+    var manifest_len = count_out * TULA_ENTRY_SIZE;
     var payload_off = manifest_off + manifest_len;
-    var payload_len = load64(b + 8);
+    var payload_user = load64(b + 8);
+    var payload_len = payload_user + tula_align8(tsize);
     var content_len = payload_off + payload_len;
     var sig_off = 0;
     if (sig_len > 0) { sig_off = content_len; }
@@ -306,7 +454,7 @@ fn tula_serialize(b, sig_len): i64 {
 
     store64(buf + 0, TULA_MAGIC);
     store64(buf + 8, TULA_VERSION);
-    store64(buf + 16, count);
+    store64(buf + 16, count_out);
     store64(buf + 24, manifest_off);
     store64(buf + 32, payload_off);
     store64(buf + 40, payload_len);
@@ -325,8 +473,49 @@ fn tula_serialize(b, sig_len): i64 {
         _tula_zero(dst + dlen, padded - dlen);   # 0..7 padding bytes
         i = i + 1;
     }
+    if (nl > 0) {
+        var te = buf + manifest_off + count * TULA_ENTRY_SIZE;   # the table's entry: last
+        _tula_write_names(b, te, buf + payload_off, payload_user, tsize);
+    }
     if (sig_len > 0) { _tula_zero(buf + sig_off, sig_len); }
     return buf;
+}
+
+# The names table (ADR 0004): its manifest entry `e` (the last) and its payload
+# at payload + off, tsize bytes, from the builder's long names in entry order.
+fn _tula_write_names(b, e, payload, off, tsize): i64 {
+    _tula_zero(e, TULA_ENTRY_SIZE);
+    tula_name_write(e, "__tula.names__");
+    store64(e + 48, TULA_DT_INT8);
+    store64(e + 56, 1);
+    store64(e + 64, tsize);
+    store64(e + 128, off);
+    store64(e + 136, tsize);
+    var t = payload + off;
+    var nl = load64(b + 40);
+    store64(t, TULA_NAMES_MAGIC);
+    store64(t + 8, nl);
+    var rec = t + TULA_NAMES_HDR;
+    var noff = TULA_NAMES_HDR + nl * TULA_NAMES_REC;
+    var count = load64(b);
+    var i = 0;
+    while (i < count) {
+        var m = _tula_bentry(b, i);
+        var fp = load64(m + 152);
+        if (fp != 0) {
+            var len = load64(m + 160);
+            store64(rec, i);
+            store64(rec + 8, noff);
+            store64(rec + 16, len);
+            _tula_copy(t + noff, fp, len);
+            store8(t + noff + len, 0);
+            noff = noff + len + 1;
+            rec = rec + TULA_NAMES_REC;
+        }
+        i = i + 1;
+    }
+    _tula_zero(t + tsize, tula_align8(tsize) - tsize);
+    return 0;
 }
 
 # Serialize an UNSIGNED buffer. (Signed variant: tula_builder_finish_signed in

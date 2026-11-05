@@ -66,6 +66,14 @@ same bytes make a small file decode into a lot of work, and strict rejects that.
 Its duplicate check sorts names (worst case O(n log n)) rather than hashing them,
 so crafted names can't make it quadratic.
 
+**The names table (1.3.0) is read as untrusted too.** It is recognized only by
+its name, dtype, magic and a record count that fits its bytes. Each record is
+bounds-checked when `tula_entry_full_name` reads it; one that doesn't hold up is
+treated as absent, and the in-place key comes back. Nothing reads outside the
+buffer, and the guard-page fuzzer (`make fuzz`, phase F) mutates the table
+directly. `tula_validate_strict` also requires the table to be canonical, with
+every key matching its name.
+
 ## Caller responsibilities
 
 - **Before unpacking a foreign quantized tensor**, call `tula_entry_payload_ok(e)`
@@ -91,13 +99,16 @@ so crafted names can't make it quadratic.
   file as it is now: a process that truncates or rewrites it after validation
   can change validated bytes, or make a later read SIGBUS. Use `tula_read_file`
   (a private copy) for files in a location others can write.
-- **Write through `tula_builder_add_checked`** (1.2.0). The plain add truncates
-  names over 47 characters (frozen v1 behaviour), so two distinct long names can
-  become the same stored name. The LoRA pair `…q_proj.lora_A.weight` /
+- **Write through `tula_builder_add_long`** (1.3.0) or
+  `tula_builder_add_checked` (1.2.0). The plain add truncates names over 47
+  characters (frozen v1 behaviour), so two distinct long names can become the
+  same stored name. The LoRA pair `…q_proj.lora_A.weight` /
   `…q_proj.lora_B.weight` under a `base_model.model.model.layers.N.self_attn.`
-  prefix does, and `tula_find` returns the first match. The checked add refuses
-  the long name (`TULA_ERR_NAME_LONG`) and any repeat (`TULA_ERR_DUP_NAME`).
-  Names that long need the 1.3.0 long-name extension.
+  prefix does, and `tula_find` returns the first match. `add_long` stores long
+  names whole in the names table (ADR 0004) and refuses repeats;
+  `add_checked` refuses long names outright. **Look up by `tula_find_name`**,
+  which verifies the full name, so a key collision can't hand back the wrong
+  tensor.
 - **Manage your own keys.** Use a trustworthy source for `sk`/`pk`.
 
 ## Reporting a vulnerability

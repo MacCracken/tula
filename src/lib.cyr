@@ -44,12 +44,14 @@ include "lib/sigil.cyr"
 # tula domain modules — flat, dependency order.
 # error.cyr is dep-free; format.cyr (header + manifest + builder + reader)
 # builds on it; sign.cyr adds Ed25519 sign/verify over sigil + format;
-# fileio.cyr and dtype.cyr build on format; check.cyr (the strict validator +
-# scale lookup) builds on format and dtype.
+# fileio.cyr and dtype.cyr build on format; names.cyr (1.3.0: the long-name
+# table's reader) builds on format; check.cyr (the strict validator + scale
+# lookup) builds on format, dtype and names.
 # ================================================================
 include "src/error.cyr"
 include "src/format.cyr"
 include "src/sign.cyr"
 include "src/fileio.cyr"
 include "src/dtype.cyr"
+include "src/names.cyr"
 include "src/check.cyr"

@@ -63,6 +63,25 @@ case O(n log n) for any names, about 9 ns per comparison. Up to 512 tensors the
 records live on the stack; beyond that in a private mapping, unmapped afterwards.
 Measured on a 1,000-tensor file (realistic `model.layers.*` names, mapping path): **316 µs**.
 
+### Added in 1.3.0
+
+| Op | 1.3.0 | Notes |
+|---|---:|---|
+| `tula_f32_pack` (2²⁰) | 9.5 ms · 109 Melem/s | f64 → binary32, integer RNE |
+| `tula_f32_unpack` (2²⁰) | 7.6 ms · 137 Melem/s | exact widening |
+| `tula_f16_pack` / `tula_bf16_pack` (2²⁰) | 10.3–10.5 ms · 99–102 Melem/s | |
+| `tula_f16_unpack` / `tula_bf16_unpack` (2²⁰) | 7.6 ms · 138 Melem/s | |
+| `tula_builder_add_long` | 640–720 ns | per add of a 60-char LoRA name (key + copy) |
+| `tula_find_name`, 256 long names | 2.1 µs | key hash + scan + table binary search + full-name check |
+| `tula_builder_add_checked` | 213 ns | was 192 in 1.2.0: the long-name bookkeeping |
+
+The array conversions take an inline fast path for normal numbers. A normal f64
+whose result is a normal narrow value below the top exponent has its fraction
+rounded and added to the exponent field, so a carry bumps the exponent the way
+IEEE rounding does. Everything else goes through the general conversion. That's
+about 2.2× the per-element scalar calls (46 → 102 Melem/s pack, 68 → 138 unpack)
+and bit-identical (tested on every 16-bit code and midpoint, and 300k F32 cases).
+
 Earlier result (1.0.0, cyrius 6.3.27, tmpfs `/tmp`, ms resolution): write 34 ms,
 read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O only.
 

@@ -334,6 +334,9 @@ fn tula_packed_len(dtype, nelems): i64 {
     if (dtype == TULA_DT_INT8)    { return nelems; }
     if (dtype == TULA_DT_TERNARY) { return tula_ternary_bytes(nelems); }
     if (dtype == TULA_DT_NF4)     { return tula_nf4_bytes(nelems); }
+    if (dtype == TULA_DT_F32)     { return nelems * 4; }   # 1.3.0
+    if (dtype == TULA_DT_F16)     { return nelems * 2; }   # 1.3.0
+    if (dtype == TULA_DT_BF16)    { return nelems * 2; }   # 1.3.0
     return 0 - 1;
 }
 
@@ -386,3 +389,180 @@ fn tula_entry_nelems(e): i64 {
     }
     return n;
 }
+
+# ---------------------------------------------------------------------------
+# F32 / F16 / BF16 (1.3.0, ADR 0005) — IEEE 754 conversions to and from f64,
+# in integer arithmetic so a file's bytes never depend on the process's
+# floating-point mode (a flush-to-zero setting would change hardware results).
+#
+#   f64 -> narrow: round to nearest, ties to even, straight from the f64 (BF16
+#   and F16 are NOT rounded through F32: two roundings can disagree with one);
+#   overflow -> +-inf; underflow -> the correctly rounded subnormal or +-0, no
+#   flush; the sign of zero kept; NaN -> NaN with its sign and top payload bits,
+#   quiet bit set (what x86 cvtsd2ss / aarch64 fcvt give in the default mode).
+#   narrow -> f64: exact for every number; a NaN keeps its sign and payload and
+#   comes back quiet (IEEE: a conversion never returns a signaling NaN).
+#
+# A narrow format has E exponent bits and M mantissa bits: F32 (8, 23),
+# F16 (5, 10), BF16 (8, 7). Values travel as their bit patterns in an i64.
+# ---------------------------------------------------------------------------
+
+# v >> s rounded to nearest, ties to even, for 0 <= v < 2^53 and s >= 1.
+fn _tula_rne_shift(v, s): i64 {
+    if (s >= 64) { return 0; }
+    var q = v >> s;
+    var rem = v & ((1 << s) - 1);
+    var half = 1 << (s - 1);
+    if (rem > half) { return q + 1; }
+    if (rem == half) { return q + (q & 1); }
+    return q;
+}
+
+# f64 bits -> the (E, M) format's bits.
+fn _tula_f64_narrow(x, ebits, mbits): i64 {
+    var sign = ((x >> 63) & 1) << (ebits + mbits);
+    var ex = (x >> 52) & 0x7FF;
+    var mant = x & 0xFFFFFFFFFFFFF;
+    var emax = (1 << ebits) - 1;               # the all-ones exponent: inf / NaN
+    var inf = sign | (emax << mbits);
+    if (ex == 0x7FF) {
+        if (mant == 0) { return inf; }
+        var pay = (mant >> (52 - mbits)) | (1 << (mbits - 1));   # top payload bits, quiet
+        return inf | (pay & ((1 << mbits) - 1));
+    }
+    # f64 zero and f64 subnormals (< 2^-1022) are far below every narrow format's
+    # smallest subnormal: they round to a signed zero.
+    if (ex == 0) { return sign; }
+    var bias = (1 << (ebits - 1)) - 1;
+    var e = ex - 1023 + bias;                  # the narrow biased exponent
+    var full = mant | (1 << 52);               # 53-bit significand
+    if (e >= 1) {
+        var r = _tula_rne_shift(full, 52 - mbits);
+        if ((r >> (mbits + 1)) != 0) {         # rounding carried into a new bit
+            r = r >> 1;
+            e = e + 1;
+        }
+        if (e >= emax) { return inf; }
+        return sign | (e << mbits) | (r & ((1 << mbits) - 1));
+    }
+    # Subnormal in the narrow format: units of 2^(1 - bias - mbits). A result that
+    # rounds up to 1 << mbits is exactly the smallest normal, encoded as is.
+    return sign | _tula_rne_shift(full, (52 - mbits) + (1 - e));
+}
+
+# The (E, M) format's bits -> f64 bits, exactly.
+fn _tula_narrow_widen(h, ebits, mbits): i64 {
+    var sign = ((h >> (ebits + mbits)) & 1) << 63;
+    var e = (h >> mbits) & ((1 << ebits) - 1);
+    var m = h & ((1 << mbits) - 1);
+    var bias = (1 << (ebits - 1)) - 1;
+    if (e == (1 << ebits) - 1) {
+        if (m == 0) { return sign | (0x7FF << 52); }                    # inf
+        return sign | (0x7FF << 52) | (m << (52 - mbits)) | (1 << 51);  # NaN: payload kept, quiet
+    }
+    if (e == 0) {
+        if (m == 0) { return sign; }
+        # Subnormal: m * 2^(1 - bias - mbits). Normalize on its top set bit p.
+        var p = mbits - 1;
+        while (((m >> p) & 1) == 0) { p = p - 1; }
+        var ex = (1 - bias - mbits) + p + 1023;
+        var frac = (m << (52 - p)) & 0xFFFFFFFFFFFFF;
+        return sign | (ex << 52) | frac;
+    }
+    return sign | ((e - bias + 1023) << 52) | (m << (52 - mbits));
+}
+
+# f64 bits -> binary32 bits (low 32 bits of the result).
+fn tula_f64_to_f32(x): i64  { return _tula_f64_narrow(x, 8, 23); }
+# binary32 bits (low 32 bits used) -> f64 bits.
+fn tula_f32_to_f64(h): i64  { return _tula_narrow_widen(h & 0xFFFFFFFF, 8, 23); }
+# f64 bits -> binary16 bits (low 16 bits of the result).
+fn tula_f64_to_f16(x): i64  { return _tula_f64_narrow(x, 5, 10); }
+# binary16 bits (low 16 bits used) -> f64 bits.
+fn tula_f16_to_f64(h): i64  { return _tula_narrow_widen(h & 0xFFFF, 5, 10); }
+# f64 bits -> bfloat16 bits (low 16 bits of the result).
+fn tula_f64_to_bf16(x): i64 { return _tula_f64_narrow(x, 8, 7); }
+# bfloat16 bits (low 16 bits used) -> f64 bits.
+fn tula_bf16_to_f64(h): i64 { return _tula_narrow_widen(h & 0xFFFF, 8, 7); }
+
+# Narrow f64[n] `src` into the (E, M) format at `dst`, `width` bytes each. The
+# common case — a normal f64 whose result is a normal narrow value below the top
+# exponent — is rounded inline: round the 52-bit fraction to M bits (nearest,
+# ties to even) and ADD it to the exponent field, so a carry out of the fraction
+# bumps the exponent, as IEEE rounding does. Below the top exponent that carry
+# can't reach inf. Everything else — zeros, subnormals, the top exponent, inf,
+# NaN — takes _tula_f64_narrow. Same bits either way (tests/tcyr/floats.tcyr).
+fn _tula_narrow_array(src, n, dst, ebits, mbits, width): i64 {
+    var bias = (1 << (ebits - 1)) - 1;
+    var emax = (1 << ebits) - 1;
+    var shift = 52 - mbits;
+    var rmask = (1 << shift) - 1;
+    var half = 1 << (shift - 1);
+    var i = 0;
+    while (i < n) {
+        var x = load64(src + i * 8);
+        var en = ((x >> 52) & 0x7FF) - 1023 + bias;
+        var h = 0;
+        if (en >= 1) {
+            if (en < emax - 1) {
+                var frac = x & 0xFFFFFFFFFFFFF;
+                var q = frac >> shift;
+                var rem = frac & rmask;
+                if (rem > half) { q = q + 1; }
+                if (rem == half) { q = q + (q & 1); }
+                h = (((x >> 63) & 1) << (ebits + mbits)) | ((en << mbits) + q);
+            } else {
+                h = _tula_f64_narrow(x, ebits, mbits);
+            }
+        } else {
+            h = _tula_f64_narrow(x, ebits, mbits);
+        }
+        if (width == 4) { store32(dst + i * 4, h); }
+        else            { store16(dst + i * 2, h); }
+        i = i + 1;
+    }
+    return n * width;
+}
+
+# Widen n values of the (E, M) format at `src` (`width` bytes each) into f64[n]
+# `dst`. A normal value is rebuilt inline (sign, rebiased exponent, shifted
+# mantissa); zeros, subnormals, inf and NaN take _tula_narrow_widen.
+fn _tula_widen_array(src, n, dst, ebits, mbits, width): i64 {
+    var rebias = 1023 - ((1 << (ebits - 1)) - 1);
+    var emax = (1 << ebits) - 1;
+    var mmask = (1 << mbits) - 1;
+    var top = ebits + mbits;
+    var i = 0;
+    while (i < n) {
+        var h = 0;
+        if (width == 4) { h = load32(src + i * 4) & 0xFFFFFFFF; }
+        else            { h = load16(src + i * 2) & 0xFFFF; }
+        var e = (h >> mbits) & emax;
+        var v = 0;
+        if (e != 0) {
+            if (e != emax) {
+                v = (((h >> top) & 1) << 63) | ((e + rebias) << 52) | ((h & mmask) << (52 - mbits));
+            } else {
+                v = _tula_narrow_widen(h, ebits, mbits);
+            }
+        } else {
+            v = _tula_narrow_widen(h, ebits, mbits);
+        }
+        store64(dst + i * 8, v);
+        i = i + 1;
+    }
+    return n;
+}
+
+# Pack f64[n] `src` as binary32 into `dst` (4 bytes each, LE). Returns n * 4.
+fn tula_f32_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 8, 23, 4); }
+# Unpack n binary32 values from `src` into f64[n] `dst`. Returns n.
+fn tula_f32_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 8, 23, 4); }
+# Pack f64[n] `src` as binary16 into `dst` (2 bytes each, LE). Returns n * 2.
+fn tula_f16_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 5, 10, 2); }
+# Unpack n binary16 values from `src` into f64[n] `dst`. Returns n.
+fn tula_f16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 5, 10, 2); }
+# Pack f64[n] `src` as bfloat16 into `dst` (2 bytes each, LE). Returns n * 2.
+fn tula_bf16_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 8, 7, 2); }
+# Unpack n bfloat16 values from `src` into f64[n] `dst`. Returns n.
+fn tula_bf16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 8, 7, 2); }

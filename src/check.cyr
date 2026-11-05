@@ -195,8 +195,13 @@ fn _tula_strict_unique(buf, count): i64 {
 #   TULA_ERR_SHAPE    — a negative dim, a non-zero dim past ndim, an element
 #                       count over the cap, or data_len != the dtype's packed
 #                       length for the shape (a 0-dim entry holds one element);
-#   TULA_ERR_DUP_NAME — two tensors share a name;
-#   TULA_ERR_OOM      — no memory for the duplicate check (> 32 tensors).
+#   TULA_ERR_NAMES    — (1.3.0) a names table is present but not canonical:
+#                       records out of order or pointing at the table itself,
+#                       names not packed in record order, a name of 47 bytes or
+#                       fewer, a NUL inside a name, or an entry whose field is
+#                       not its full name's key (ADR 0004);
+#   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
+#   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To
 # read a file strictly: r = tula_read_file(path) (or tula_open_mmap), then
 # tula_validate_strict(r, tula_total_len(r)).
@@ -217,34 +222,65 @@ fn tula_validate_strict(buf, len): i64 {
         i = i + 1;
     }
     if (cursor != payload_len) { return TULA_ERR_LAYOUT; }
+    rc = _tula_strict_names(buf, count);
+    if (rc != TULA_OK) { return rc; }
     return _tula_strict_unique(buf, count);
+}
+
+# The names table, if present, is exactly what tula_builder_add_long + finish
+# write (ADR 0004): records in strictly increasing entry order, none at or past
+# the table itself; names packed in record order straight after the records,
+# each over 47 bytes, NUL-free, NUL-terminated, ending at the table's end; and
+# each referenced entry's field equal to the key of its name.
+fn _tula_strict_names(buf, count): i64 {
+    var te = _tula_names_entry(buf);
+    if (te == 0) { return TULA_OK; }
+    var t = tula_entry_data(buf, te);
+    var dlen = tula_entry_data_len(te);
+    var nl = load64(t + 8);
+    var noff = TULA_NAMES_HDR + nl * TULA_NAMES_REC;   # <= dlen: _tula_names_entry checked nl
+    var prev = 0 - 1;
+    var q = 0;
+    while (q < nl) {
+        var rec = t + TULA_NAMES_HDR + q * TULA_NAMES_REC;
+        var ei = load64(rec);
+        var off = load64(rec + 8);
+        var len = load64(rec + 16);
+        if (ei <= prev) { return TULA_ERR_NAMES; }
+        if (ei >= count - 1) { return TULA_ERR_NAMES; }
+        if (off != noff) { return TULA_ERR_NAMES; }
+        if (off > dlen) { return TULA_ERR_NAMES; }
+        if (len <= TULA_NAME_MAX) { return TULA_ERR_NAMES; }
+        if (len >= dlen - off) { return TULA_ERR_NAMES; }
+        var k = 0;
+        while (k < len) {
+            if (load8(t + off + k) == 0) { return TULA_ERR_NAMES; }
+            k = k + 1;
+        }
+        if (load8(t + off + len) != 0) { return TULA_ERR_NAMES; }
+        var key[48];
+        _tula_key2(&key, t + off, len, "", 0);
+        if (_tula_name_eq(_tula_ent(buf, ei), &key) == 0) { return TULA_ERR_NAMES; }
+        noff = off + len + 1;
+        prev = ei;
+        q = q + 1;
+    }
+    if (noff != dlen) { return TULA_ERR_NAMES; }
+    return TULA_OK;
 }
 
 # The "<name>.scale" sidecar of entry `e` (ADR 0002), checked for an unpack that
 # will read `need` scales: it must exist, be f64, pass tula_entry_payload_ok, and
 # hold at least `need` elements in at least need * 8 bytes. Returns the sidecar's
 # entry, or 0. `need` is what the caller's unpack reads: 1 for a per-tensor
-# scale, the row count for per-row, tula_nf4_blocks(n, block) for NF4. A name
-# over 41 chars returns 0: "<name>.scale" would not fit untruncated in 47.
+# scale, the row count for per-row, tula_nf4_blocks(n, block) for NF4.
+# "<name>" is the entry's FULL name (1.3.0): a sidecar name over 47 chars is
+# looked up through the names table (ADR 0004). A file without long names has
+# no such sidecar, so there — as in 1.2.0 — a name over 41 chars returns 0.
 fn tula_find_scale(r, e, need): i64 {
     if (need < 1) { return 0; }
-    var name = tula_entry_name(e);
-    var nlen = strlen(name);
-    if (nlen + 6 > TULA_NAME_MAX) { return 0; }
-    var key[48];
-    var k = 0;
-    while (k < nlen) {
-        store8(&key + k, load8(name + k));
-        k = k + 1;
-    }
-    var suf = ".scale";
-    var j = 0;
-    while (j < 6) {
-        store8(&key + nlen + j, load8(suf + j));
-        j = j + 1;
-    }
-    store8(&key + nlen + 6, 0);
-    var s = tula_find(r, &key);
+    var name = tula_entry_full_name(r, e);
+    var s = _tula_find_name2(r, name, strlen(name), ".scale", 6);
     if (s == 0) { return 0; }
     if (tula_entry_dtype(s) != TULA_DT_F64) { return 0; }
     if (tula_entry_payload_ok(s) != 1) { return 0; }

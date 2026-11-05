@@ -22,6 +22,7 @@ enum TulaErrCode {
     TULA_ERR_LAYOUT    = 14;   # payload or name bytes not in canonical layout (strict) (1.2.0)
     TULA_ERR_SHAPE     = 15;   # shape inconsistent with dtype + data_len (strict) (1.2.0)
     TULA_ERR_DTYPE     = 16;   # dtype unknown to this tula (strict) (1.2.0)
+    TULA_ERR_NAMES     = 17;   # the long-name table is malformed (strict) (1.3.0)
     TULA_ERR_OTHER     = 99;   # catch-all
 }
 
@@ -44,6 +45,7 @@ fn tula_err_name(code): i64 {
     if (code == TULA_ERR_LAYOUT)    { return "payload or name bytes not in canonical layout"; }
     if (code == TULA_ERR_SHAPE)     { return "shape inconsistent with dtype and data_len"; }
     if (code == TULA_ERR_DTYPE)     { return "unknown dtype"; }
+    if (code == TULA_ERR_NAMES)     { return "malformed long-name table"; }
     if (code == TULA_ERR_OTHER)     { return "other error"; }
     return "unknown error";
 }

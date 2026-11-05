@@ -74,6 +74,14 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   entry); `tula_entry_nelems` (D-11); error codes 13–16. The builder now copies
   names and shapes at add time. The fuzz PRNG's low bits were fixed. Plain-builder
   output is byte-identical to 1.1.2's. 178 → 274 assertions.
+- **1.3.0** (2026-11-04) — **real names, real dtypes**, no format bump:
+  - Long names via the `__tula.names__` table and 47-byte keys (D-1, ADR 0004):
+    `tula_builder_add_long`, `tula_find_name` (verifies the full name),
+    `tula_entry_full_name`, `tula_has_long_names`, plus `TULA_ERR_NAMES` in
+    strict. The LoRA `lora_A`/`lora_B` collision round-trips as two tensors.
+  - `TULA_DT_F32/F16/BF16` with integer-arithmetic IEEE conversions (D-10, ADR
+    0005), exhaustively tested for the 16-bit formats.
+  - The builder's output is byte-identical to 1.2.0's. 274 → 388 assertions.
 
 ---
 
@@ -92,18 +100,18 @@ inconsistent with one call each. 1.2.0 shipped it (above). Left in the line:
 ## 1.3.x — real names, real dtypes
 
 **Goal:** tula stores what HF/LoRA checkpoints actually contain, without a
-format bump.
+format bump. 1.3.0 shipped both halves (above). The old plan split them, with the
+dtypes as "1.3.x", but new `TULA_DT_*` values are MINOR-only (STABILITY.md), so
+they landed in 1.3.0 together. Left in the line:
 
-- **1.3.0 — long names** (D-1, proper). **ADR 0004 first.** The likely shape,
-  following ADR 0002's sidecar precedent: a reserved tensor (e.g.
-  `"__tula.names__"`) holds the full names, and each entry's 48-byte field holds
-  a deterministic short key. A 1.x reader that knows nothing of it still opens
-  the file; `tula_find_name(r, long_name)` resolves through the table. The LoRA
-  `lora_A` / `lora_B` collision (audit §5) is the acceptance test.
-- **1.3.x — F32 / F16 / BF16** (D-10): new `TULA_DT_F32` / `TULA_DT_F16` /
-  `TULA_DT_BF16`. `tula_packed_len` / `payload_ok` learn their sizes, plus
-  conversion helpers to/from f64 (round-to-nearest-even, NaN/Inf/subnormal
-  exact), each with a differential test. Most real checkpoints ship BF16 or F16.
+- **1.3.x patches** — fixes as consumers adopt long names and the new dtypes; no
+  new surface.
+- **Consumer migration** (cross-repo): anukulana writes HF/LoRA names through
+  `tula_builder_add_long` and reads with `tula_find_name`. It keeps BF16/F16
+  source tensors in their dtype rather than widening them to f64.
+- **Later dtype candidates** need their own ADR before a MINOR:
+  - FP8 (E4M3 / E5M2), which come in several incompatible NaN/inf conventions.
+  - int4 blockwise (GGUF-style Q4).
 
 ## 1.4.x — big files
 

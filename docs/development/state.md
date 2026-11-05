@@ -23,27 +23,35 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.2.0** (`tula_version_int()` returns `10200`). 1.0.1–1.1.1 are
+VERSION is **1.3.0** (`tula_version_int()` returns `10300`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
 with byte-identical output, and no API or format change. **1.2.0 — real
 checkpoints, checked** (additive): the sized builder, the checked add, the strict
 validator (`src/check.cyr`), `tula_verify_required`, `tula_find_scale`,
-`tula_entry_nelems`, error codes 13–16. Post-1.0 work
+`tula_entry_nelems`, error codes 13–16. **1.3.0 — real names, real dtypes**: long
+names through the `__tula.names__` table and 47-byte keys (ADR 0004;
+`src/names.cyr`), and `TULA_DT_F32/F16/BF16` with integer-arithmetic IEEE
+conversions (ADR 0005). Still no format bump. Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.2.0)
+## Tests, fuzz, gates (1.3.0)
 
-**274 assertions** across 7 suites, all green: `builder.tcyr` 67, `strict.tcyr` 67,
-`dtype.tcyr` 50, `fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22,
-`sign.tcyr` 8. `dtype` and `builder` include differential tests against the 1.1.1
-implementations. `make fuzz`: 2,303,000 iterations with every buffer ending at a
-`PROT_NONE` guard page. It includes a payload-guard + unpack phase (49,360
-entries) and a strict phase, where 6,302 strict accepts were all confirmed by
-brute force and 147,167 duplicate-name verdicts came through the sort path.
-0 faults. `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
+**388 assertions** across 9 suites, all green: `names.tcyr` 77, `builder.tcyr` 67,
+`strict.tcyr` 67, `dtype.tcyr` 50, `floats.tcyr` 37, `fileio.tcyr` 30,
+`hardening.tcyr` 30, `roundtrip.tcyr` 22, `sign.tcyr` 8.
+- `floats` checks F16/BF16 exhaustively (every code, every midpoint) and F32
+  against the hardware.
+- `dtype` and `builder` include differential tests against the 1.1.1
+  implementations.
+- `make fuzz`: 2,603,000 iterations with every buffer ending at a `PROT_NONE`
+  guard page, 0 faults. It covers:
+  - a payload-guard + unpack phase (2.1M entries, all seven dtypes);
+  - a strict phase, where 14,455 strict accepts were all confirmed by brute
+    force, including the find-name round trip;
+  - phase F, which mutates a names table. `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
 0 undocumented.
 
 ## Toolchain
@@ -82,8 +90,9 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-**1.3.0 — real names, real dtypes** ([roadmap](roadmap.md)): the long-name
-extension (ADR 0004 first; the LoRA `lora_A`/`lora_B` collision is the acceptance
-test), then F32 / F16 / BF16. 1.4.0 is the streaming writer for files over 2 GiB.
-Meanwhile 1.2.x is consumer migration: anukulana and ifran adopt the checked add
-and strict reads (ifran still pins tula 1.0.2).
+**1.4.0 — big files** ([roadmap](roadmap.md)): a streaming writer, so files over
+the stdlib's 2 GiB per-allocation cap can be written (unsigned first; a signed
+stream needs a multi-part Ed25519 from sigil). Then `tula_write_file_atomic` and a
+caller-buffer read. Meanwhile consumers migrate: anukulana and ifran adopt the
+checked/long adds, strict reads, `tula_find_name` and native BF16 (ifran still
+pins tula 1.0.2).

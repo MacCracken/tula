@@ -1,0 +1,332 @@
+# tests/tcyr/names.tcyr — 1.3.0 long names (ADR 0004). The acceptance test is the
+# LoRA pair whose names truncate to the same 47 bytes: both must round-trip as
+# distinct tensors. Also: old readers' view (keys as names), the reserved name,
+# strict's canonical rules for the table, tampering, file I/O, signing, scales.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn filled(n, v): i64 {
+    var p = alloc(n + 8);
+    var i = 0;
+    while (i < n) { store8(p + i, v); i = i + 1; }
+    return p;
+}
+
+fn lora_a(): i64 { return "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"; }
+fn lora_b(): i64 { return "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"; }
+fn moe(): i64 { return "model.layers.0.block_sparse_moe.experts.0.w1.weight"; }   # 51
+
+# A file with three long names, one short name, and a long-named sidecar scale.
+fn long_builder(): i64 {
+    var b = tula_builder_new();
+    tula_builder_add_long(b, lora_a(), TULA_DT_INT8, shape1(4), 1, filled(4, 0xA), 4);
+    tula_builder_add_long(b, "short", TULA_DT_INT8, shape1(2), 1, filled(2, 0x5), 2);
+    tula_builder_add_long(b, lora_b(), TULA_DT_INT8, shape1(4), 1, filled(4, 0xB), 4);
+    tula_builder_add_long(b, moe(), TULA_DT_INT8, shape1(3), 1, filled(3, 0xC), 3);
+    var sc = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight.scale";
+    tula_builder_add_long(b, sc, TULA_DT_F64, shape1(1), 1, filled(8, 0), 8);
+    return b;
+}
+
+fn test_lora_acceptance() {
+    var buf = tula_builder_finish(long_builder());
+    var len = tula_total_len(buf);
+    var r = tula_open(buf, len);
+    assert(r != 0, "a long-name file opens with tula_open (every 1.x reader)");
+    assert_eq(tula_count(r), 6, "5 tensors + the names table");
+    assert_eq(tula_has_long_names(r), 1, "the names table is recognized");
+    var ea = tula_find_name(r, lora_a());
+    var eb = tula_find_name(r, lora_b());
+    assert(ea != 0, "lora_A found by its full name");
+    assert(eb != 0, "lora_B found by its full name");
+    assert(ea != eb, "lora_A and lora_B are DIFFERENT tensors (the 47-byte collision is gone)");
+    assert_eq(load8(tula_entry_data(r, ea)), 0xA, "lora_A's data is lora_A's");
+    assert_eq(load8(tula_entry_data(r, eb)), 0xB, "lora_B's data is lora_B's");
+    assert(streq(tula_entry_full_name(r, ea), lora_a()), "full name of lora_A round-trips");
+    assert(streq(tula_entry_full_name(r, eb), lora_b()), "full name of lora_B round-trips");
+    var em = tula_find_name(r, moe());
+    assert(em != 0, "the 51-char Mixtral name is found");
+    assert(streq(tula_entry_full_name(r, em), moe()), "... and round-trips");
+    var es = tula_find_name(r, "short");
+    assert(es != 0, "a short name is found through tula_find_name too");
+    assert(es == tula_find(r, "short"), "... the same entry tula_find returns");
+    assert(tula_entry_full_name(r, es) == tula_entry_name(es), "a short name's full name is in place");
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "the long-name file is strict-valid");
+    return 0;
+}
+
+fn test_old_reader_view() {
+    var buf = tula_builder_finish(long_builder());
+    var r = tula_open(buf, tula_total_len(buf));
+    var ea = tula_find_name(r, lora_a());
+    var key = tula_entry_name(ea);
+    assert_eq(strlen(key), 47, "a long name's field holds a 47-byte key");
+    var i = 0;
+    var pre = 1;
+    while (i < 30) {
+        if (load8(key + i) != load8(lora_a() + i)) { pre = 0; }
+        i = i + 1;
+    }
+    assert(pre, "the key starts with the name's first 30 bytes");
+    assert_eq(load8(key + 30), 126, "then '~'");
+    var hexok = 1;
+    i = 31;
+    while (i < 47) {
+        var c = load8(key + i);
+        var isd = 0;
+        if (c >= 48) { if (c <= 57) { isd = 1; } }
+        if (c >= 97) { if (c <= 102) { isd = 1; } }
+        if (isd == 0) { hexok = 0; }
+        i = i + 1;
+    }
+    assert(hexok, "then 16 lowercase hex digits");
+    assert_eq(tula_find(r, lora_a()), 0, "tula_find (an old reader) can't see the full name");
+    assert(tula_find(r, key) == ea, "... but finds the entry by its key");
+    assert_eq(tula_find_name(r, key), 0, "tula_find_name does not take a key for a name");
+    var et = tula_find(r, "__tula.names__");
+    assert(et != 0, "the table is an ordinary tensor to an old reader");
+    assert_eq(tula_entry_dtype(et), TULA_DT_INT8, "... an int8 vector");
+    assert(et == tula_entry(r, tula_count(r) - 1), "... and the last entry");
+    return 0;
+}
+
+fn test_short_only_matches_checked() {
+    # add_long with only short names is byte-identical to add_checked: no table.
+    var b1 = tula_builder_new();
+    var b2 = tula_builder_new();
+    tula_builder_add_checked(b1, "a", TULA_DT_INT8, shape1(3), 1, filled(3, 1), 3);
+    tula_builder_add_checked(b1, "bb", TULA_DT_F64, shape1(1), 1, filled(8, 2), 8);
+    tula_builder_add_long(b2, "a", TULA_DT_INT8, shape1(3), 1, filled(3, 1), 3);
+    tula_builder_add_long(b2, "bb", TULA_DT_F64, shape1(1), 1, filled(8, 2), 8);
+    var x = tula_builder_finish(b1);
+    var y = tula_builder_finish(b2);
+    var len = tula_total_len(x);
+    assert_eq(tula_total_len(y), len, "same length");
+    var same = 1;
+    var i = 0;
+    while (i < len) {
+        if (load8(x + i) != load8(y + i)) { same = 0; }
+        i = i + 1;
+    }
+    assert(same, "add_long with short names == add_checked, byte for byte");
+    assert_eq(tula_has_long_names(tula_open(y, len)), 0, "no names table without a long name");
+    return 0;
+}
+
+fn test_writer_rules() {
+    var d = filled(8, 1);
+    var b = tula_builder_new();
+    assert_eq(tula_builder_add_long(b, lora_a(), TULA_DT_INT8, shape1(1), 1, d, 1), 0, "a long name is accepted");
+    assert_eq(tula_builder_add_long(b, lora_a(), TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+      "the same long name twice -> DUP_NAME");
+    assert_eq(tula_builder_add_long(b, "__tula.names__", TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+      "the table's name -> DUP_NAME");
+    assert_eq(tula_builder_add_checked(b, "__tula.names__", TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+      "checked add of the table's name once long names exist -> DUP_NAME");
+    assert_eq(tula_builder_add_checked(b, lora_b(), TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_NAME_LONG,
+      "add_checked still refuses long names (1.2.0)");
+    assert_eq(tula_builder_add_long(b, "x", TULA_DT_INT8, shape1(1), 9, d, 1), TULA_ERR_NDIM,
+      "add_long keeps add's checks");
+    assert_eq(load64(b), 1, "one tensor held after the refusals");
+    var b2 = tula_builder_new();
+    assert_eq(tula_builder_add_checked(b2, "__tula.names__", TULA_DT_INT8, shape1(1), 1, d, 1), 0,
+      "without long names the name is ordinary (1.2.0 behaviour)");
+    assert_eq(tula_builder_add_long(b2, lora_a(), TULA_DT_INT8, shape1(1), 1, d, 1), TULA_ERR_DUP_NAME,
+      "... but then no long name can follow (the table needs it)");
+    var plain = tula_builder_finish(b2);
+    assert_eq(tula_has_long_names(tula_open(plain, tula_total_len(plain))), 0,
+      "a 1.2-style tensor of that name is not a table");
+    assert_eq(tula_validate_strict(plain, tula_total_len(plain)), TULA_OK, "... and is strict-valid, as in 1.2.0");
+    return 0;
+}
+
+fn test_name_buffer_reuse() {
+    # one name buffer, rewritten for every add: the builder copies long names too
+    var nm = alloc(80);
+    var pre = "model.layers.0.block_sparse_moe.experts.";
+    var b = tula_builder_new();
+    var i = 0;
+    while (i < 10) {
+        var k = 0;
+        while (load8(pre + k) != 0) { store8(nm + k, load8(pre + k)); k = k + 1; }
+        store8(nm + k, 48 + i);
+        var suf = ".w1.weight";
+        var j = 0;
+        while (load8(suf + j) != 0) { store8(nm + k + 1 + j, load8(suf + j)); j = j + 1; }
+        store8(nm + k + 1 + j, 0);
+        tula_builder_add_long(b, nm, TULA_DT_INT8, shape1(1), 1, filled(1, i), 1);
+        i = i + 1;
+    }
+    store8(nm, 0);
+    var buf = tula_builder_finish(b);
+    var r = tula_open(buf, tula_total_len(buf));
+    var e7 = tula_find_name(r, "model.layers.0.block_sparse_moe.experts.7.w1.weight");
+    assert(e7 != 0, "expert 7 found after the name buffer was reused 10 times");
+    assert_eq(load8(tula_entry_data(r, e7)), 7, "... with its own data");
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "10 long names: strict-valid");
+    return 0;
+}
+
+fn test_scale_and_signing_and_files() {
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, i * 11 + 2); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var sb = tula_builder_finish_signed(long_builder(), sk);
+    var slen = tula_total_len(sb);
+    var path = "build/test_names_signed.tula";
+    assert_eq(tula_write_file(path, sb, slen), slen, "signed long-name file written");
+    var r = tula_read_file(path);
+    assert(r != 0, "... read back");
+    assert_eq(tula_validate_strict(r, tula_total_len(r)), TULA_OK, "... strict-valid from disk");
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "... and the signature (covering the table) verifies");
+    var ea = tula_find_name(r, lora_a());
+    var s = tula_find_scale(r, ea, 1);
+    assert(s != 0, "a long-named tensor's long-named .scale sidecar is found");
+    var want = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight.scale";
+    assert(streq(tula_entry_full_name(r, s), want), "... the right one");
+    assert_eq(tula_find_scale(r, tula_find_name(r, lora_b()), 1), 0, "lora_B has no sidecar -> 0");
+    var m = tula_open_mmap(path);
+    assert(m != 0, "mmap opens it");
+    assert(tula_find_name(m, lora_b()) != 0, "... and resolves a long name");
+    tula_close_mmap(m);
+    # a flipped byte in a stored long name breaks the signature
+    var ra = tula_find_name(r, lora_a());
+    var fn0 = tula_entry_full_name(r, ra);
+    store8(fn0 + 60, load8(fn0 + 60) ^ 1);
+    assert_eq(tula_verify_required(r, pk), TULA_ERR_SIG, "editing a long name in the table -> SIG");
+    return 0;
+}
+
+# A fresh copy of the long-name file and pointers into its table.
+fn fresh(): i64 {
+    return tula_builder_finish(long_builder());
+}
+
+fn table_of(buf): i64 {
+    var r = tula_open(buf, tula_total_len(buf));
+    return tula_entry_data(r, tula_entry(r, tula_count(r) - 1));
+}
+
+fn test_strict_table_rules() {
+    var buf = fresh();
+    var len = tula_total_len(buf);
+    var t = table_of(buf);
+    # records: [0]=lora_A (entry 0), [1]=lora_B (entry 2), [2]=moe (entry 3), [3]=scale (entry 4)
+    assert_eq(load64(t + 8), 4, "4 records");
+    assert_eq(load64(t + 16), 0, "record 0 -> entry 0");
+    assert_eq(load64(t + 40), 2, "record 1 -> entry 2");
+
+    store64(t + 16, 2); store64(t + 40, 0);                  # unsorted records
+    assert_eq(tula_validate(buf, len), TULA_OK, "unsorted records pass validate");
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "unsorted records -> NAMES");
+
+    buf = fresh(); t = table_of(buf);
+    store64(t + 16 + 72, 5);                                   # record 3 -> the table itself
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "a record pointing at the table -> NAMES");
+
+    buf = fresh(); t = table_of(buf);
+    store64(t + 16 + 8, load64(t + 16 + 8) + 1);              # name_off not packed
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "a misplaced name -> NAMES");
+
+    buf = fresh(); t = table_of(buf);
+    var off0 = load64(t + 16 + 8);
+    store8(t + off0 + 10, 0);                                  # NUL inside a name
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "a NUL inside a long name -> NAMES");
+
+    buf = fresh(); t = table_of(buf);
+    store8(t + off0 + 50, load8(t + off0 + 50) ^ 2);           # name no longer matches its key
+    assert_eq(tula_validate(buf, len), TULA_OK, "a name/key mismatch passes validate");
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "a name that doesn't match its entry's key -> NAMES");
+    var r = tula_open(buf, len);
+    assert_eq(tula_find_name(r, lora_a()), 0, "... and tula_find_name never returns the mismatched entry");
+
+    buf = fresh();
+    r = tula_open(buf, len);
+    var key = tula_entry_name(tula_find_name(r, lora_b()));
+    var dg = load8(key + 40);                                  # a hex digit of the key: change it
+    if (dg == 48) { store8(key + 40, 49); } else { store8(key + 40, 48); }
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_NAMES, "an entry key that doesn't match its name -> NAMES");
+    return 0;
+}
+
+fn test_malformed_records_are_safe() {
+    # Out-of-range records are treated as absent: the in-place key comes back.
+    var buf = fresh();
+    var len = tula_total_len(buf);
+    var t = table_of(buf);
+    var r = tula_open(buf, len);
+    var ea = tula_entry(r, 0);
+    store64(t + 16 + 8, 0x7FFFFFFFFFFFFF00);                   # lora_A's name_off far out
+    assert(tula_entry_full_name(r, ea) == tula_entry_name(ea), "an out-of-range name_off -> the key, no read");
+    assert_eq(tula_find_name(r, lora_a()), 0, "... and lora_A is not found by full name");
+    store64(t + 16 + 8, 0 - 8);
+    assert(tula_entry_full_name(r, ea) == tula_entry_name(ea), "a negative name_off -> the key");
+    store64(t + 16 + 8, 0);
+    store64(t + 16 + 16, 0x7FFFFFFFFFFFFFFF);                  # length runs past the table
+    assert(tula_entry_full_name(r, ea) == tula_entry_name(ea), "a length past the table -> the key");
+    store64(t + 8, 0x10000000);                                # record count past the table
+    assert_eq(tula_has_long_names(r), 0, "a record count the table can't hold -> no table");
+    store64(t + 8, 4);
+    store64(t, 0);                                             # no magic
+    assert_eq(tula_has_long_names(r), 0, "no magic -> no table");
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "... then it's an ordinary int8 tensor (strict-valid)");
+    return 0;
+}
+
+fn test_sized_builder_long() {
+    var n = 300;
+    var b = tula_builder_new_cap(n);
+    var nm = alloc(80);
+    var pre = "base_model.model.model.layers.";
+    var i = 0;
+    var bad = 0;
+    while (i < n) {
+        var k = 0;
+        while (load8(pre + k) != 0) { store8(nm + k, load8(pre + k)); k = k + 1; }
+        store8(nm + k, 48 + i / 100);
+        store8(nm + k + 1, 48 + (i / 10) % 10);
+        store8(nm + k + 2, 48 + i % 10);
+        var suf = ".self_attn.v_proj.lora_B.weight";
+        var j = 0;
+        while (load8(suf + j) != 0) { store8(nm + k + 3 + j, load8(suf + j)); j = j + 1; }
+        store8(nm + k + 3 + j, 0);
+        if (tula_builder_add_long(b, nm, TULA_DT_INT8, shape1(1), 1, filled(1, i & 0xFF), 1) != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "300 long names into a cap-300 builder");
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    assert_eq(tula_count(buf), 301, "300 tensors + the table (the table needs no builder slot)");
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "300 long names: strict-valid (the sort path runs on keys)");
+    var r = tula_open(buf, len);
+    var e = tula_find_name(r, "base_model.model.model.layers.217.self_attn.v_proj.lora_B.weight");
+    assert(e != 0, "layer 217 found by full name");
+    assert_eq(load8(tula_entry_data(r, e)), 217, "... with its own data");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_lora_acceptance();
+    test_old_reader_view();
+    test_short_only_matches_checked();
+    test_writer_rules();
+    test_name_buffer_reuse();
+    test_scale_and_signing_and_files();
+    test_strict_table_rules();
+    test_malformed_records_are_safe();
+    test_sized_builder_long();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

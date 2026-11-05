@@ -7,6 +7,100 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-04
+
+**Real names, real dtypes.** An additive MINOR with no format bump: two new
+conventions inside format v1, each recorded in an ADR. It closes audit D-1 (long
+names, properly) and D-10 (F32/F16/BF16). Every 1.2.0 call behaves as before,
+and the plain and checked builders' output is **byte-identical** to 1.2.0's
+(diffed over randomized builders, with NF4 and int8 outputs too).
+
+### Added
+
+- **Long tensor names** (ADR 0004). `tula_builder_add_long` takes names of any
+  length. A name of 47 chars or fewer is added exactly as with `add_checked`. A
+  longer one is stored whole in a **names table**: the reserved int8 tensor
+  `__tula.names__`, appended as the last entry. Its entry holds a 47-byte
+  **key**: the first 30 bytes, `~`, then FNV-1a-64 in hex.
+  - `tula_find_name(r, name)` looks up by full name and **verifies it** against
+    the table, so a hash collision can't return the wrong tensor.
+  - `tula_entry_full_name(r, e)` returns the name; `tula_has_long_names(r)` says
+    whether a table is present.
+  - **The acceptance test passes:** the LoRA pair `…q_proj.lora_A.weight` /
+    `…lora_B.weight` (62 chars, the same first 47 bytes) round-trips as two
+    distinct tensors. So does Mixtral's 51-char
+    `model.layers.0.block_sparse_moe.experts.0.w1.weight`.
+  - **Every 1.x reader opens these files.** 1.0–1.2 see the keys as names and
+    the table as an ordinary int8 tensor, and 1.2's strict validator accepts them.
+- **`TULA_DT_F32` (4), `TULA_DT_F16` (5), `TULA_DT_BF16` (6)** (ADR 0005), with
+  IEEE 754 conversions to and from f64: `tula_f64_to_f32/f16/bf16`,
+  `tula_f32/f16/bf16_to_f64`, and array `tula_f32/f16/bf16_pack` / `_unpack`.
+  - Round to nearest, ties to even, straight from the f64. BF16 is never rounded
+    through F32: 1 + 2⁻⁸ + 2⁻³⁰ is `0x3F81` directly, `0x3F80` via F32.
+  - ±inf on overflow, correctly rounded subnormals (no flush to zero), signed
+    zeros kept, NaN quiet with its sign and payload.
+  - Integer arithmetic only, so a file's bytes never depend on the writer's FP
+    mode.
+  - `tula_packed_len`, `tula_entry_payload_ok` and `tula_validate_strict` learn
+    the sizes.
+- **`TULA_ERR_NAMES` (17)** — `tula_validate_strict` requires a names table to be
+  canonical: ordered records, names packed in order, each over 47 bytes with no
+  embedded NUL, and each entry's field equal to its name's key.
+- **ADRs** 0004 (long names) and 0005 (the dtypes and their rounding).
+- New module `src/names.cyr` (the table reader).
+
+### Changed
+
+- **`tula_find_scale` uses the entry's full name**, so a long-named tensor's
+  `"<full name>.scale"` sidecar is found through the table. A file without long
+  names has no such sidecar, so 1.2.0's answers are unchanged.
+- **`tula_builder_add_checked` refuses `__tula.names__` once the builder holds a
+  long name**, because the table will take that name. Without long names it
+  behaves exactly as in 1.2.0.
+- **Builder** (private layout): it records long names. It reserves the table's
+  manifest slot and its bytes under the size cap. The checked add costs 192 → 213
+  ns for that bookkeeping.
+- **Reference consumer** (`examples/consumer.cyr`, the CI gate) also writes a
+  62-char LoRA tensor in BF16 with `add_long` and loads it back with
+  `tula_find_name` + `tula_bf16_unpack`.
+- **Fuzz harness**:
+  - Every accepted buffer runs `tula_entry_full_name` on every entry, with the
+    result scanned to its NUL under the guard page.
+  - When the strict validator accepts, `tula_find_name(full_name(e)) == e` must
+    hold for every entry.
+  - The consumer phase unpacks F32/F16/BF16.
+  - New phase F mutates a canonical long-name file, aiming at the names table.
+- **Bench**: F32/F16/BF16 pack (~100–109 Melem/s) and unpack (~138 Melem/s) on
+  2²⁰ elements, and long-name add (~0.7 µs) and lookup (~2.1 µs, 256 LoRA names).
+  The array conversions take an inline fast path for normal numbers, about 2.2×
+  the scalar path, bit-identical (tested).
+
+### Fixed (during development)
+
+- The F32 oracle test caught widening keeping a **signaling** NaN signaling. It
+  disagreed with `cvtss2sd` on 572 of 300,000 random f32 codes, exactly the
+  signaling-NaN share. IEEE 754 never returns a signaling NaN from a conversion,
+  so widening now sets the quiet bit (ADR 0005 updated).
+
+### Verified
+
+- Suite **274 → 388** assertions in 9 suites: new `floats.tcyr` (37) and
+  `names.tcyr` (77).
+  - **F16 and BF16 exhaustively:** all 65,536 codes round-trip, and every
+    neighbour midpoint (and ±1 f64 ulp) rounds correctly at both signs.
+  - **F32 matches the hardware** on 300k random inputs plus specials, and 100k
+    midpoints.
+  - **BF16 matches the classic F32-bit rounding** on 300k F32-exact inputs.
+  - **The array fast paths match the scalar path** on every 16-bit code and
+    midpoint, and on 300k F32 cases.
+  - **Mutations are caught:** ties-up, a dropped carry and an off-by-one
+    subnormal shift in the conversions, and in names, `tula_find_name` trusting
+    the key or strict skipping the key check.
+- `make fuzz`: 2,603,000 iterations, 2.1M entries unpacked, 14,455 strict accepts
+  all passing the find-name round trip, 0 faults, 0 invariant failures.
+- `fmt`, `lint`, `vet` and `deny` clean. `doc --check` 0 undocumented.
+  `make example` PASS. `make dist` OK.
+
 ## [1.2.0] - 2026-11-04
 
 **Real checkpoints, checked.** An additive MINOR (ADR 0003): new functions and

@@ -381,6 +381,71 @@ fn main(): i64 {
     report_el("int8 dequant : ", n, imin);
     chk = chk + load64(out + 8 * 4242);
 
+    # ---- F32 / F16 / BF16 (1.3.0): integer-arithmetic IEEE conversions ----
+    var nb32 = alloc(n * 4);
+    var nb16 = alloc(n * 2);
+    var fmt = 0;
+    while (fmt < 3) {
+        var pk = 0;
+        var up = 0;
+        round = 0;
+        while (round < BN_ROUNDS) {
+            var tp = now_ns();
+            if (fmt == 0) { tula_f32_pack(sig, n, nb32); }
+            if (fmt == 1) { tula_f16_pack(sig, n, nb16); }
+            if (fmt == 2) { tula_bf16_pack(sig, n, nb16); }
+            pk = min_of(pk, round, now_ns() - tp);
+            var tu = now_ns();
+            if (fmt == 0) { tula_f32_unpack(nb32, n, out); }
+            if (fmt == 1) { tula_f16_unpack(nb16, n, out); }
+            if (fmt == 2) { tula_bf16_unpack(nb16, n, out); }
+            up = min_of(up, round, now_ns() - tu);
+            round = round + 1;
+        }
+        chk = chk + load64(out + 8 * 999);
+        if (fmt == 0) { report_el("f32 pack     : ", n, pk); report_el("f32 unpack   : ", n, up); }
+        if (fmt == 1) { report_el("f16 pack     : ", n, pk); report_el("f16 unpack   : ", n, up); }
+        if (fmt == 2) { report_el("bf16 pack    : ", n, pk); report_el("bf16 unpack  : ", n, up); }
+        fmt = fmt + 1;
+    }
+
+    # ---- long names (1.3.0): 256 LoRA-style names over 47 chars ----
+    var lnames = alloc(BN_FIND_N * 8);
+    var lb = tula_builder_new();
+    var lpre = "base_model.model.model.layers.";
+    var lsuf = ".self_attn.q_proj.lora_A.weight";
+    var li = 0;
+    var lamin = 0;
+    var t6l = now_ns();
+    while (li < BN_FIND_N) {
+        var lnm = alloc(96);
+        var lk = 0;
+        while (load8(lpre + lk) != 0) { store8(lnm + lk, load8(lpre + lk)); lk = lk + 1; }
+        lk = lk + put_dec(lnm + lk, li);
+        var ls = 0;
+        while (load8(lsuf + ls) != 0) { store8(lnm + lk, load8(lsuf + ls)); lk = lk + 1; ls = ls + 1; }
+        store8(lnm + lk, 0);
+        store64(lnames + li * 8, lnm);
+        tula_builder_add_long(lb, lnm, TULA_DT_F64, shape1, 1, d1, 8);
+        li = li + 1;
+    }
+    lamin = now_ns() - t6l;
+    report_op("add (long)   : ", BN_FIND_N, lamin);
+    var lr = tula_builder_finish(lb);
+    var lfmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t7l = now_ns();
+        var lq = 0;
+        while (lq < BN_FIND_N) {
+            if (tula_find_name(lr, load64(lnames + lq * 8)) == 0) { sput("find_name MISSED\n"); return 1; }
+            lq = lq + 1;
+        }
+        lfmin = min_of(lfmin, round, now_ns() - t7l);
+        round = round + 1;
+    }
+    report_op("find_name(L) : ", BN_FIND_N, lfmin);
+
     sput("checksum: ");
     fmt_int(chk);
     sput(" (ignore; anti-DCE)\n");
