@@ -12,9 +12,11 @@
 #   ed25519_verify(pk[32], msg, msg_len, sig[64])      -> 1 valid / 0 invalid
 
 # Serialize the builder AND sign it with a 64-byte Ed25519 secret key
-# (seed||pk, as produced by ed25519_keypair). Returns the signed buffer.
+# (seed||pk, as produced by ed25519_keypair). Returns the signed buffer, or 0 if
+# the allocation fails.
 fn tula_builder_finish_signed(b, sk): i64 {
     var buf = tula_serialize(b, 64);   # reserves the 64-byte sig block at sig_off
+    if (buf == 0) { return 0; }
     var so = load64(buf + 48);          # sig_off == content_len
     ed25519_sign(sk, buf, so, buf + so);
     return buf;

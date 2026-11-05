@@ -46,10 +46,15 @@ The full march M0→M5:
 - **v1.0 prep** — `docs/api.md` (frozen surface) + `STABILITY.md` +
   `examples/consumer.cyr` (end-to-end, CI gate).
 
-**105/105** assertions across 5 suites (round-trip · sign · file-io · dtype ·
-hardening) + a >10⁶-iteration fuzz harness and an end-to-end consumer, all green.
-Deps: stdlib + **sigil** (Ed25519). Cyrius pin **6.3.27**. CI + release workflows
-in place. Post-1.0 changes are additive-only (SemVer). See
+- **1.1.2 P(-1)** — hardening / optimization / repair (`docs/audit/2026-11-04-audit.md`):
+  file readers check the header against the real file size; hot paths 1.2–11.6×
+  faster, byte-identical output.
+
+**178/178** assertions across 6 suites (builder · round-trip · sign · file-io ·
+dtype · hardening) + a >10⁶-iteration guard-page fuzz harness and an end-to-end
+consumer, all green. Deps: stdlib + **sigil** (Ed25519); the cyrius pin lives in
+`cyrius.cyml`. CI + release workflows in place. Post-1.0 changes are
+additive-only (SemVer); next is 1.2.0 (real checkpoints, checked). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test

@@ -177,7 +177,7 @@ fn test_ternary_file_with_scale() {
     var buf = tula_builder_finish(b);
     var total = tula_total_len(buf);
 
-    var path = "/tmp/tula_m2_ternary.tula";
+    var path = "build/test_dtype_ternary.tula";
     assert_eq(tula_write_file(path, buf, total), total, "wrote ternary + scale");
     var r = tula_read_file(path);
     assert(r != 0, "reopen ternary file");
@@ -246,6 +246,238 @@ fn test_payload_ok() {
     return 0;
 }
 
+# ---- 1.1.2: the optimized helpers answer bit-for-bit as 1.1.1's did ------------
+
+# 1.1.1's tula_nf4_nearest: the full 16-entry scan.
+fn ref_nearest(xn): i64 {
+    var best = 0;
+    var bestd = f64_abs(f64_sub(xn, tula_nf4_level(0)));
+    var j = 1;
+    while (j < 16) {
+        var d = f64_abs(f64_sub(xn, tula_nf4_level(j)));
+        if (f64_lt(d, bestd) == 1) {
+            bestd = d;
+            best = j;
+        }
+        j = j + 1;
+    }
+    return best;
+}
+
+# 1.1.1's tula_nf4_unpack: per element, scale at i / block.
+fn ref_nf4_unpack(nibbles, scales, n, block, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var amax = load64(scales + (i / block) * 8);
+        store64(dst + i * 8, f64_mul(tula_nf4_level(tula_nf4_get(nibbles, i)), amax));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    return (x >> 33) & 0x7FFFFFFF;
+}
+
+fn test_nearest_matches_reference() {
+    var bad = 0;
+    var tried = 0;
+    # a dense sweep of [-1.25, 1.25]
+    var k = 0;
+    while (k <= 25000) {
+        var x = f64_sub(f64_div(f64_from(k), f64_from(10000)), f64_div(f64_from(5), f64_from(4)));
+        if (tula_nf4_nearest(x) != ref_nearest(x)) { bad = bad + 1; }
+        tried = tried + 1;
+        k = k + 1;
+    }
+    # every level, every midpoint between neighbours, and one ulp either side
+    var j = 0;
+    while (j < 16) {
+        var l = tula_nf4_level(j);
+        if (tula_nf4_nearest(l) != ref_nearest(l)) { bad = bad + 1; }
+        tried = tried + 1;
+        if (j < 15) {
+            var mid = f64_div(f64_add(l, tula_nf4_level(j + 1)), f64_from(2));
+            if (tula_nf4_nearest(mid) != ref_nearest(mid)) { bad = bad + 1; }
+            if (tula_nf4_nearest(mid + 1) != ref_nearest(mid + 1)) { bad = bad + 1; }
+            if (tula_nf4_nearest(mid - 1) != ref_nearest(mid - 1)) { bad = bad + 1; }
+            tried = tried + 3;
+        }
+        j = j + 1;
+    }
+    # signed zeros, infinities, NaN, values far outside [-1, 1]
+    var specials = alloc(8 * 8);
+    store64(specials + 0, 0);                     # +0.0
+    store64(specials + 8, 0x8000000000000000);    # -0.0
+    store64(specials + 16, 0x7FF0000000000000);   # +inf
+    store64(specials + 24, 0xFFF0000000000000);   # -inf
+    store64(specials + 32, 0x7FF8000000000000);   # NaN
+    store64(specials + 40, 0x4059000000000000);   # 100.0
+    store64(specials + 48, 0xC059000000000000);   # -100.0
+    store64(specials + 56, 0x0000000000000001);   # smallest subnormal
+    var q = 0;
+    while (q < 8) {
+        var v = load64(specials + q * 8);
+        if (tula_nf4_nearest(v) != ref_nearest(v)) { bad = bad + 1; }
+        tried = tried + 1;
+        q = q + 1;
+    }
+    assert(tried > 25000, "nearest: sweep + midpoints + specials covered");
+    assert_eq(bad, 0, "early-exit nearest == the full scan on every input");
+    assert_eq(tula_nf4_nearest(0x7FF8000000000000), 0, "NaN -> code 0, as before");
+    return 0;
+}
+
+fn test_nf4_unpack_matches_reference() {
+    var s = alloc(8);
+    store64(s, 0x9E3779B97F4A7C15);
+    var n = 1001;                       # odd, and not a multiple of either block
+    var nib = alloc(tula_nf4_bytes(n));
+    var i = 0;
+    while (i < tula_nf4_bytes(n)) { store8(nib + i, lcg(s) & 0xFF); i = i + 1; }
+    var scl = alloc(tula_nf4_blocks(n, 7) * 8);
+    i = 0;
+    while (i < tula_nf4_blocks(n, 7)) {
+        store64(scl + i * 8, f64_div(f64_from(lcg(s) % 1000 + 1), f64_from(97)));
+        i = i + 1;
+    }
+    var a = alloc(n * 8);
+    var b = alloc(n * 8);
+    var bad = 0;
+    var blk = 0;
+    while (blk < 2) {
+        var block = 64;
+        if (blk == 1) { block = 7; }
+        assert_eq(tula_nf4_unpack(nib, scl, n, block, a), n, "nf4 unpack returns n");
+        ref_nf4_unpack(nib, scl, n, block, b);
+        i = 0;
+        while (i < n) {
+            if (load64(a + i * 8) != load64(b + i * 8)) { bad = bad + 1; }
+            i = i + 1;
+        }
+        blk = blk + 1;
+    }
+    assert_eq(bad, 0, "table/blocked nf4 unpack == 1.1.1's, bit for bit (blocks 64 and 7)");
+    return 0;
+}
+
+fn test_nf4_pack_matches_reference() {
+    # pack with the early-exit nearest; repack the codes with the full scan and
+    # compare every nibble
+    var n = 2000;
+    var block = 64;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        var x = f64_div(f64_from((i * 7919) % 2003 - 1001), f64_from(613));
+        store64(src + i * 8, x);
+        i = i + 1;
+    }
+    var nb = tula_nf4_blocks(n, block);
+    var scl = alloc(nb * 8);
+    var nib = alloc(tula_nf4_bytes(n));
+    assert_eq(tula_nf4_pack(src, n, block, scl, nib), nb, "nf4 pack returns the block count");
+    var bad = 0;
+    i = 0;
+    while (i < n) {
+        var amax = load64(scl + (i / block) * 8);
+        var want = 7;
+        if (f64_gt(amax, f64_from(0)) == 1) { want = ref_nearest(f64_div(load64(src + i * 8), amax)); }
+        if (tula_nf4_get(nib, i) != want) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "nf4 pack codes == the full-scan codes");
+    return 0;
+}
+
+fn test_ternary_unpack_matches_get() {
+    # every byte value (codes 0..3 in every slot, including the unused code 3),
+    # and an n that is not a multiple of 4
+    var n = 1023;
+    var pk = alloc(256);
+    var i = 0;
+    while (i < 256) { store8(pk + i, i); i = i + 1; }
+    var out = alloc(n * 8);
+    assert_eq(tula_ternary_unpack(pk, n, out), n, "ternary unpack returns n");
+    var bad = 0;
+    i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != tula_ternary_get(pk, i)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "byte-wise ternary unpack == tula_ternary_get for every code");
+    return 0;
+}
+
+fn test_nf4_block_nonpositive() {
+    var nib = alloc(16);
+    var scl = alloc(16);
+    var dst = alloc(64);
+    var src = alloc(64);
+    var i = 0;
+    while (i < 16) { store8(nib + i, 0xEE); i = i + 1; }
+    i = 0;
+    while (i < 8) { store64(dst + i * 8, 0x1111); store64(src + i * 8, f64_from(1)); i = i + 1; }
+    assert_eq(tula_nf4_blocks(10, 0), 0, "nf4_blocks(n, 0) -> 0 (no divide by zero)");
+    assert_eq(tula_nf4_blocks(10, 0 - 4), 0, "nf4_blocks(n, -4) -> 0");
+    assert_eq(tula_nf4_pack(src, 8, 0, scl, nib), 0, "nf4_pack(block 0) -> 0");
+    assert_eq(load8(nib), 0xEE, "... writing nothing");
+    assert_eq(tula_nf4_unpack(nib, scl, 8, 0, dst), 0, "nf4_unpack(block 0) -> 0 (it used to SIGFPE)");
+    assert_eq(load64(dst), 0x1111, "... writing nothing");
+    return 0;
+}
+
+fn test_payload_ok_dims() {
+    var e = alloc(TULA_ENTRY_SIZE);
+    var z = 0;
+    while (z < 18) { store64(e + z * 8, 0); z = z + 1; }
+    store64(e + 48, TULA_DT_F64);
+    store64(e + 56, 2);
+    store64(e + 64, 0);
+    store64(e + 72, 0 - 5);
+    assert_eq(tula_entry_payload_ok(e), 0, "shape [0, -5] -> not ok (a negative dim, after a zero)");
+    store64(e + 64, 0 - 5);
+    store64(e + 72, 0);
+    assert_eq(tula_entry_payload_ok(e), 0, "shape [-5, 0] -> not ok");
+    store64(e + 56, 3);
+    store64(e + 64, 0x40000000);
+    store64(e + 72, 0x40000000);
+    store64(e + 80, 0);
+    assert_eq(tula_entry_payload_ok(e), 1, "shape [2^30, 2^30, 0] -> ok (empty; no overflow verdict)");
+    store64(e + 80, 2);
+    assert_eq(tula_entry_payload_ok(e), 0, "shape [2^30, 2^30, 2] -> not ok (over the cap)");
+    return 0;
+}
+
+fn test_int8_dequant_table_matches_scalar() {
+    # n >= 1024 takes the 256-entry table; compare every element against the
+    # scalar formula, over every byte value, for two scales (one negative).
+    var n = 2048;
+    var q = alloc(n);
+    var i = 0;
+    while (i < n) { store8(q + i, (i * 37) & 0xFF); i = i + 1; }
+    var out = alloc(n * 8);
+    var bad = 0;
+    var t = 0;
+    while (t < 2) {
+        var scale = f64_div(f64_from(3), f64_from(254));
+        if (t == 1) { scale = f64_div(f64_from(0 - 7), f64_from(1000)); }
+        tula_int8_dequant(q, n, scale, out);
+        i = 0;
+        while (i < n) {
+            var b = load8(q + i);
+            if (b >= 128) { b = b - 256; }
+            if (load64(out + i * 8) != f64_mul(f64_from(b), scale)) { bad = bad + 1; }
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    assert_eq(bad, 0, "table int8 dequant == the scalar formula on every code");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     test_ternary_roundtrip();
@@ -254,6 +486,13 @@ fn main(): i64 {
     test_nf4_zero_block();
     test_ternary_file_with_scale();
     test_payload_ok();
+    test_nearest_matches_reference();
+    test_nf4_unpack_matches_reference();
+    test_nf4_pack_matches_reference();
+    test_ternary_unpack_matches_get();
+    test_nf4_block_nonpositive();
+    test_payload_ok_dims();
+    test_int8_dequant_table_matches_scalar();
     return assert_summary();
 }
 

@@ -28,6 +28,7 @@ build: check-lib-wiring
 
 .PHONY: test
 test: check-lib-wiring
+	@mkdir -p build
 	@for f in tests/tcyr/*.tcyr; do $(CYRIUS) test "$$f" || exit 1; done
 
 .PHONY: lint

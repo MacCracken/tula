@@ -5,6 +5,14 @@
 #   1. no crash (the process running to completion is the proof), and
 #   2. whenever tula_open succeeds, the buffer is genuinely valid — re-validation
 #      agrees, and every entry's payload range stays inside [buf, buf+len).
+#   3. (1.1.2) the consumer discipline holds: for every accepted entry that
+#      tula_entry_payload_ok passes, the dtype's unpack helper reads only bytes
+#      inside the buffer.
+#
+# Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
+# read past `len` — by the validator, an accessor, tula_verify or an unpack —
+# is a SIGSEGV, not a silent over-read. Invariant 1 therefore proves no read
+# past the end, not only that the bounds arithmetic agreed.
 #
 # Deterministic LCG PRNG (fixed seed) -> fully reproducible. Cheap paths run well
 # past 10^6 iterations; the expensive signature-verify path runs at lower count.
@@ -18,6 +26,9 @@ enum FuzzCfg {
     FZ_RAND_ITERS   = 1000000;   # pure random bytes
     FZ_SIGNED_ITERS = 3000;      # mutate a signed buffer + tula_verify (expensive)
     FZ_MAXBUF       = 4096;
+    FZ_GUARD_SPAN   = 8192;      # readable bytes before the guard (>= FZ_MAXBUF + 64)
+    FZ_OUT_ELEMS    = 16640;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
+    FZ_SCALES       = 512;       # f64 block scales for nf4 unpack (>= FZ_OUT_ELEMS / 64)
 }
 
 # ---- output helpers -------------------------------------------------------
@@ -81,6 +92,65 @@ fn memcpy_n(dst, src, n): i64 {
     var i = 0;
     while (i < n) { store8(dst + i, load8(src + i)); i = i + 1; }
     return 0;
+}
+
+# The address of a PROT_NONE page with FZ_GUARD_SPAN readable bytes before it,
+# or 0 if the mapping or mprotect fails.
+fn guard_region(): i64 {
+    var base = mmap_anon(FZ_GUARD_SPAN + 4096);
+    if (base == 0) { return 0; }
+    if (cyr_mprotect(base + FZ_GUARD_SPAN, 4096, PROT_NONE) != 0) { return 0; }
+    return base + FZ_GUARD_SPAN;
+}
+
+# Copy `len` bytes of `src` so they end exactly at `guard`; returns the start.
+fn place(guard, src, len): i64 {
+    var p = guard - len;
+    memcpy_n(p, src, len);
+    return p;
+}
+
+# The consumer discipline on an opened buffer: every entry tula_entry_payload_ok
+# passes is unpacked with its dtype's helper (f64 is read word by word). Returns
+# the number of entries unpacked; an element count the guard said was safe but
+# that exceeds what the buffer can hold is an invariant breach (st + 16).
+fn consume(r, st, out, scl): i64 {
+    var done = 0;
+    var c = tula_count(r);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        var dt = tula_entry_dtype(e);
+        var nd = tula_entry_ndim(e);
+        var known = 0;
+        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_NF4) { known = 1; } }
+        if (known == 1) {
+            if (nd > 0) {
+                if (tula_entry_payload_ok(e) == 1) {
+                    var n = 1;
+                    var k = 0;
+                    while (k < nd) { n = n * tula_entry_dim(e, k); k = k + 1; }
+                    if (n > FZ_OUT_ELEMS) {
+                        store64(st + 16, load64(st + 16) + 1);
+                    } else {
+                        var p = tula_entry_data(r, e);
+                        if (dt == TULA_DT_F64) {
+                            var sum = 0;
+                            var w = 0;
+                            while (w < n) { sum = sum + load64(p + w * 8); w = w + 1; }
+                            store64(out, sum);
+                        }
+                        if (dt == TULA_DT_INT8)    { tula_int8_dequant(p, n, f64_from(1), out); }
+                        if (dt == TULA_DT_TERNARY) { tula_ternary_unpack(p, n, out); }
+                        if (dt == TULA_DT_NF4)     { tula_nf4_unpack(p, scl, n, TULA_NF4_BLOCK, out); }
+                        done = done + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return done;
 }
 
 # Apply 1..6 random mutations to `scratch` over its first `len0` bytes.
@@ -148,7 +218,14 @@ fn main(): i64 {
     var st = alloc(64);
     var z = 0;
     while (z < 8) { store64(st + z * 8, 0); z = z + 1; }
-    # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad
+    # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
+
+    var guard = guard_region();
+    if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
+    var out = alloc(FZ_OUT_ELEMS * 8);
+    var scl = alloc(FZ_SCALES * 8);
+    z = 0;
+    while (z < FZ_SCALES) { store64(scl + z * 8, f64_from(z + 1)); z = z + 1; }
 
     var buf0 = build_valid();
     var len0 = tula_total_len(buf0);
@@ -162,10 +239,11 @@ fn main(): i64 {
         memcpy_n(scratch, buf0, len0);
         mutate(s, scratch, len0);
         var testlen = rng_below(s, len0 + 32);
-        var r = tula_open(scratch, testlen);
+        var r = tula_open(place(guard, scratch, testlen), testlen);
         if (r != 0) {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r, testlen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            store64(st + 48, load64(st + 48) + consume(r, st, out, scl));
         }
         store64(st + 0, load64(st + 0) + 1);
         a = a + 1;
@@ -181,10 +259,11 @@ fn main(): i64 {
             store64(scratch + 0, TULA_MAGIC);
             store64(scratch + 8, TULA_VERSION);
         }
-        var r2 = tula_open(scratch, blen);
+        var r2 = tula_open(place(guard, scratch, blen), blen);
         if (r2 != 0) {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r2, blen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            store64(st + 48, load64(st + 48) + consume(r2, st, out, scl));
         }
         store64(st + 0, load64(st + 0) + 1);
         bph = bph + 1;
@@ -207,10 +286,11 @@ fn main(): i64 {
         if (rng_below(s, 2) == 0) { mutate(s, scratch, slen0); }
         var tl = slen0;
         if (rng_below(s, 3) == 0) { tl = rng_below(s, slen0 + 8); }
-        var r3 = tula_open(scratch, tl);
+        var r3 = tula_open(place(guard, scratch, tl), tl);
         if (r3 != 0) {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r3, tl) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            store64(st + 48, load64(st + 48) + consume(r3, st, out, scl));
             var v = tula_verify(r3, pk);
             if (v == TULA_SIG_UNSIGNED) { store64(st + 24, load64(st + 24) + 1); }
             if (v == TULA_SIG_OK)       { store64(st + 32, load64(st + 32) + 1); }
@@ -230,11 +310,12 @@ fn main(): i64 {
     kv("  verify UNSIGNED    : ", load64(st + 24));
     kv("  verify OK          : ", load64(st + 32));
     kv("  verify BAD         : ", load64(st + 40));
+    kv("  unpacked entries   : ", load64(st + 48));
     kv("  elapsed ms         : ", (t1 - t0) / 1000000);
     var fails = load64(st + 16);
     kv("  invariant failures : ", fails);
     if (fails == 0) {
-        sput("RESULT: PASS (no crash, every accepted buffer was sound)\n");
+        sput("RESULT: PASS (no crash or guard-page fault; every accepted buffer was sound)\n");
         return 0;
     }
     sput("RESULT: FAIL (invariant breach)\n");

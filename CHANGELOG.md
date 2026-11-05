@@ -7,6 +7,89 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-04
+
+A P(-1) pass: hardening, optimization and repair. Report:
+[`docs/audit/2026-11-04-audit.md`](docs/audit/2026-11-04-audit.md). No API
+addition and no format change. Every valid input gives the same result as 1.1.1;
+files and dtype outputs are **byte-identical** to 1.1.1's (diffed). Ten defects
+were reproduced on 1.1.1 and fixed. Toolchain and deps unchanged (cyrius 6.7.18,
+sigil 3.13.15).
+
+### Fixed
+
+- **`tula_open_mmap` crashed on a truncated file (High).** A file shorter than its
+  header's total was mapped and passed validation, which checked the header's own
+  length. The first read of the missing tail raised SIGBUS. Both readers now
+  compare the declared total with the file's real size before mapping or
+  allocating, and reject a shorter file.
+- **`tula_open_mmap` leaked a mapping for every file it rejected.** 500 rejected
+  opens left 500 mappings. With Linux's ~65k-map ceiling, and `alloc` itself
+  mapping memory, enough hostile files would make allocation fail. It now unmaps.
+- **`tula_read_file` allocated what the header claimed, not what the file held.**
+  A 64-byte file claiming 256 MiB reserved 256 MiB+ that is never released
+  (8 reads: +4 GiB address space). It now allocates only after the size check, and
+  reads header and body through one `open` (it opened the path twice).
+- **`tula_builder_add` accepted arguments that corrupted or broke the file.** A
+  negative `data_len` moved the next tensor to offset −88, over the manifest. An
+  `ndim` outside 0..8, or a payload over `TULA_READ_MAX_BYTES`, wrote a file
+  tula's own reader rejects. These now return `TULA_ERR_BOUNDS`, `TULA_ERR_NDIM`
+  or `TULA_ERR_TOO_BIG` and leave the builder unchanged.
+- **`tula_builder_finish` / `_signed` crashed when the allocation failed** (any
+  builder over the stdlib's 2 GiB per-allocation cap). They return 0.
+- **NF4 helpers divided by zero for `block <= 0`.** `tula_nf4_blocks`, `_pack` and
+  `_unpack` now return 0 and write nothing.
+- **`tula_entry_payload_ok` broke its own contract.** Shape `[0, -5]` returned 1,
+  although a negative dim must return 0. `[2^30, 2^30, 0]` (an empty tensor)
+  returned 0. Every dim's sign is now checked first, and any zero dim means empty.
+- **`tula_close_mmap(0)` segfaulted.** It is now a no-op.
+- **`tula_serialize` left alignment padding and the reserved signature block
+  unwritten.** Not reachable with the stdlib allocator, which zeroes memory before
+  reuse, but the file bytes depended on it. They are now written as zero.
+- **The reference consumer** (`examples/consumer.cyr`, the v1.0 CI gate) went on
+  after a failed check and then read what the check guarded. It now rejects on
+  each failure, guards the scale and bias tensors with `tula_entry_payload_ok`,
+  and checks rank, dims and dtype before they size anything.
+
+### Changed
+
+- **Faster, same bytes.** These are all measured on the same machine, and outputs
+  are diffed byte-for-byte against 1.1.1.
+  - serialize: 591 → 4,036 MB/s (word copy instead of the stdlib's byte-loop `memcpy`).
+  - `tula_find`: 11.6× on 256 long names (the query is measured once, a longer
+    one is rejected up front, and names are compared a 64-bit word at a time).
+  - NF4 pack: 3.9×. NF4 unpack: 3.0×. Ternary unpack: 2.4×. int8 dequant: 1.2×.
+- **Behaviour at the edges.** These cases used to crash, corrupt or silently
+  succeed; none affects a valid input.
+  - `tula_builder_add` has three more error returns (above).
+  - `tula_builder_finish` / `_signed` can return 0.
+  - The NF4 helpers return 0 for `block <= 0`.
+  - `tula_read_file` and `tula_open_mmap` reject a source they can't size with
+    `lseek`, e.g. a pipe. `mmap` never worked on one.
+  - A file *longer* than its header's total still opens, as before.
+- **Tests and the example write under `build/`**, not fixed `/tmp` names (a
+  planted symlink there is followed by `O_TRUNC`). `make test` creates `build/`.
+- **Fuzz harness**: every buffer under test now ends at a `PROT_NONE` guard page,
+  so an over-read faults instead of passing an arithmetic check. A new phase runs
+  `tula_entry_payload_ok` and then each dtype's unpack on every accepted entry.
+- **Bench** widened (serialize, validate, find, dtype pack/unpack) and switched to
+  µs resolution. Its file now lives in `build/`.
+- **Docs.** All public accessors now have doc comments (`cyrius doc --check`: 8
+  undocumented → 0). `SECURITY.md`, `docs/api.md` and the guide now cover the
+  real-size check, the mmap concurrent-writer caveat, and long-name collisions.
+  The roadmap is reorganized into 1.2.x – 1.x.x milestones.
+
+### Verified
+
+- Suite **105 → 178** assertions in 6 suites (new `builder.tcyr`; `fileio` and
+  `dtype` extended with regression tests and differential tests against the 1.1.1
+  code). Mutations to the new code turn the suites red (one equivalent mutant
+  noted in the report).
+- `make fuzz`: 2,003,000 iterations under the guard page, 40,472 entries unpacked,
+  0 faults, 0 invariant failures.
+- `fmt`, `lint`, `vet` and `deny` clean. `doc --check` 0 undocumented.
+  `make example` PASS. `make dist` OK. `deps --verify` 60/60.
+
 ## [1.1.1] - 2026-11-04
 
 ### Changed

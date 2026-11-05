@@ -96,30 +96,42 @@ fn main(): i64 {
     var buf = tula_builder_finish_signed(b, sk);
     var total = tula_total_len(buf);
 
-    var path = "/tmp/tula_consumer_model.tula";
-    if (tula_write_file(path, buf, total) != total) { fails = fails + 1; }
-    sput("wrote signed model: /tmp/tula_consumer_model.tula\n");
+    var path = "build/tula_consumer_model.tula";
+    if (buf == 0) { sput("FAIL: serialize\n"); return 1; }
+    if (tula_write_file(path, buf, total) != total) { sput("FAIL: write\n"); return 1; }
+    sput("wrote signed model: build/tula_consumer_model.tula\n");
 
     # ================================================================
-    # LOAD as if untrusted (a fresh process reading a foreign file)
+    # LOAD as if untrusted (a fresh process reading a foreign file).
+    # Every check below REJECTS — returns — on failure: nothing after a failed
+    # check may touch the file, because what it guarded is then unproven.
     # ================================================================
     var r = tula_read_file(path);
     if (r == 0) { sput("FAIL: model did not open\n"); return 1; }
-    if (tula_count(r) != 3) { fails = fails + 1; }
+    if (tula_count(r) != 3) { sput("FAIL: tensor count\n"); return 1; }
 
-    # 1. authenticity
-    if (tula_verify(r, pk) != TULA_SIG_OK) { sput("FAIL: signature\n"); fails = fails + 1; }
-    else { sput("signature: OK\n"); }
+    # 1. authenticity — UNSIGNED is as untrusted as BAD
+    if (tula_verify(r, pk) != TULA_SIG_OK) { sput("FAIL: signature\n"); return 1; }
+    sput("signature: OK\n");
 
-    # 2. locate + guard the ternary weight, then unpack + dequant
+    # 2. locate + guard the ternary weight AND its scale sidecar, then unpack +
+    #    dequant. Each tensor read gets its own payload_ok, and its rank and dims
+    #    are checked against what this consumer expects before they size anything.
     var ew = tula_find(r, "layer.w");
     var es = tula_find(r, "layer.w.scale");
-    if (ew == 0) { fails = fails + 1; }
-    if (es == 0) { fails = fails + 1; }
-    if (tula_entry_payload_ok(ew) != 1) { sput("FAIL: payload guard\n"); fails = fails + 1; }
+    if (ew == 0) { sput("FAIL: layer.w missing\n"); return 1; }
+    if (es == 0) { sput("FAIL: layer.w.scale missing\n"); return 1; }
+    if (tula_entry_dtype(ew) != TULA_DT_TERNARY) { sput("FAIL: layer.w dtype\n"); return 1; }
+    if (tula_entry_dtype(es) != TULA_DT_F64) { sput("FAIL: scale dtype\n"); return 1; }
+    if (tula_entry_ndim(ew) != 1) { sput("FAIL: layer.w rank\n"); return 1; }
+    if (tula_entry_ndim(es) != 1) { sput("FAIL: scale rank\n"); return 1; }
+    if (tula_entry_dim(es, 0) != 1) { sput("FAIL: scale is not per-tensor\n"); return 1; }
+    if (tula_entry_payload_ok(ew) != 1) { sput("FAIL: payload guard (weight)\n"); return 1; }
+    if (tula_entry_payload_ok(es) != 1) { sput("FAIL: payload guard (scale)\n"); return 1; }
 
     var gamma2 = load64(tula_entry_data(r, es));
     var wn = tula_entry_dim(ew, 0);
+    if (wn != n) { sput("FAIL: layer.w length\n"); return 1; }
     var got = alloc(wn * 8);
     tula_ternary_unpack(tula_entry_data(r, ew), wn, got);
 
@@ -138,7 +150,11 @@ fn main(): i64 {
 
     # 3. plain f64 bias round-trips bit-exact
     var eb = tula_find(r, "layer.b");
-    if (eb == 0) { fails = fails + 1; }
+    if (eb == 0) { sput("FAIL: layer.b missing\n"); return 1; }
+    if (tula_entry_dtype(eb) != TULA_DT_F64) { sput("FAIL: layer.b dtype\n"); return 1; }
+    if (tula_entry_ndim(eb) != 1) { sput("FAIL: layer.b rank\n"); return 1; }
+    if (tula_entry_dim(eb, 0) != bn) { sput("FAIL: layer.b length\n"); return 1; }
+    if (tula_entry_payload_ok(eb) != 1) { sput("FAIL: payload guard (bias)\n"); return 1; }
     var bp = tula_entry_data(r, eb);
     var okb = 1;
     i = 0;

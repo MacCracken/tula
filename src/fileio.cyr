@@ -2,52 +2,94 @@
 # (heap copy) or mmap it (zero-copy). Uses stdlib io + mmap; portable.
 #
 # tula files are self-describing — the 64-byte header carries the total length
-# (payload_off + payload_len + sig_len), so reads need no stat() call.
+# (payload_off + payload_len + sig_len). Both readers check that length against
+# the file's real size (lseek to the end, so no stat()) BEFORE they allocate or
+# map anything: a header that claims more than the file holds is rejected, so a
+# 64-byte file can no longer reserve gigabytes of address space (heap), and a
+# truncated file can no longer be mapped past its end, where the first touch of
+# the missing tail raised SIGBUS (mmap).
+
+# Read up to len bytes from fd, looping over short reads. Returns the bytes read
+# (fewer than len only at end of file) or a negative errno.
+fn _tula_read_full(fd, buf, len): i64 {
+    var got = 0;
+    while (got < len) {
+        var n = file_read(fd, buf + got, len - got);
+        if (n < 0) { return n; }
+        if (n == 0) { return got; }
+        got = got + n;
+    }
+    return got;
+}
+
+# The shared front half of both readers. Reads the header of an open fd and
+# returns the total length it declares, or -1 to reject: short header, bad magic,
+# a size field negative or over the cap, or a total larger than the file (or a
+# file that cannot be sized — a pipe). Leaves the fd offset unspecified.
+fn _tula_fd_total(fd): i64 {
+    var hdr[64];
+    if (_tula_read_full(fd, &hdr, TULA_HEADER_SIZE) != TULA_HEADER_SIZE) { return 0 - 1; }
+    if (load64(&hdr + 0) != TULA_MAGIC) { return 0 - 1; }
+    var total = tula_hdr_total(&hdr);
+    if (total < TULA_HEADER_SIZE) { return 0 - 1; }
+    if (total > TULA_READ_MAX_BYTES) { return 0 - 1; }
+    var fsz = xlseek(fd, 0, 2);   # SEEK_END: the file's real size
+    if (fsz < 0) { return 0 - 1; }
+    if (total > fsz) { return 0 - 1; }
+    return total;
+}
 
 # Write a serialized tula buffer to `path` (create/truncate). Returns bytes
-# written (== len on success) or a negative io error.
+# written (== len on success) or a negative io error. Not crash-safe: a failure
+# part-way leaves a truncated file, which both readers then reject.
 fn tula_write_file(path, buf, len): i64 {
     return file_write_all(path, buf, len);
 }
 
-# Read a tula file into a fresh heap buffer; validates magic/version. Returns the
-# buffer (reader handle — use tula_* accessors) or 0 on error.
+# Read a tula file into a fresh heap buffer. Returns the buffer (reader handle —
+# use tula_* accessors) or 0 on error. One open: the header and the body come
+# from the same fd. The allocation is sized from the header only after the file
+# is known to hold that many bytes; then tula_open runs full validation.
 fn tula_read_file(path): i64 {
-    var hdr = alloc(TULA_HEADER_SIZE);
-    var n = file_read_all(path, hdr, TULA_HEADER_SIZE);
-    if (n < TULA_HEADER_SIZE) { return 0; }
-    if (load64(hdr + 0) != TULA_MAGIC) { return 0; }
-    # Bomb guard: sanity-check the header-declared total BEFORE allocating.
-    var total = tula_hdr_total(hdr);
-    if (total < TULA_HEADER_SIZE) { return 0; }
-    if (total > TULA_READ_MAX_BYTES) { return 0; }
+    var fd = file_open(path, 0, 0);   # O_RDONLY
+    if (fd < 0) { return 0; }
+    var total = _tula_fd_total(fd);
+    if (total < 0) { file_close(fd); return 0; }
+    if (xlseek(fd, 0, 0) != 0) { file_close(fd); return 0; }   # SEEK_SET
     var buf = alloc(total);
-    if (buf == 0) { return 0; }
-    var got = file_read_all(path, buf, total);
+    if (buf == 0) { file_close(fd); return 0; }
+    var got = _tula_read_full(fd, buf, total);
+    file_close(fd);
     if (got != total) { return 0; }
     return tula_open(buf, total);   # full structural validation
 }
 
 # Zero-copy: mmap a tula file read-only. Returns the mapped buffer (reader
-# handle) or 0. Release with tula_close_mmap when done.
+# handle) or 0. Release with tula_close_mmap when done. The mapping is made only
+# for a file at least as long as its header says, and is unmapped again if
+# validation then fails, so a rejected file leaves nothing mapped.
+#
+# A mapping reflects the file as it is NOW: another process that truncates or
+# rewrites the file after this returns can change validated bytes (or, by
+# truncating, make a later read SIGBUS). Map only files nobody else writes; for
+# anything else use tula_read_file, which takes a private copy.
 fn tula_open_mmap(path): i64 {
     var fd = file_open(path, 0, 0);   # O_RDONLY
     if (fd < 0) { return 0; }
-    var hdr = alloc(TULA_HEADER_SIZE);
-    var n = file_read(fd, hdr, TULA_HEADER_SIZE);
-    if (n < TULA_HEADER_SIZE) { file_close(fd); return 0; }
-    if (load64(hdr + 0) != TULA_MAGIC) { file_close(fd); return 0; }
-    # Bomb guard: sanity-check the header-declared total BEFORE mmap'ing.
-    var total = tula_hdr_total(hdr);
-    if (total < TULA_HEADER_SIZE) { file_close(fd); return 0; }
-    if (total > TULA_READ_MAX_BYTES) { file_close(fd); return 0; }
+    var total = _tula_fd_total(fd);
+    if (total < 0) { file_close(fd); return 0; }
     var addr = mmap_file_ro(fd, total);
     file_close(fd);   # the mapping survives fd close
     if (addr == 0) { return 0; }
-    return tula_open(addr, total);
+    if (tula_open(addr, total) == 0) {
+        cyr_munmap(addr, total);
+        return 0;
+    }
+    return addr;
 }
 
-# Release a buffer obtained from tula_open_mmap.
+# Release a buffer obtained from tula_open_mmap. 0 (a failed open) is a no-op.
 fn tula_close_mmap(r): i64 {
+    if (r == 0) { return 0; }
     return cyr_munmap(r, tula_total_len(r));
 }

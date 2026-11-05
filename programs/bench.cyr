@@ -1,16 +1,23 @@
-# programs/bench.cyr — tula throughput bench (M4): write / read (heap) / mmap on a
-# large synthetic file (100s of tensors, ~100 MB). Reports min latency + MB/s per
-# op over a few rounds. Numbers are transcribed into docs/benchmarks.md.
+# programs/bench.cyr — tula throughput bench (M4, widened in 1.1.2): file I/O on a
+# large synthetic file (write / read heap / mmap), plus the in-memory paths a
+# consumer pays on every load — serialize, validate, find, and the dtype
+# pack/unpack helpers. Each op reports its min latency over BN_ROUNDS rounds
+# (least-noise estimate), in µs, plus a throughput. Numbers are transcribed into
+# docs/benchmarks.md.
 #
 #   cyrius build programs/bench.cyr build/tula_bench && ./build/tula_bench
 
 include "src/lib.cyr"
 
 enum BenchCfg {
-    BN_TENSORS = 200;        # tensor count (<= TULA_BUILDER_MAX)
-    BN_TSIZE   = 524288;     # 512 KiB per tensor -> ~100 MB payload
-    BN_ROUNDS  = 3;          # rounds per op; report the min
-    BN_PAGE    = 4096;
+    BN_TENSORS  = 200;       # tensor count for the big file (<= TULA_BUILDER_MAX)
+    BN_TSIZE    = 524288;    # 512 KiB per tensor -> ~100 MB payload
+    BN_ROUNDS   = 5;         # rounds per op; report the min
+    BN_PAGE     = 4096;
+    BN_FIND_N   = 256;       # tensors in the find bench (TULA_BUILDER_MAX)
+    BN_FIND_REP = 20;        # full sweeps of every name per round
+    BN_VAL_REP  = 2000;      # tula_validate calls per round
+    BN_DT_N     = 1048576;   # elements per dtype op (2^20)
 }
 
 fn sput(s): i64 {
@@ -18,29 +25,62 @@ fn sput(s): i64 {
     return 0;
 }
 
-# "<label> <ms> ms  <mbps> MB/s\n"
-fn report(label, bytes, ns): i64 {
+# "<label> <us> us  <mbps> MB/s\n" — bytes moved in ns.
+fn report_mb(label, bytes, ns): i64 {
     sput(label);
-    fmt_int(ns / 1000000);
-    sput(" ms  ");
-    var mb = bytes / 1000000;
-    var ms = ns / 1000000;
+    fmt_int(ns / 1000);
+    sput(" us  ");
     var mbps = 0;
-    if (ms > 0) { mbps = mb * 1000 / ms; }
+    if (ns > 0) { mbps = bytes * 1000 / ns; }
     fmt_int(mbps);
     sput(" MB/s\n");
     return 0;
 }
 
-# Build a ~100 MB tula buffer: BN_TENSORS f64 tensors of BN_TSIZE bytes each,
-# each seeded with a non-zero pattern (so the file isn't sparse).
-fn build_big(): i64 {
+# "<label> <ns_per_op> ns/op\n" — `ops` operations in ns.
+fn report_op(label, ops, ns): i64 {
+    sput(label);
+    fmt_int(ns / ops);
+    sput(" ns/op\n");
+    return 0;
+}
+
+# "<label> <us> us  <melem> Melem/s\n" — `n` elements in ns.
+fn report_el(label, n, ns): i64 {
+    sput(label);
+    fmt_int(ns / 1000);
+    sput(" us  ");
+    var me = 0;
+    if (ns > 0) { me = n * 1000 / ns; }
+    fmt_int(me);
+    sput(" Melem/s\n");
+    return 0;
+}
+
+fn min_of(cur, round, dt): i64 {
+    if (round == 0) { return dt; }
+    if (dt < cur) { return dt; }
+    return cur;
+}
+
+# Write decimal `v` at `p`; returns the digit count (no NUL).
+fn put_dec(p, v): i64 {
+    if (v == 0) { store8(p, 48); return 1; }
+    var digs = alloc(24);
+    var nd = 0;
+    while (v > 0) { store8(digs + nd, 48 + (v % 10)); v = v / 10; nd = nd + 1; }
+    var j = 0;
+    while (j < nd) { store8(p + j, load8(digs + nd - 1 - j)); j = j + 1; }
+    return nd;
+}
+
+# A builder of BN_TENSORS f64 tensors of BN_TSIZE bytes each, each seeded with a
+# non-zero per-page pattern (so the file isn't sparse). Names "t0".."t199".
+fn build_big_builder(): i64 {
     var b = tula_builder_new();
-    var names = alloc(BN_TENSORS * 8);
     var i = 0;
     while (i < BN_TENSORS) {
         var data = alloc(BN_TSIZE);
-        # touch one word per page so the payload has real (non-zero) content
         var p = 0;
         while (p < BN_TSIZE) {
             store64(data + p, 0x1000000000000000 + i);
@@ -48,26 +88,42 @@ fn build_big(): i64 {
         }
         var shape = alloc(8);
         store64(shape + 0, BN_TSIZE / 8);
-        # a distinct name per tensor: "t" + index packed into the name cstring
         var nm = alloc(16);
         store8(nm + 0, 116);            # 't'
-        store64(nm + 1, 0);
-        var v = i;
-        var k = 1;
-        if (v == 0) { store8(nm + 1, 48); store8(nm + 2, 0); }
-        else {
-            # write decimal digits
-            var digs = alloc(16);
-            var nd = 0;
-            while (v > 0) { store8(digs + nd, 48 + (v % 10)); v = v / 10; nd = nd + 1; }
-            var j = 0;
-            while (j < nd) { store8(nm + 1 + j, load8(digs + nd - 1 - j)); j = j + 1; }
-            store8(nm + 1 + nd, 0);
-        }
+        var nd = put_dec(nm + 1, i);
+        store8(nm + 1 + nd, 0);
         tula_builder_add(b, nm, TULA_DT_F64, shape, 1, data, BN_TSIZE);
         i = i + 1;
     }
-    return tula_builder_finish(b);
+    return b;
+}
+
+# Realistic checkpoint names (long, sharing a 13-byte prefix):
+# "model.layers.<i>.mlp.down_proj.weight". Returns a vec-like array of name ptrs
+# at +0.. and the finished buffer through `out_buf`.
+fn build_find_file(names, out_buf): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 1);
+    var data = alloc(8);
+    store64(data, 1);
+    var pre = "model.layers.";
+    var suf = ".mlp.down_proj.weight";
+    var i = 0;
+    while (i < BN_FIND_N) {
+        var nm = alloc(48);
+        var k = 0;
+        while (load8(pre + k) != 0) { store8(nm + k, load8(pre + k)); k = k + 1; }
+        k = k + put_dec(nm + k, i);
+        var s = 0;
+        while (load8(suf + s) != 0) { store8(nm + k, load8(suf + s)); k = k + 1; s = s + 1; }
+        store8(nm + k, 0);
+        store64(names + i * 8, nm);
+        tula_builder_add(b, nm, TULA_DT_F64, shape, 1, data, 8);
+        i = i + 1;
+    }
+    store64(out_buf, tula_builder_finish(b));
+    return 0;
 }
 
 # Touch one byte per page across the whole buffer; returns the checksum (keeps the
@@ -82,31 +138,54 @@ fn scan(r, total): i64 {
     return sum;
 }
 
+# f64[n] test signal in [-2, 2): a deterministic ramp, every value distinct.
+fn fill_signal(dst, n): i64 {
+    var i = 0;
+    var span = f64_from(n);
+    while (i < n) {
+        var x = f64_div(f64_from((i * 7919) % n), span);         # [0, 1)
+        store64(dst + i * 8, f64_sub(f64_mul(x, f64_from(4)), f64_from(2)));
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
-    sput("building ~100 MB synthetic tula file...\n");
-    var buf = build_big();
+    var chk = 0;
+    sput("building ~100 MB synthetic tula builder...\n");
+    var bb = build_big_builder();
+
+    # ---- serialize (builder -> one contiguous buffer, payload memcpy) ----
+    var zmin = 0;
+    var buf = 0;
+    var round = 0;
+    while (round < BN_ROUNDS) {
+        var tz = now_ns();
+        buf = tula_builder_finish(bb);
+        zmin = min_of(zmin, round, now_ns() - tz);
+        round = round + 1;
+    }
     var total = tula_total_len(buf);
     sput("  tensors : ");
     fmt_int(tula_count(buf));
     sput("\n  bytes   : ");
     fmt_int(total);
     sput("\n");
+    report_mb("serialize    : ", total, zmin);
 
-    var path = "/tmp/tula_bench.tula";
+    var path = "build/tula_bench.tula";
 
     # ---- write ----
     var wmin = 0;
-    var round = 0;
+    round = 0;
     while (round < BN_ROUNDS) {
         var t0 = now_ns();
         tula_write_file(path, buf, total);
-        var dt = now_ns() - t0;
-        if (round == 0) { wmin = dt; }
-        if (dt < wmin) { wmin = dt; }
+        wmin = min_of(wmin, round, now_ns() - t0);
         round = round + 1;
     }
-    report("write        : ", total, wmin);
+    report_mb("write        : ", total, wmin);
 
     # ---- read (heap copy) ----
     var rmin = 0;
@@ -116,11 +195,10 @@ fn main(): i64 {
         var rr = tula_read_file(path);
         var dt2 = now_ns() - t1;
         if (rr == 0) { sput("read FAILED\n"); return 1; }
-        if (round == 0) { rmin = dt2; }
-        if (dt2 < rmin) { rmin = dt2; }
+        rmin = min_of(rmin, round, dt2);
         round = round + 1;
     }
-    report("read (heap)  : ", total, rmin);
+    report_mb("read (heap)  : ", total, rmin);
 
     # ---- mmap open (lazy) ----
     var omin = 0;
@@ -131,27 +209,121 @@ fn main(): i64 {
         var dt3 = now_ns() - t2;
         if (rm == 0) { sput("mmap FAILED\n"); return 1; }
         tula_close_mmap(rm);
-        if (round == 0) { omin = dt3; }
-        if (dt3 < omin) { omin = dt3; }
+        omin = min_of(omin, round, dt3);
         round = round + 1;
     }
-    report("mmap open    : ", total, omin);
+    sput("mmap open    : ");
+    fmt_int(omin / 1000);
+    sput(" us\n");
 
     # ---- mmap scan (fault-in throughput) ----
     var smin = 0;
-    var chk = 0;
     round = 0;
     while (round < BN_ROUNDS) {
         var rm2 = tula_open_mmap(path);
         var t3 = now_ns();
         chk = chk + scan(rm2, total);
-        var dt4 = now_ns() - t3;
+        smin = min_of(smin, round, now_ns() - t3);
         tula_close_mmap(rm2);
-        if (round == 0) { smin = dt4; }
-        if (dt4 < smin) { smin = dt4; }
         round = round + 1;
     }
-    report("mmap scan    : ", total, smin);
+    report_mb("mmap scan    : ", total, smin);
+
+    # ---- validate (the untrusted-input gate; 200 entries) ----
+    var vmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t4 = now_ns();
+        var v = 0;
+        while (v < BN_VAL_REP) { chk = chk + tula_validate(buf, total); v = v + 1; }
+        vmin = min_of(vmin, round, now_ns() - t4);
+        round = round + 1;
+    }
+    report_op("validate     : ", BN_VAL_REP, vmin);
+
+    # ---- find (256 long, shared-prefix names; every name, BN_FIND_REP sweeps) ----
+    var names = alloc(BN_FIND_N * 8);
+    var fbox = alloc(8);
+    build_find_file(names, fbox);
+    var fr = load64(fbox);
+    var fmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t5 = now_ns();
+        var rep = 0;
+        while (rep < BN_FIND_REP) {
+            var q = 0;
+            while (q < BN_FIND_N) {
+                if (tula_find(fr, load64(names + q * 8)) == 0) { sput("find MISSED\n"); return 1; }
+                q = q + 1;
+            }
+            rep = rep + 1;
+        }
+        fmin = min_of(fmin, round, now_ns() - t5);
+        round = round + 1;
+    }
+    report_op("find (n=256) : ", BN_FIND_N * BN_FIND_REP, fmin);
+
+    # ---- dtype helpers on 2^20 elements ----
+    var n = BN_DT_N;
+    var sig = alloc(n * 8);
+    fill_signal(sig, n);
+    var out = alloc(n * 8);
+
+    # NF4 pack (codebook nearest per element) + unpack (dequant)
+    var nib = alloc(tula_nf4_bytes(n));
+    var scl = alloc(tula_nf4_blocks(n, TULA_NF4_BLOCK) * 8);
+    var pmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t6 = now_ns();
+        tula_nf4_pack(sig, n, TULA_NF4_BLOCK, scl, nib);
+        pmin = min_of(pmin, round, now_ns() - t6);
+        round = round + 1;
+    }
+    report_el("nf4 pack     : ", n, pmin);
+    var umin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t7 = now_ns();
+        tula_nf4_unpack(nib, scl, n, TULA_NF4_BLOCK, out);
+        umin = min_of(umin, round, now_ns() - t7);
+        round = round + 1;
+    }
+    report_el("nf4 unpack   : ", n, umin);
+    chk = chk + load64(out + 8 * 12345);
+
+    # ternary unpack (2-bit codes -> i64 trits)
+    var trits = alloc(n * 8);
+    var ti = 0;
+    while (ti < n) { store64(trits + ti * 8, (ti % 3) - 1); ti = ti + 1; }
+    var tpk = alloc(tula_ternary_bytes(n));
+    tula_ternary_pack(trits, n, tpk);
+    var tmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t8 = now_ns();
+        tula_ternary_unpack(tpk, n, out);
+        tmin = min_of(tmin, round, now_ns() - t8);
+        round = round + 1;
+    }
+    report_el("ternary unpk : ", n, tmin);
+    chk = chk + load64(out + 8 * 777);
+
+    # int8 dequant
+    var q8 = alloc(n);
+    var s8 = tula_int8_quant(sig, n, q8);
+    var imin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t9 = now_ns();
+        tula_int8_dequant(q8, n, s8, out);
+        imin = min_of(imin, round, now_ns() - t9);
+        round = round + 1;
+    }
+    report_el("int8 dequant : ", n, imin);
+    chk = chk + load64(out + 8 * 4242);
+
     sput("checksum: ");
     fmt_int(chk);
     sput(" (ignore; anti-DCE)\n");

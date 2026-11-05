@@ -58,7 +58,7 @@ fn main(): i64 {
     var b = tula_builder_new();
     tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, 24);
     var buf = tula_builder_finish(b);                 # unsigned
-    tula_write_file("/tmp/model.tula", buf, tula_total_len(buf));
+    tula_write_file("model.tula", buf, tula_total_len(buf));
     return 0;
 }
 
@@ -77,7 +77,7 @@ before returning a handle; `tula_open`/`tula_validate` do the same for an
 in-memory buffer.
 
 ```cyrius
-var r = tula_read_file("/tmp/model.tula");
+var r = tula_read_file("model.tula");
 if (r == 0) { return 1; }                             # malformed -> rejected
 
 # if signed, check authenticity before trusting the data
@@ -90,7 +90,9 @@ var p = tula_entry_data(r, e);                        # in-bounds, zero-copy
 ```
 
 For large files prefer `tula_open_mmap` (zero-copy; sub-millisecond regardless of
-size) + `tula_close_mmap`. See [benchmarks](../benchmarks.md).
+size) + `tula_close_mmap`. See [benchmarks](../benchmarks.md). A mapping shows the
+file as it is *now*: map only files nobody else is writing. For a file another
+process may truncate or rewrite, use `tula_read_file`, which takes a private copy.
 
 ## Quantized tensors
 

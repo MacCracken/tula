@@ -68,15 +68,23 @@ Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 - `fn tula_builder_new() -> b` — allocate a builder (cap `TULA_BUILDER_MAX = 256`
   tensors).
 - `fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len) -> 0 |
-  TULA_ERR_TOO_MANY` — append a tensor. `name` cstring (≤47 chars, truncated
-  otherwise), `shape` an `i64[ndim]` array, `data`/`data_len` the raw payload
+  TULA_ERR_*` — append a tensor. `name` cstring (≤47 chars, truncated
+  otherwise — two long names can truncate to the same stored name, see
+  `SECURITY.md`), `shape` an `i64[ndim]` array, `data`/`data_len` the raw payload
   bytes (already packed for quantized dtypes). Pointers are borrowed until
-  `finish`.
-- `fn tula_builder_finish(b) -> buf` — serialize to one contiguous **unsigned**
-  buffer. Use `tula_total_len(buf)` for its length.
-- `fn tula_builder_finish_signed(b, sk) -> buf` — serialize and append an Ed25519
-  signature over `[0, sig_off)`. `sk` is a 64-byte secret key (`seed‖pk`, from
-  `ed25519_keypair`).
+  `finish`. Errors, each leaving the builder unchanged: `TULA_ERR_TOO_MANY`
+  (`TULA_BUILDER_MAX` reached), `TULA_ERR_NDIM` (`ndim` outside 0..8),
+  `TULA_ERR_BOUNDS` (`data_len < 0`), `TULA_ERR_TOO_BIG` (the payload would pass
+  `TULA_READ_MAX_BYTES`). *1.1.2: the last three were accepted before and wrote
+  a corrupt or unreadable file.*
+- `fn tula_builder_finish(b) -> buf | 0` — serialize to one contiguous
+  **unsigned** buffer (0 if the allocation fails). Use `tula_total_len(buf)` for
+  its length. Every byte is written (alignment padding is zero), so the same
+  builder always gives the same bytes. The whole file is one allocation, so the
+  stdlib's per-allocation cap (2 GiB) bounds what can be written today.
+- `fn tula_builder_finish_signed(b, sk) -> buf | 0` — serialize and append an
+  Ed25519 signature over `[0, sig_off)`. `sk` is a 64-byte secret key
+  (`seed‖pk`, from `ed25519_keypair`).
 
 *Low-level*: `tula_serialize(b, sig_len)` (0 or 64) underlies both; call the
 `finish` wrappers.
@@ -95,7 +103,8 @@ Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 - `fn tula_entry_name(e) -> cstring` · `tula_entry_dtype(e)` ·
   `tula_entry_ndim(e)` · `tula_entry_dim(e, k)` · `tula_entry_data_len(e)`.
 - `fn tula_entry_data(r, e) -> ptr` — pointer to the tensor's payload bytes.
-- `fn tula_find(r, name) -> e | 0` — first entry with that name.
+- `fn tula_find(r, name) -> e | 0` — first entry with that name (exact match; a
+  query over 47 chars never matches, since no stored name is that long).
 - `fn tula_is_signed(r) -> 0 | 64` — signature **presence** (length), not validity.
 
 The reader is zero-copy over `buf`; accessors return pointers *into* it.
@@ -112,13 +121,19 @@ Crypto is `sigil`'s; keys are the caller's (tula owns no key management).
 
 - `fn tula_write_file(path, buf, len) -> bytes_written | <0` — create/truncate,
   write the serialized buffer.
-- `fn tula_read_file(path) -> r | 0` — read into a fresh heap buffer, bomb-guard
-  the header total, then `tula_open` (full validation).
-- `fn tula_open_mmap(path) -> r | 0` — zero-copy read-only mmap (bomb-guarded +
-  validated). Release with `fn tula_close_mmap(r)`.
+- `fn tula_read_file(path) -> r | 0` — read into a fresh heap buffer, then
+  `tula_open` (full validation). The allocation happens only after the file is
+  known to hold the total its header declares.
+- `fn tula_open_mmap(path) -> r | 0` — zero-copy read-only mmap, validated. A file
+  shorter than its header's total is rejected before mapping, and a mapped file
+  that fails validation is unmapped again. Release with `fn tula_close_mmap(r)`
+  (`tula_close_mmap(0)` is a no-op). The mapping is live: map only files no other
+  process writes (`SECURITY.md`).
 
-tula files are self-describing (the header carries the total length), so reads
-need no `stat()`.
+tula files are self-describing (the header carries the total length). Both
+readers compare it with the file's real size via `lseek(SEEK_END)`, not
+`stat()`, and reject a source that can't be sized (a pipe). A file *longer* than
+its total opens, and the readers take exactly the declared bytes.
 
 ## dtype payload helpers — `src/dtype.cyr`
 
@@ -136,12 +151,14 @@ unpacking a foreign tensor, call `tula_entry_payload_ok(e)` first** (see below).
 - `fn tula_int8_dequant(src_i8, n, scale, dst_f64) -> 0`
 
 **NF4** (4-bit blockwise NormalFloat, QLoRA codebook):
-- `fn tula_nf4_blocks(n, block) -> ceil(n/block)` · `fn tula_nf4_bytes(n) ->
-  ceil(n/2)`
+- `fn tula_nf4_blocks(n, block) -> ceil(n/block)` (0 for `block <= 0`) · `fn
+  tula_nf4_bytes(n) -> ceil(n/2)`
 - `fn tula_nf4_pack(src_f64, n, block, scales_f64, nibbles) -> n_blocks` — writes
   per-block absmax into `scales` (store as sidecar) and 4-bit codes into
   `nibbles`.
-- `fn tula_nf4_unpack(nibbles, scales, n, block, dst_f64) -> n`
+- `fn tula_nf4_unpack(nibbles, scales, n, block, dst_f64) -> n` — reads
+  `tula_nf4_blocks(n, block)` scales. `pack` and `unpack` return 0 and write
+  nothing for `block <= 0`.
 - `fn tula_nf4_get(nibbles, i) -> code 0..15` · `fn tula_nf4_level(i) -> f64` (the
   codebook). `TULA_NF4_BLOCK = 64` (typical block size).
 
@@ -149,7 +166,10 @@ unpacking a foreign tensor, call `tula_entry_payload_ok(e)` first** (see below).
 - `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length.
 - `fn tula_entry_payload_ok(e) -> 1 | 0` — overflow-safe check that an entry's
   `data_len` is large enough for its dtype+shape. **Run it before any unpack on a
-  foreign entry** (a lying `shape` could otherwise drive an over-read).
+  foreign entry** (a lying `shape` could otherwise drive an over-read), and on
+  the entry's `.scale` sidecar. 0 for any negative dim; 1 for an empty tensor (a
+  zero dim), an unknown dtype, or a 0-dim entry (no element count, so no
+  contract).
 
 Double-quant composes: int8-quantize a `"<name>.scale"` tensor and store its own
 `"<name>.scale.scale"` — the same convention, one level down.

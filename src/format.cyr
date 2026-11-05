@@ -9,8 +9,8 @@
 #     +24 manifest_off   (= 64)
 #     +32 payload_off
 #     +40 payload_len
-#     +48 sig_off        (0 = unsigned in M0)
-#     +56 sig_len        (0 = unsigned in M0)
+#     +48 sig_off        (0 = unsigned; else payload_off + payload_len)
+#     +56 sig_len        (0 = unsigned; else 64, an Ed25519 signature)
 #
 #   MANIFEST — tensor_count × ENTRY (144 bytes each), at manifest_off
 #     +0   name[48]      (cstring, null-padded; ≤47 chars)
@@ -20,11 +20,13 @@
 #     +128 data_off      (offset within payload)
 #     +136 data_len      (bytes)
 #
-#   PAYLOAD — raw tensor bytes at payload_off; each tensor 8-byte aligned.
+#   PAYLOAD — raw tensor bytes at payload_off; each tensor 8-byte aligned, the
+#             0..7 padding bytes after it zero.
 #
-# M0 = in-memory serialize/parse round-trip (write→read bit-identical). File
-# I/O (mmap read / write to disk) and the sigil-signed header are the next
-# bites; the format already reserves sig_off/sig_len.
+#   SIGNATURE — optional 64-byte Ed25519 block at sig_off (src/sign.cyr).
+#
+# This module is the in-memory codec: builder -> serialize, and validate ->
+# accessors. File I/O is src/fileio.cyr; signing is src/sign.cyr.
 
 enum TulaDType {
     TULA_DT_F64     = 0;   # raw f64 (IEEE-754 i64 bit patterns)
@@ -68,6 +70,40 @@ fn tula_align8(n): i64 {
     return ((n + 7) / 8) * 8;
 }
 
+# Copy n bytes src -> dst, a 64-bit word at a time with a byte tail. Unaligned
+# word access is fine on every cyrius target (x86_64, aarch64, cx). The stdlib
+# memcpy is a byte loop, which made tula_serialize copy the whole payload one
+# byte at a time. n <= 0 copies nothing.
+fn _tula_copy(dst, src, n): i64 {
+    var i = 0;
+    while (i + 32 <= n) {
+        store64(dst + i, load64(src + i));
+        store64(dst + i + 8, load64(src + i + 8));
+        store64(dst + i + 16, load64(src + i + 16));
+        store64(dst + i + 24, load64(src + i + 24));
+        i = i + 32;
+    }
+    while (i + 8 <= n) {
+        store64(dst + i, load64(src + i));
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    return dst;
+}
+
+# Zero n bytes at dst (n <= 0 writes nothing).
+fn _tula_zero(dst, n): i64 {
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, 0);
+        i = i + 1;
+    }
+    return dst;
+}
+
 # Copy a cstring into a 48-byte name field: truncate to 47, null-pad the rest.
 fn tula_name_write(dst, src): i64 {
     var n = strlen(src);
@@ -84,9 +120,9 @@ fn tula_name_write(dst, src): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.1.1 -> 10101).
+# Packed version int: major*10000 + minor*100 + patch (1.1.2 -> 10102).
 fn tula_version_int(): i64 {
-    return 10101;
+    return 10102;
 }
 
 # ---------------------------------------------------------------------------
@@ -95,6 +131,7 @@ fn tula_version_int(): i64 {
 # builder layout: +0 count, +8 payload_total, then MAX entries of 48-byte meta
 #   (name_ptr, dtype, ndim, shape_ptr, data_ptr, data_len).
 
+# Allocate an empty builder (room for TULA_BUILDER_MAX tensors).
 fn tula_builder_new(): i64 {
     var b = alloc(16 + TULA_BUILDER_MAX * 48);
     store64(b, 0);       # count
@@ -102,10 +139,26 @@ fn tula_builder_new(): i64 {
     return b;
 }
 
-# Returns 0 on success, TULA_ERR_TOO_MANY if the cap is hit.
+# Append a tensor. Returns 0 on success, or (builder unchanged):
+#   TULA_ERR_TOO_MANY — TULA_BUILDER_MAX tensors already added;
+#   TULA_ERR_NDIM     — ndim outside [0, TULA_MAXDIM];
+#   TULA_ERR_BOUNDS   — data_len < 0;
+#   TULA_ERR_TOO_BIG  — the payload would pass TULA_READ_MAX_BYTES.
+# Each rejected case used to be accepted and produce a file tula's own reader
+# rejects (ndim, size) or a corrupt buffer (a negative data_len moved the next
+# tensor's offset backwards over the manifest), so rejecting it loses nothing a
+# caller could have read back. Names over 47 chars are still truncated (frozen
+# v1 behaviour; see SECURITY.md on collisions).
 fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
     var c = load64(b);
     if (c >= TULA_BUILDER_MAX) { return TULA_ERR_TOO_MANY; }
+    if (ndim < 0)              { return TULA_ERR_NDIM; }
+    if (ndim > TULA_MAXDIM)    { return TULA_ERR_NDIM; }
+    if (data_len < 0)          { return TULA_ERR_BOUNDS; }
+    # data_len <= cap first, so the sum below cannot overflow.
+    if (data_len > TULA_READ_MAX_BYTES) { return TULA_ERR_TOO_BIG; }
+    var grown = load64(b + 8) + tula_align8(data_len);
+    if (grown > TULA_READ_MAX_BYTES)    { return TULA_ERR_TOO_BIG; }
     var m = b + 16 + c * 48;
     store64(m + 0, name);
     store64(m + 8, dtype);
@@ -114,13 +167,16 @@ fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
     store64(m + 32, data);
     store64(m + 40, data_len);
     store64(b, c + 1);
-    store64(b + 8, load64(b + 8) + tula_align8(data_len));
+    store64(b + 8, grown);
     return 0;
 }
 
 # Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
 # unsigned file, or 64 to reserve an appended Ed25519 signature block (filled by
-# src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr.
+# src/sign.cyr — this writes the LAYOUT, not the signature). Returns the buf ptr,
+# or 0 if the allocation fails. Every byte is written — the alignment padding
+# after each tensor and the reserved signature block are zeroed — so the output
+# is a pure function of the builder's inputs, whatever the allocator hands back.
 fn tula_serialize(b, sig_len): i64 {
     var count = load64(b);
     var manifest_off = TULA_HEADER_SIZE;
@@ -132,6 +188,7 @@ fn tula_serialize(b, sig_len): i64 {
     if (sig_len > 0) { sig_off = content_len; }
     var total = content_len + sig_len;
     var buf = alloc(total);
+    if (buf == 0) { return 0; }
 
     store64(buf + 0, TULA_MAGIC);
     store64(buf + 8, TULA_VERSION);
@@ -164,10 +221,14 @@ fn tula_serialize(b, sig_len): i64 {
         var dlen = load64(m + 40);
         store64(e + 128, cur);
         store64(e + 136, dlen);
-        memcpy(buf + payload_off + cur, load64(m + 32), dlen);
-        cur = cur + tula_align8(dlen);
+        var dst = buf + payload_off + cur;
+        _tula_copy(dst, load64(m + 32), dlen);
+        var padded = tula_align8(dlen);
+        _tula_zero(dst + dlen, padded - dlen);   # 0..7 padding bytes
+        cur = cur + padded;
         i = i + 1;
     }
+    if (sig_len > 0) { _tula_zero(buf + sig_off, sig_len); }
     return buf;
 }
 
@@ -286,7 +347,9 @@ fn tula_open(buf, len): i64 {
     return buf;
 }
 
+# Tensor count of an opened buffer.
 fn tula_count(r): i64          { return load64(r + 16); }
+# On-disk format version of an opened buffer (TULA_VERSION for v1).
 fn tula_format_version(r): i64 { return load64(r + 8); }
 
 # Pointer to manifest entry i.
@@ -294,10 +357,15 @@ fn tula_entry(r, i): i64 {
     return r + load64(r + 24) + i * TULA_ENTRY_SIZE;
 }
 
-fn tula_entry_name(e): i64     { return e; }              # cstring in place
+# Entry name: a NUL-terminated cstring in place (at most 47 chars).
+fn tula_entry_name(e): i64     { return e; }
+# Entry dtype (a TULA_DT_* value; unknown values are carried through).
 fn tula_entry_dtype(e): i64    { return load64(e + 48); }
+# Entry rank, 0..TULA_MAXDIM.
 fn tula_entry_ndim(e): i64     { return load64(e + 56); }
+# Entry dimension k (0 <= k < ndim). Values are the file's: unvalidated.
 fn tula_entry_dim(e, k): i64   { return load64(e + 64 + k * 8); }
+# Entry payload length in bytes.
 fn tula_entry_data_len(e): i64 { return load64(e + 136); }
 
 # Pointer to the tensor's payload bytes.
@@ -305,19 +373,60 @@ fn tula_entry_data(r, e): i64 {
     return r + load64(r + 32) + load64(e + 128);   # payload_off + data_off
 }
 
-# Find an entry by name; returns the entry ptr or 0.
+# Find an entry by name; returns the entry ptr or 0 (the first match).
+#
+# Same answer as streq over every entry, faster. streq ran strlen on both
+# strings for EVERY entry; here the query is measured once and, since a stored
+# name is at most TULA_NAME_MAX bytes, a longer query returns 0 up front (it
+# could never have matched). The query is copied into a zero-padded 48-byte
+# word buffer and each entry's name field is compared a 64-bit word at a time
+# over bytes [0, qlen] — the query's bytes plus the entry's terminating NUL.
+# Bytes after the entry's NUL are never compared, and no read leaves the
+# 48-byte field.
 fn tula_find(r, name): i64 {
+    var qlen = 0;
+    while (qlen <= TULA_NAME_MAX) {
+        if (load8(name + qlen) == 0) { break; }
+        qlen = qlen + 1;
+    }
+    if (qlen > TULA_NAME_MAX) { return 0; }
+
+    var q[48];
+    var w = 0;
+    while (w < 6) { store64(&q + w * 8, 0); w = w + 1; }
+    var j = 0;
+    while (j < qlen) { store8(&q + j, load8(name + j)); j = j + 1; }
+
+    var cmp = qlen + 1;                 # bytes that must match, incl. the NUL
+    var nfull = cmp / 8;                # whole words
+    var rem = cmp % 8;                  # bytes in the last, partial word
+    var mask = 0;
+    var qtail = 0;
+    if (rem > 0) {
+        mask = (1 << (rem * 8)) - 1;
+        qtail = load64(&q + nfull * 8) & mask;   # nfull <= 5 here: inside q
+    }
+
     var c = tula_count(r);
+    var e = r + load64(r + 24);
     var i = 0;
     while (i < c) {
-        var e = tula_entry(r, i);
-        if (streq(tula_entry_name(e), name)) { return e; }
+        var k = 0;
+        while (k < nfull) {
+            if (load64(e + k * 8) != load64(&q + k * 8)) { break; }
+            k = k + 1;
+        }
+        if (k == nfull) {
+            if (rem == 0) { return e; }
+            if ((load64(e + nfull * 8) & mask) == qtail) { return e; }
+        }
+        e = e + TULA_ENTRY_SIZE;
         i = i + 1;
     }
     return 0;
 }
 
-# Whether the file carries a signature: 0 = unsigned, else the signature length
+# Signature presence of an opened buffer: 0 = unsigned, else the signature length
 # in bytes (64 for Ed25519). This is a PRESENCE check only — cryptographic
 # verification is tula_verify(r, pk) in src/sign.cyr.
 fn tula_is_signed(r): i64 {

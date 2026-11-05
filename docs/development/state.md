@@ -23,10 +23,22 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.1.1** (`tula_version_int()` returns `10101`). 1.0.1–1.1.1 are
-toolchain/dep realigns with no API or format change (see `CHANGELOG.md`). Post-1.0 work
+VERSION is **1.1.2** (`tula_version_int()` returns `10102`). 1.0.1–1.1.1 are
+toolchain/dep realigns. **1.1.2 is the P(-1) pass**
+([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
+truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
+with byte-identical output, and no API or format change. Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
+
+## Tests, fuzz, gates (1.1.2)
+
+**178 assertions** across 6 suites, all green: `builder.tcyr` 38, `dtype.tcyr` 50,
+`fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22, `sign.tcyr` 8. `dtype`
+and `builder` include differential tests against the 1.1.1 implementations.
+`make fuzz`: 2,003,000 iterations with every buffer ending at a `PROT_NONE` guard
+page, plus a payload-guard + unpack phase (40,472 entries), 0 faults. `fmt` /
+`lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`: 0 undocumented.
 
 ## Toolchain
 
@@ -53,8 +65,9 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 - `programs/smoke.cyr` → `build/tula_smoke` (link-check).
 - `programs/fuzz.cyr` → `build/tula_fuzz` (`make fuzz`) + `programs/bench.cyr` →
-  `build/tula_bench` (`make bench`) + `examples/consumer.cyr` →
-  `build/tula_consumer` (`make example`, a CI gate).
+  `build/tula_bench` (`make bench`; writes `build/tula_bench.tula`) +
+  `examples/consumer.cyr` → `build/tula_consumer` (`make example`, a CI gate).
+  Tests and the example write their files under `build/`.
 - `dist/tula.cyr` — the distlib bundle consumers pull via `[deps.tula]`
   (regenerate with `make dist`; leaves `ed25519_*` unresolved — consumer supplies
   sigil, the standard consumer-bundle pattern). `cyrius.lock` is gitignored (CI
@@ -63,12 +76,8 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-**1.0.0 is cut at the file level** — VERSION `1.0.0`, CHANGELOG `[1.0.0]`,
-`tula_version_int()` → `10000`, docs rolled, all criteria checked. **The only
-step left is the maintainer's git action** (Claude does not run git): tag `1.0.0`
-(the `release.yml` workflow fires on the tag) after confirming the `sigil` tag
-(3.9.9) exists on GitHub for CI/release resolution.
-
-Post-1.0, work accretes under `[Unreleased]` and is additive-only. A future bite
-could round-trip a real attn11 checkpoint through `tula_*_file` once attn11's
-checkpoint reader lands.
+**1.2.0 — real checkpoints** ([roadmap](roadmap.md)): a sized builder (real models
+pass 256 tensors), a checked add that refuses name collisions, a strict validator
+(overlap / duplicates / shape-vs-size), a signature-required verify, and a
+quant-sidecar check — all additive. 1.3.0 takes long names and F32/F16/BF16; 1.4.0
+the streaming writer for files over 2 GiB.

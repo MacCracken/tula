@@ -1,0 +1,257 @@
+# tests/tcyr/builder.tcyr — the writer contract and name lookup (1.1.2 P(-1)).
+# tula_builder_add refuses what tula's own reader would reject (or what used to
+# corrupt the buffer), serialize writes every byte (zeroed padding, same bytes
+# every time), a failed allocation returns 0 instead of crashing, and the
+# word-at-a-time tula_find answers exactly as the streq loop it replaced.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn one_shape(v): i64 {
+    var s = alloc(8);
+    store64(s, v);
+    return s;
+}
+
+fn bytes_eq(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ---- builder_add argument checks ----------------------------------------
+
+fn test_add_rejects() {
+    var data = alloc(16);
+    var sh = alloc(72);
+    var z = 0;
+    while (z < 9) { store64(sh + z * 8, 1); z = z + 1; }
+    var b = tula_builder_new();
+    assert_eq(tula_builder_add(b, "a", TULA_DT_F64, sh, 9, data, 8), TULA_ERR_NDIM, "ndim 9 -> NDIM");
+    assert_eq(tula_builder_add(b, "a", TULA_DT_F64, sh, 0 - 1, data, 8), TULA_ERR_NDIM, "ndim -1 -> NDIM");
+    assert_eq(tula_builder_add(b, "a", TULA_DT_F64, sh, 1, data, 0 - 1), TULA_ERR_BOUNDS, "data_len -1 -> BOUNDS");
+    var over = TULA_READ_MAX_BYTES + 1;
+    assert_eq(tula_builder_add(b, "a", TULA_DT_F64, sh, 1, data, over), TULA_ERR_TOO_BIG, "data_len > cap -> TOO_BIG");
+    assert_eq(load64(b), 0, "rejected adds leave the count at 0");
+    assert_eq(load64(b + 8), 0, "rejected adds leave the payload total at 0");
+    assert_eq(tula_builder_add(b, "eight", TULA_DT_F64, sh, 8, data, 8), 0, "ndim 8 accepted");
+    assert_eq(tula_builder_add(b, "zero", TULA_DT_F64, sh, 0, data, 8), 0, "ndim 0 accepted");
+    assert_eq(tula_builder_add(b, "empty", TULA_DT_F64, sh, 1, data, 0), 0, "data_len 0 accepted");
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_validate(buf, tula_total_len(buf)), TULA_OK, "builder output validates");
+    assert_eq(tula_count(buf), 3, "only the accepted tensors are written");
+    return 0;
+}
+
+fn test_cumulative_cap() {
+    var data = alloc(8);
+    var sh = one_shape(1);
+    var b = tula_builder_new();
+    var half = TULA_READ_MAX_BYTES / 2 + 8;
+    assert_eq(tula_builder_add(b, "a", TULA_DT_F64, sh, 1, data, half), 0, "one half-cap tensor accepted");
+    var rc2 = tula_builder_add(b, "b", TULA_DT_F64, sh, 1, data, half);
+    assert_eq(rc2, TULA_ERR_TOO_BIG, "cumulative payload > cap -> TOO_BIG");
+    assert_eq(load64(b), 1, "the refused add leaves the count at 1");
+    # not finished: this builder describes half a TiB
+    return 0;
+}
+
+fn test_too_many() {
+    var data = alloc(8);
+    var sh = one_shape(1);
+    var b = tula_builder_new();
+    var i = 0;
+    var bad = 0;
+    while (i < TULA_BUILDER_MAX) {
+        if (tula_builder_add(b, "t", TULA_DT_F64, sh, 1, data, 8) != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "TULA_BUILDER_MAX adds accepted");
+    assert_eq(tula_builder_add(b, "t", TULA_DT_F64, sh, 1, data, 8), TULA_ERR_TOO_MANY, "one more -> TOO_MANY");
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_count(buf), TULA_BUILDER_MAX, "a full builder serializes every tensor");
+    assert_eq(tula_validate(buf, tula_total_len(buf)), TULA_OK, "a full builder's output validates");
+    return 0;
+}
+
+# ---- serialize writes every byte ------------------------------------------
+
+fn build_odd(b): i64 {
+    # 5, 1 and 13 bytes: padding 3, 7 and 3
+    var d5 = alloc(5);
+    var d1 = alloc(1);
+    var d13 = alloc(13);
+    var i = 0;
+    while (i < 5) { store8(d5 + i, 0xA5); i = i + 1; }
+    store8(d1, 0x5A);
+    i = 0;
+    while (i < 13) { store8(d13 + i, 0xC3); i = i + 1; }
+    tula_builder_add(b, "five", TULA_DT_INT8, one_shape(5), 1, d5, 5);
+    tula_builder_add(b, "one", TULA_DT_INT8, one_shape(1), 1, d1, 1);
+    tula_builder_add(b, "thirteen", TULA_DT_INT8, one_shape(13), 1, d13, 13);
+    return 0;
+}
+
+fn test_padding_and_determinism() {
+    var b = tula_builder_new();
+    build_odd(b);
+    var buf1 = tula_builder_finish(b);
+    var buf2 = tula_builder_finish(b);
+    var len = tula_total_len(buf1);
+    assert_eq(len, tula_total_len(buf2), "same builder -> same length");
+    assert(bytes_eq(buf1, buf2, len), "same builder -> same bytes");
+    var po = load64(buf1 + 32);
+    var zeros = 1;
+    if (load8(buf1 + po + 5) != 0) { zeros = 0; }
+    if (load8(buf1 + po + 7) != 0) { zeros = 0; }
+    if (load8(buf1 + po + 9) != 0) { zeros = 0; }
+    if (load8(buf1 + po + 15) != 0) { zeros = 0; }
+    if (load8(buf1 + po + 29) != 0) { zeros = 0; }
+    if (load8(buf1 + po + 31) != 0) { zeros = 0; }
+    assert(zeros, "the padding after each tensor is zero");
+    assert_eq(load8(buf1 + po + 8), 0x5A, "second tensor starts on the next 8-byte boundary");
+    assert_eq(load8(buf1 + po + 16 + 12), 0xC3, "third tensor's last byte in place");
+    return 0;
+}
+
+fn test_signed_deterministic() {
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, 7 * i + 3); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var b = tula_builder_new();
+    build_odd(b);
+    var s1 = tula_builder_finish_signed(b, sk);
+    var s2 = tula_builder_finish_signed(b, sk);
+    var len = tula_total_len(s1);
+    assert(bytes_eq(s1, s2, len), "signed output is deterministic (Ed25519 is)");
+    assert_eq(tula_verify(tula_open(s1, len), pk), TULA_SIG_OK, "signed output verifies");
+    return 0;
+}
+
+fn test_finish_alloc_failure() {
+    # Under tula's cap but over the stdlib allocator's per-call ceiling: the add
+    # is accepted, and serialize's allocation fails.
+    var data = alloc(8);
+    var b = tula_builder_new();
+    var big = ALLOC_MAX + 8;
+    var rc1 = tula_builder_add(b, "big", TULA_DT_F64, one_shape(1), 1, data, big);
+    assert_eq(rc1, 0, "an over-ALLOC_MAX tensor is accepted by add");
+    assert_eq(tula_builder_finish(b), 0, "allocation failure -> finish returns 0 (no crash)");
+    var sk = alloc(64);
+    assert_eq(tula_builder_finish_signed(b, sk), 0, "allocation failure -> finish_signed returns 0");
+    return 0;
+}
+
+# ---- tula_find == the streq loop it replaced -------------------------------
+
+# 1.1.1's tula_find, kept as the reference.
+fn ref_find(r, name): i64 {
+    var c = tula_count(r);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        if (streq(tula_entry_name(e), name)) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_find_matches_reference() {
+    var names = alloc(32 * 8);
+    var nn = 0;
+    store64(names + nn * 8, ""); nn = nn + 1;
+    store64(names + nn * 8, "a"); nn = nn + 1;
+    store64(names + nn * 8, "abc"); nn = nn + 1;
+    store64(names + nn * 8, "abcd"); nn = nn + 1;
+    store64(names + nn * 8, "abcdefg"); nn = nn + 1;                  # 7
+    store64(names + nn * 8, "abcdefgh"); nn = nn + 1;                 # 8
+    store64(names + nn * 8, "abcdefghi"); nn = nn + 1;                # 9
+    store64(names + nn * 8, "abcdefghijklmno"); nn = nn + 1;          # 15
+    store64(names + nn * 8, "abcdefghijklmnop"); nn = nn + 1;         # 16
+    store64(names + nn * 8, "model.layers.0.self_attn.q_proj.weight"); nn = nn + 1;
+    store64(names + nn * 8, "model.layers.0.self_attn.k_proj.weight"); nn = nn + 1;
+    store64(names + nn * 8, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK"); nn = nn + 1;   # 47
+    store64(names + nn * 8, "abc"); nn = nn + 1;                      # duplicate: first wins
+    var b = tula_builder_new();
+    var data = alloc(8);
+    var k = 0;
+    while (k < nn) {
+        tula_builder_add(b, load64(names + k * 8), TULA_DT_F64, one_shape(1), 1, data, 8);
+        k = k + 1;
+    }
+    # a 48-char name is stored truncated to its first 47
+    tula_builder_add(b, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL", TULA_DT_F64, one_shape(1), 1, data, 8);
+    var buf = tula_builder_finish(b);
+    var r = tula_open(buf, tula_total_len(buf));
+    assert(r != 0, "find fixture opens");
+
+    var qs = alloc(48 * 8);
+    var nq = 0;
+    k = 0;
+    while (k < nn) { store64(qs + nq * 8, load64(names + k * 8)); nq = nq + 1; k = k + 1; }
+    store64(qs + nq * 8, "ab"); nq = nq + 1;                           # prefix of stored names
+    store64(qs + nq * 8, "abcde"); nq = nq + 1;
+    store64(qs + nq * 8, "abcdefghij"); nq = nq + 1;                   # one past a stored name
+    store64(qs + nq * 8, "abcdefghijklmnopq"); nq = nq + 1;
+    store64(qs + nq * 8, "model.layers.0.self_attn.v_proj.weight"); nq = nq + 1;   # absent
+    store64(qs + nq * 8, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL"); nq = nq + 1;   # 48: never stored as such
+    store64(qs + nq * 8, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"); nq = nq + 1;
+    store64(qs + nq * 8, "b"); nq = nq + 1;
+    var agree = 0;
+    var q = 0;
+    while (q < nq) {
+        var qn = load64(qs + q * 8);
+        if (tula_find(r, qn) == ref_find(r, qn)) { agree = agree + 1; }
+        q = q + 1;
+    }
+    assert_eq(agree, nq, "tula_find agrees with the streq reference on every query");
+    assert(tula_find(r, "abc") == tula_entry(r, 2), "duplicate name -> the first entry");
+    assert(tula_find(r, "") == tula_entry(r, 0), "empty name found");
+    assert_eq(tula_find(r, "ab"), 0, "a prefix is not a match");
+    assert_eq(tula_find(r, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL"), 0, "a 48-char query never matches");
+    return 0;
+}
+
+fn test_find_ignores_bytes_after_nul() {
+    # A foreign writer need not zero the name field after the NUL; the validator
+    # only requires the NUL. Lookup must ignore what follows it.
+    var b = tula_builder_new();
+    var data = alloc(8);
+    tula_builder_add(b, "a", TULA_DT_F64, one_shape(1), 1, data, 8);
+    tula_builder_add(b, "abcdefgh", TULA_DT_F64, one_shape(1), 1, data, 8);
+    var buf = tula_builder_finish(b);
+    var e0 = buf + 64;
+    var e1 = buf + 64 + TULA_ENTRY_SIZE;
+    store8(e0 + 2, 90);     # "a\0Z..."
+    store8(e0 + 7, 90);
+    store8(e0 + 40, 90);
+    store8(e1 + 9, 90);     # "abcdefgh\0Z..."
+    store8(e1 + 15, 90);
+    var r = tula_open(buf, tula_total_len(buf));
+    assert(r != 0, "garbage after the NUL still validates");
+    assert(tula_find(r, "a") == e0, "find ignores bytes after a 1-char name's NUL");
+    assert(tula_find(r, "abcdefgh") == e1, "find ignores bytes after an 8-char name's NUL");
+    assert(tula_find(r, "a") == ref_find(r, "a"), "... as the reference does");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_add_rejects();
+    test_cumulative_cap();
+    test_too_many();
+    test_padding_and_determinism();
+    test_signed_deterministic();
+    test_finish_alloc_failure();
+    test_find_matches_reference();
+    test_find_ignores_bytes_after_nul();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

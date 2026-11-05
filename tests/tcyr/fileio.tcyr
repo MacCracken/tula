@@ -1,4 +1,6 @@
-# tests/tcyr/fileio.tcyr — tula file I/O (M1): write/read/mmap round-trips.
+# tests/tcyr/fileio.tcyr — tula file I/O (M1): write/read/mmap round-trips, and
+# (1.1.2) both readers checking the header's length against the real file size.
+# Files go under build/ (gitignored; `make test` creates it), not fixed /tmp names.
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -23,7 +25,7 @@ fn test_write_read_roundtrip() {
     var buf = tula_builder_finish(b);
     var total = tula_total_len(buf);
 
-    var path = "/tmp/tula_m1_unsigned.tula";
+    var path = "build/test_fileio_unsigned.tula";
     assert_eq(tula_write_file(path, buf, total), total, "wrote full buffer");
 
     var r = tula_read_file(path);
@@ -54,7 +56,7 @@ fn test_signed_file() {
     var buf = tula_builder_finish_signed(b, sk);
     var total = tula_total_len(buf);
 
-    var path = "/tmp/tula_m1_signed.tula";
+    var path = "build/test_fileio_signed.tula";
     assert_eq(tula_write_file(path, buf, total), total, "wrote signed file");
     var r = tula_read_file(path);
     assert(r != 0, "signed file opens");
@@ -73,7 +75,7 @@ fn test_mmap_read() {
     tula_builder_add(b, "m", TULA_DT_F64, shape, 1, data, 16);
     var buf = tula_builder_finish(b);
     var total = tula_total_len(buf);
-    var path = "/tmp/tula_m1_mmap.tula";
+    var path = "build/test_fileio_mmap.tula";
     tula_write_file(path, buf, total);
 
     var r = tula_open_mmap(path);
@@ -88,7 +90,125 @@ fn test_mmap_read() {
 }
 
 fn test_missing_file() {
-    assert_eq(tula_read_file("/tmp/tula_does_not_exist_xyz123.tula"), 0, "missing file -> 0");
+    assert_eq(tula_read_file("build/test_fileio_does_not_exist.tula"), 0, "missing file -> 0");
+    return 0;
+}
+
+# A 32 KiB-payload file, so a truncation leaves whole pages missing past EOF.
+fn build_big_payload(): i64 {
+    var n = 4096;
+    var shape = alloc(8);
+    store64(shape, n);
+    var data = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(data + i * 8, i + 1); i = i + 1; }
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, n * 8);
+    return tula_builder_finish(b);
+}
+
+fn test_truncated_file_rejected() {
+    var buf = build_big_payload();
+    var path = "build/test_fileio_truncated.tula";
+    tula_write_file(path, buf, 300);   # header + manifest + a little payload
+    # Before 1.1.2 the mmap reader accepted this (validation checked the header's
+    # own length) and the first payload read past EOF raised SIGBUS.
+    assert_eq(tula_open_mmap(path), 0, "truncated file -> mmap 0 (no SIGBUS)");
+    assert_eq(tula_read_file(path), 0, "truncated file -> heap read 0");
+    return 0;
+}
+
+fn test_header_overclaims_rejected() {
+    var h = alloc(64);
+    var z = 0;
+    while (z < 8) { store64(h + z * 8, 0); z = z + 1; }
+    store64(h + 0, TULA_MAGIC);
+    store64(h + 8, TULA_VERSION);
+    store64(h + 24, 64);
+    store64(h + 32, 64);
+    store64(h + 40, 0x10000000);       # claims 256 MiB of payload; the file is 64 bytes
+    var path = "build/test_fileio_overclaim.tula";
+    tula_write_file(path, h, 64);
+    var before = alloc_used();
+    assert_eq(tula_read_file(path), 0, "64-byte file claiming 256 MiB -> heap read 0");
+    assert(alloc_used() - before < 4096, "... and nothing sized from the claim was allocated");
+    assert_eq(tula_open_mmap(path), 0, "64-byte file claiming 256 MiB -> mmap 0");
+    return 0;
+}
+
+fn test_trailing_bytes_still_open() {
+    # A file longer than its header's total still opens (readers take exactly the
+    # declared total), as it did before 1.1.2.
+    var shape = alloc(8);
+    store64(shape, 2);
+    var data = alloc(16);
+    store64(data, 5);
+    store64(data + 8, 6);
+    var b = tula_builder_new();
+    tula_builder_add(b, "t", TULA_DT_F64, shape, 1, data, 16);
+    var buf = tula_builder_finish(b);
+    var total = tula_total_len(buf);
+    var big = alloc(total + 100);
+    var i = 0;
+    while (i < total) { store8(big + i, load8(buf + i)); i = i + 1; }
+    while (i < total + 100) { store8(big + i, 0x77); i = i + 1; }
+    var path = "build/test_fileio_trailing.tula";
+    tula_write_file(path, big, total + 100);
+    var r = tula_read_file(path);
+    assert(r != 0, "trailing bytes -> heap read still opens");
+    assert_eq(load64(tula_entry_data(r, tula_entry(r, 0)) + 8), 6, "... with the right data");
+    var m = tula_open_mmap(path);
+    assert(m != 0, "trailing bytes -> mmap still opens");
+    tula_close_mmap(m);
+    return 0;
+}
+
+# Live mappings of this process, or -1 when /proc is not readable.
+fn maps_count(): i64 {
+    var cap = 1048576;
+    var buf = alloc(cap);
+    var n = file_read_all("/proc/self/maps", buf, cap);
+    if (n <= 0) { return 0 - 1; }
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(buf + i) == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn test_failed_mmap_unmaps() {
+    var shape = alloc(8);
+    store64(shape, 2);
+    var data = alloc(16);
+    var b = tula_builder_new();
+    tula_builder_add(b, "v", TULA_DT_F64, shape, 1, data, 16);
+    var buf = tula_builder_finish(b);
+    var total = tula_total_len(buf);
+    store64(buf + 8, 7);              # bad version: passes the size checks, fails validation
+    var path = "build/test_fileio_badversion.tula";
+    tula_write_file(path, buf, total);
+    var m0 = maps_count();
+    var k = 0;
+    var opened = 0;
+    while (k < 200) {
+        if (tula_open_mmap(path) != 0) { opened = opened + 1; }
+        k = k + 1;
+    }
+    var m1 = maps_count();
+    assert_eq(opened, 0, "bad-version file never opens via mmap");
+    if (m0 >= 0) {
+        assert_eq(m1, m0, "200 rejected mmap opens leave no mapping behind");
+    }
+    return 0;
+}
+
+fn test_close_and_dirs() {
+    assert_eq(tula_close_mmap(0), 0, "tula_close_mmap(0) is a no-op");
+    assert_eq(tula_read_file("build"), 0, "a directory -> heap read 0");
+    assert_eq(tula_open_mmap("build"), 0, "a directory -> mmap 0");
+    assert_eq(tula_open_mmap("build/test_fileio_does_not_exist.tula"), 0, "missing file -> mmap 0");
     return 0;
 }
 
@@ -98,6 +218,11 @@ fn main(): i64 {
     test_signed_file();
     test_mmap_read();
     test_missing_file();
+    test_truncated_file_rejected();
+    test_header_overclaims_rejected();
+    test_trailing_bytes_still_open();
+    test_failed_mmap_unmaps();
+    test_close_and_dirs();
     return assert_summary();
 }
 
