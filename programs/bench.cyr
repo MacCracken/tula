@@ -241,6 +241,18 @@ fn main(): i64 {
     }
     report_op("validate     : ", BN_VAL_REP, vmin);
 
+    # ---- validate strict (1.2.0; 200 entries: per-entry rules + heapsort of names) ----
+    var vsmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t4s = now_ns();
+        var vs = 0;
+        while (vs < BN_VAL_REP) { chk = chk + tula_validate_strict(buf, total); vs = vs + 1; }
+        vsmin = min_of(vsmin, round, now_ns() - t4s);
+        round = round + 1;
+    }
+    report_op("strict (200) : ", BN_VAL_REP, vsmin);
+
     # ---- find (256 long, shared-prefix names; every name, BN_FIND_REP sweeps) ----
     var names = alloc(BN_FIND_N * 8);
     var fbox = alloc(8);
@@ -263,6 +275,51 @@ fn main(): i64 {
         round = round + 1;
     }
     report_op("find (n=256) : ", BN_FIND_N * BN_FIND_REP, fmin);
+
+    # ---- strict on the 256 long, shared-prefix names (the sort's worst-ish case) ----
+    var flen = tula_total_len(fr);
+    var fsmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var t5s = now_ns();
+        var fs = 0;
+        while (fs < BN_VAL_REP) { chk = chk + tula_validate_strict(fr, flen); fs = fs + 1; }
+        fsmin = min_of(fsmin, round, now_ns() - t5s);
+        round = round + 1;
+    }
+    report_op("strict (256) : ", BN_VAL_REP, fsmin);
+
+    # ---- builder add: plain vs checked (1.2.0; name index lookup), 256 adds ----
+    var shape1 = alloc(8);
+    store64(shape1, 1);
+    var d1 = alloc(8);
+    var amin = 0;
+    var cmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var ba = tula_builder_new();
+        var t5a = now_ns();
+        var qa = 0;
+        while (qa < BN_FIND_N) {
+            tula_builder_add(ba, load64(names + qa * 8), TULA_DT_F64, shape1, 1, d1, 8);
+            qa = qa + 1;
+        }
+        amin = min_of(amin, round, now_ns() - t5a);
+        var bc = tula_builder_new();
+        var t5c = now_ns();
+        var qc = 0;
+        while (qc < BN_FIND_N) {
+            if (tula_builder_add_checked(bc, load64(names + qc * 8), TULA_DT_F64, shape1, 1, d1, 8) != 0) {
+                sput("checked add FAILED\n");
+                return 1;
+            }
+            qc = qc + 1;
+        }
+        cmin = min_of(cmin, round, now_ns() - t5c);
+        round = round + 1;
+    }
+    report_op("add (plain)  : ", BN_FIND_N, amin);
+    report_op("add (checked): ", BN_FIND_N, cmin);
 
     # ---- dtype helpers on 2^20 elements ----
     var n = BN_DT_N;

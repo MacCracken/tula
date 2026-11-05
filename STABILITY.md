@@ -37,8 +37,10 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
 These may change in a MINOR release without a major bump:
 
 - **Internal helpers** not listed in `docs/api.md` — e.g. `tula_align8`,
-  `tula_name_write`, `tula_serialize`, `tula_hdr_total`, `tula_nf4_nearest`.
-  Treat them as private.
+  `tula_name_write`, `tula_serialize`, `tula_hdr_total`, `tula_nf4_nearest`, and
+  every `_tula_*` function. Treat them as private, together with the builder's
+  in-memory layout and the internal tuning constants (`TULA_BHDR_SIZE`,
+  `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`).
 - **Benchmark numbers** and the fuzz/bench harness internals.
 - **The exact `TULA_ERR_*` returned** for a given malformed input may be refined
   to a more specific code (the *set* of codes only grows; a given input keeps

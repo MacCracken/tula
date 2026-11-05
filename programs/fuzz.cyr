@@ -8,6 +8,12 @@
 #   3. (1.1.2) the consumer discipline holds: for every accepted entry that
 #      tula_entry_payload_ok passes, the dtype's unpack helper reads only bytes
 #      inside the buffer.
+#   4. (1.2.0) tula_validate_strict never accepts what it shouldn't: on every
+#      buffer tula_open accepts it runs too, and when it says TULA_OK a brute-force
+#      check must agree — exact length, every entry's data_len equal to its
+#      dtype's packed length, no two names equal. Phase E feeds it a 40-tensor
+#      canonical file (past the 32-tensor pairwise threshold, so the heapsort
+#      duplicate check runs) with duplicate names injected.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -25,10 +31,12 @@ enum FuzzCfg {
     FZ_MUT_ITERS    = 1000000;   # structured mutation of a valid buffer
     FZ_RAND_ITERS   = 1000000;   # pure random bytes
     FZ_SIGNED_ITERS = 3000;      # mutate a signed buffer + tula_verify (expensive)
-    FZ_MAXBUF       = 4096;
-    FZ_GUARD_SPAN   = 8192;      # readable bytes before the guard (>= FZ_MAXBUF + 64)
-    FZ_OUT_ELEMS    = 16640;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
-    FZ_SCALES       = 512;       # f64 block scales for nf4 unpack (>= FZ_OUT_ELEMS / 64)
+    FZ_STRICT_ITERS = 300000;    # phase E: a 40-tensor canonical file, names duplicated
+    FZ_STRICT_N     = 40;
+    FZ_MAXBUF       = 8192;
+    FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
+    FZ_OUT_ELEMS    = 33024;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
+    FZ_SCALES       = 1024;      # f64 block scales for nf4 unpack (>= FZ_OUT_ELEMS / 64)
 }
 
 # ---- output helpers -------------------------------------------------------
@@ -43,12 +51,22 @@ fn kv(label, n): i64 {
     return 0;
 }
 
-# ---- LCG PRNG (Knuth/PCG constants; i64 multiply wraps mod 2^64) -----------
+# ---- PRNG: an LCG state (Knuth/PCG constants; i64 multiply wraps mod 2^64)
+# whose outputs pass through the splitmix64 finalizer. Until 1.2.0 the raw state
+# was returned, and a power-of-two LCG's low bits have tiny periods (bit k
+# repeats every 2^(k+1) draws), so every `rng_below(s, small)` choice — mutation
+# kind, offset, value class — followed a short fixed pattern. Mixing spreads
+# the high bits' quality into every bit.
+fn srl(x, k): i64 {
+    return (x >> k) & ((1 << (64 - k)) - 1);   # logical shift right (>> is arithmetic)
+}
 fn rng_next(s): i64 {
     var x = load64(s);
     x = x * 6364136223846793005 + 1442695040888963407;
     store64(s, x);
-    return x;
+    var z = (x ^ srl(x, 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ srl(z, 27)) * 0x94D049BB133111EB;
+    return z ^ srl(z, 31);
 }
 fn rng_below(s, n): i64 {
     if (n <= 0) { return 0; }
@@ -180,6 +198,54 @@ fn mutate(s, scratch, len0): i64 {
     return 0;
 }
 
+# FZ_STRICT_N int8 [1] tensors "t00".."t39", through the checked add: canonical.
+fn build_strict_base(): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 1);
+    var data = alloc(8);
+    store8(data, 7);
+    var nm = alloc(8);
+    var i = 0;
+    while (i < FZ_STRICT_N) {
+        store8(nm, 116);
+        store8(nm + 1, 48 + i / 10);
+        store8(nm + 2, 48 + i % 10);
+        store8(nm + 3, 0);
+        tula_builder_add_checked(b, nm, TULA_DT_INT8, shape, 1, data, 1);
+        i = i + 1;
+    }
+    return tula_builder_finish(b);
+}
+
+# Invariant 4: run the strict validator on an opened buffer; when it accepts,
+# check by brute force that it was right. st+56 counts strict accepts, st+64
+# strict DUP_NAME verdicts, st+16 breaches.
+fn strict_check(r, len, st): i64 {
+    var rc = tula_validate_strict(r, len);
+    if (rc == TULA_ERR_DUP_NAME) { store64(st + 64, load64(st + 64) + 1); }
+    if (rc != TULA_OK) { return 0; }
+    store64(st + 56, load64(st + 56) + 1);
+    var ok = 1;
+    if (len != tula_total_len(r)) { ok = 0; }
+    var c = tula_count(r);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        var n = tula_entry_nelems(e);
+        if (n < 0) { ok = 0; }
+        if (tula_entry_data_len(e) != tula_packed_len(tula_entry_dtype(e), n)) { ok = 0; }
+        var j = i + 1;
+        while (j < c) {
+            if (streq(tula_entry_name(e), tula_entry_name(tula_entry(r, j)))) { ok = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (ok == 0) { store64(st + 16, load64(st + 16) + 1); }
+    return 0;
+}
+
 # When tula_open succeeds the buffer MUST be genuinely valid: re-validation
 # agrees, and every accessor stays inside [r, r+len). Returns 1 if sound, else 0.
 fn check_opened(r, len): i64 {
@@ -215,10 +281,11 @@ fn main(): i64 {
     var s = alloc(8);
     store64(s, 0x243F6A8885A308D3);   # fixed seed (digits of pi) -> reproducible
 
-    var st = alloc(64);
+    var st = alloc(128);
     var z = 0;
-    while (z < 8) { store64(st + z * 8, 0); z = z + 1; }
+    while (z < 16) { store64(st + z * 8, 0); z = z + 1; }
     # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
+    # +56 strict accepted  +64 strict DUP_NAME
 
     var guard = guard_region();
     if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
@@ -244,6 +311,7 @@ fn main(): i64 {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r, testlen) == 0) { store64(st + 16, load64(st + 16) + 1); }
             store64(st + 48, load64(st + 48) + consume(r, st, out, scl));
+            strict_check(r, testlen, st);
         }
         store64(st + 0, load64(st + 0) + 1);
         a = a + 1;
@@ -264,6 +332,7 @@ fn main(): i64 {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r2, blen) == 0) { store64(st + 16, load64(st + 16) + 1); }
             store64(st + 48, load64(st + 48) + consume(r2, st, out, scl));
+            strict_check(r2, blen, st);
         }
         store64(st + 0, load64(st + 0) + 1);
         bph = bph + 1;
@@ -291,6 +360,7 @@ fn main(): i64 {
             store64(st + 8, load64(st + 8) + 1);
             if (check_opened(r3, tl) == 0) { store64(st + 16, load64(st + 16) + 1); }
             store64(st + 48, load64(st + 48) + consume(r3, st, out, scl));
+            strict_check(r3, tl, st);
             var v = tula_verify(r3, pk);
             if (v == TULA_SIG_UNSIGNED) { store64(st + 24, load64(st + 24) + 1); }
             if (v == TULA_SIG_OK)       { store64(st + 32, load64(st + 32) + 1); }
@@ -302,6 +372,31 @@ fn main(): i64 {
         d = d + 1;
     }
 
+    # ---- phase E: a 40-tensor canonical file; mutations + injected duplicates ----
+    var bufe = build_strict_base();
+    var elen = tula_total_len(bufe);
+    var ep = 0;
+    while (ep < FZ_STRICT_ITERS) {
+        memcpy_n(scratch, bufe, elen);
+        var how = rng_below(s, 4);
+        if (how == 0) { mutate(s, scratch, elen); }
+        if (how >= 1) {
+            # copy one name field over another: a duplicate, everything else canonical
+            var src = rng_below(s, FZ_STRICT_N);
+            var dst = rng_below(s, FZ_STRICT_N);
+            memcpy_n(scratch + 64 + dst * 144, scratch + 64 + src * 144, 48);
+            if (how == 3) { mutate(s, scratch, elen); }
+        }
+        var re = tula_open(place(guard, scratch, elen), elen);
+        if (re != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(re, elen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            strict_check(re, elen, st);
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        ep = ep + 1;
+    }
+
     var t1 = now_ns();
 
     sput("tula fuzz — reader hardening (M3) under hostile input\n");
@@ -311,6 +406,8 @@ fn main(): i64 {
     kv("  verify OK          : ", load64(st + 32));
     kv("  verify BAD         : ", load64(st + 40));
     kv("  unpacked entries   : ", load64(st + 48));
+    kv("  strict accepted    : ", load64(st + 56));
+    kv("  strict DUP_NAME    : ", load64(st + 64));
     kv("  elapsed ms         : ", (t1 - t0) / 1000000);
     var fails = load64(st + 16);
     kv("  invariant failures : ", fails);

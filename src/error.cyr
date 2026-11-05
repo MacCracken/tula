@@ -18,6 +18,10 @@ enum TulaErrCode {
     TULA_ERR_NDIM      = 10;   # tensor ndim outside [0, TULA_MAXDIM] (M3)
     TULA_ERR_HEADER    = 11;   # header structural invariant violated (offsets/sig) (M3)
     TULA_ERR_TOO_BIG   = 12;   # declared size exceeds a resource cap (bomb guard) (M3)
+    TULA_ERR_DUP_NAME  = 13;   # two tensors share a name (strict validate / checked add) (1.2.0)
+    TULA_ERR_LAYOUT    = 14;   # payload or name bytes not in canonical layout (strict) (1.2.0)
+    TULA_ERR_SHAPE     = 15;   # shape inconsistent with dtype + data_len (strict) (1.2.0)
+    TULA_ERR_DTYPE     = 16;   # dtype unknown to this tula (strict) (1.2.0)
     TULA_ERR_OTHER     = 99;   # catch-all
 }
 
@@ -27,7 +31,7 @@ fn tula_err_name(code): i64 {
     if (code == TULA_ERR_MAGIC)     { return "bad magic (not a tula file)"; }
     if (code == TULA_ERR_VERSION)   { return "unsupported format version"; }
     if (code == TULA_ERR_TRUNCATED) { return "truncated input"; }
-    if (code == TULA_ERR_TOO_MANY)  { return "too many tensors (builder cap)"; }
+    if (code == TULA_ERR_TOO_MANY)  { return "too many tensors (builder or reader cap)"; }
     if (code == TULA_ERR_NAME_LONG) { return "tensor name too long"; }
     if (code == TULA_ERR_OOM)       { return "out of memory"; }
     if (code == TULA_ERR_UNSIGNED)  { return "file is unsigned"; }
@@ -36,6 +40,10 @@ fn tula_err_name(code): i64 {
     if (code == TULA_ERR_NDIM)      { return "tensor ndim out of range"; }
     if (code == TULA_ERR_HEADER)    { return "malformed header"; }
     if (code == TULA_ERR_TOO_BIG)   { return "declared size exceeds cap"; }
+    if (code == TULA_ERR_DUP_NAME)  { return "duplicate tensor name"; }
+    if (code == TULA_ERR_LAYOUT)    { return "payload or name bytes not in canonical layout"; }
+    if (code == TULA_ERR_SHAPE)     { return "shape inconsistent with dtype and data_len"; }
+    if (code == TULA_ERR_DTYPE)     { return "unknown dtype"; }
     if (code == TULA_ERR_OTHER)     { return "other error"; }
     return "unknown error";
 }

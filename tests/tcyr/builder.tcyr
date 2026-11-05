@@ -3,6 +3,7 @@
 # corrupt the buffer), serialize writes every byte (zeroed padding, same bytes
 # every time), a failed allocation returns 0 instead of crashing, and the
 # word-at-a-time tula_find answers exactly as the streq loop it replaced.
+# 1.2.0: the sized builder, the checked add, and names/shapes copied at add.
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -240,6 +241,95 @@ fn test_find_ignores_bytes_after_nul() {
     return 0;
 }
 
+# ---- 1.2.0: sized builder, checked add, copy-at-add --------------------------
+
+fn test_sized_builder() {
+    assert_eq(tula_builder_new_cap(0), 0, "cap 0 -> 0");
+    assert_eq(tula_builder_new_cap(0 - 3), 0, "negative cap -> 0");
+    assert_eq(tula_builder_new_cap(TULA_READ_MAX_TENSORS + 1), 0, "cap over the reader's tensor cap -> 0");
+    var data = alloc(8);
+    var sh = one_shape(1);
+    var b1 = tula_builder_new_cap(1);
+    assert(b1 != 0, "cap 1 builder");
+    assert_eq(tula_builder_add(b1, "a", TULA_DT_F64, sh, 1, data, 8), 0, "cap 1: first add");
+    assert_eq(tula_builder_add(b1, "b", TULA_DT_F64, sh, 1, data, 8),
+      TULA_ERR_TOO_MANY, "cap 1: second add -> TOO_MANY");
+    # 300 tensors: past the default cap, a Llama-2-7B-sized tensor count
+    var n = 300;
+    var b = tula_builder_new_cap(n);
+    var nm = alloc(16);
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        store8(nm, 116);
+        store8(nm + 1, 48 + i / 100);
+        store8(nm + 2, 48 + (i / 10) % 10);
+        store8(nm + 3, 48 + i % 10);
+        store8(nm + 4, 0);
+        if (tula_builder_add_checked(b, nm, TULA_DT_F64, sh, 1, data, 8) != 0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "300 checked adds into a cap-300 builder");
+    assert_eq(tula_builder_add(b, "x", TULA_DT_F64, sh, 1, data, 8), TULA_ERR_TOO_MANY, "301st -> TOO_MANY");
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_count(buf), 300, "300 tensors serialized");
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "300-tensor output is strict-valid");
+    assert(tula_find(buf, "t299") != 0, "the last name, written through one reused buffer, is found");
+    assert(tula_find(buf, "t000") != 0, "the first name survived the buffer's reuse");
+    return 0;
+}
+
+fn test_add_checked() {
+    var data = alloc(8);
+    var sh = one_shape(1);
+    var b = tula_builder_new();
+    var long48 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL";
+    assert_eq(tula_builder_add_checked(b, long48, TULA_DT_F64, sh, 1, data, 8),
+      TULA_ERR_NAME_LONG, "48-char name -> NAME_LONG");
+    var lora_a = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
+    assert_eq(tula_builder_add_checked(b, lora_a, TULA_DT_F64, sh, 1, data, 8),
+      TULA_ERR_NAME_LONG, "LoRA name -> NAME_LONG");
+    assert_eq(load64(b), 0, "refused checked adds leave the builder empty");
+    assert_eq(tula_builder_add_checked(b, "w", TULA_DT_F64, sh, 1, data, 8), 0, "checked add of w");
+    assert_eq(tula_builder_add_checked(b, "w", TULA_DT_F64, sh, 1, data, 8), TULA_ERR_DUP_NAME, "second w -> DUP_NAME");
+    assert_eq(tula_builder_add(b, "v", TULA_DT_F64, sh, 1, data, 8), 0, "plain add of v");
+    assert_eq(tula_builder_add_checked(b, "v", TULA_DT_F64, sh, 1, data, 8),
+      TULA_ERR_DUP_NAME, "checked add sees a plain add's name");
+    assert_eq(tula_builder_add(b, long48, TULA_DT_F64, sh, 1, data, 8), 0, "plain add truncates a 48-char name");
+    var trunc47 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK";
+    assert_eq(tula_builder_add_checked(b, trunc47, TULA_DT_F64, sh, 1, data, 8),
+      TULA_ERR_DUP_NAME, "checked add sees the truncated stored name");
+    assert_eq(tula_builder_add(b, "w", TULA_DT_F64, sh, 1, data, 8), 0, "plain add still allows a duplicate (frozen)");
+    assert_eq(tula_builder_add_checked(b, "w2", TULA_DT_F64, sh, 9, data, 8),
+      TULA_ERR_NDIM, "checked add keeps add's checks");
+    assert_eq(load64(b), 4, "four tensors held");
+    return 0;
+}
+
+fn test_name_and_shape_copied_at_add() {
+    var data = alloc(32);
+    var nm = alloc(8);
+    var sh = alloc(16);
+    var b = tula_builder_new();
+    store8(nm, 97); store8(nm + 1, 0);              # "a"
+    store64(sh, 2); store64(sh + 8, 2);
+    tula_builder_add_checked(b, nm, TULA_DT_F64, sh, 2, data, 32);
+    store8(nm, 98);                                  # "b", same buffers
+    store64(sh, 4); store64(sh + 8, 1);
+    tula_builder_add_checked(b, nm, TULA_DT_F64, sh, 2, data, 32);
+    store8(nm, 122);                                 # mutate after the last add
+    store64(sh, 99);
+    var buf = tula_builder_finish(b);
+    var ea = tula_find(buf, "a");
+    var eb = tula_find(buf, "b");
+    assert(ea != 0, "first name kept although its buffer was rewritten");
+    assert(eb != 0, "second name kept although its buffer was rewritten after");
+    assert_eq(tula_entry_dim(ea, 0), 2, "first shape kept (copied at add)");
+    assert_eq(tula_entry_dim(eb, 0), 4, "second shape kept (copied at add)");
+    assert_eq(tula_find(buf, "z"), 0, "a post-add rewrite never reaches the file");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     test_add_rejects();
@@ -250,6 +340,9 @@ fn main(): i64 {
     test_finish_alloc_failure();
     test_find_matches_reference();
     test_find_ignores_bytes_after_nul();
+    test_sized_builder();
+    test_add_checked();
+    test_name_and_shape_copied_at_add();
     return assert_summary();
 }
 

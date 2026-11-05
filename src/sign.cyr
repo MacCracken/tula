@@ -33,3 +33,15 @@ fn tula_verify(r, pk): i64 {
     if (ed25519_verify(pk, r, so, r + so) != 0) { return TULA_SIG_OK; }
     return TULA_SIG_BAD;
 }
+
+# Verify, requiring a signature (1.2.0): TULA_OK only for a valid signature under
+# `pk`; TULA_ERR_UNSIGNED for an unsigned buffer; TULA_ERR_SIG for a bad one.
+# Stripping the signature from a signed file leaves a structurally valid
+# UNSIGNED file, so a consumer that relies on signatures must reject UNSIGNED as
+# firmly as BAD — this makes that one call. Same precondition as tula_verify.
+fn tula_verify_required(r, pk): i64 {
+    var v = tula_verify(r, pk);
+    if (v == TULA_SIG_OK) { return TULA_OK; }
+    if (v == TULA_SIG_UNSIGNED) { return TULA_ERR_UNSIGNED; }
+    return TULA_ERR_SIG;
+}

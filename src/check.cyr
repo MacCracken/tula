@@ -1,0 +1,255 @@
+# @public — tula consumer checks (1.2.0): the strict validator and the
+# quantization-sidecar lookup.
+#
+# tula_validate proves a buffer is SAFE to read (every offset in bounds). It
+# does not prove the buffer is CONSISTENT: tensors may overlap or leave gaps,
+# names may repeat, a shape may not match its byte length. Rejecting those in
+# tula_validate would break 1.x files the 1.x writer can produce (the plain
+# builder allows duplicate names), so the stricter rules live here, opt-in.
+#
+# Strict = canonical: a buffer passes tula_validate_strict iff it is exactly what
+# a correct tula writer produces for its manifest — the layout
+# tula_builder_add_checked + tula_builder_finish(_signed) write when every
+# data_len is its dtype's packed length. Careful safetensors readers enforce the
+# same family of rules (no overlap, no gaps, shape x dtype == byte length).
+
+enum TulaStrictCfg {
+    TULA_STRICT_SORT_MIN = 33;   # from this many tensors, duplicates are found by sorting
+    TULA_STRICT_STACK_N  = 512;  # up to this many, the sort's index array is on the stack
+}
+
+# Pointer to manifest entry i of a validated buffer.
+fn _tula_ent(buf, i): i64 {
+    return buf + TULA_HEADER_SIZE + i * TULA_ENTRY_SIZE;
+}
+
+# One entry's strict rules. `cursor` is where the entry's payload must start.
+fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
+    # Name: every byte after the NUL is zero (tula_validate proved the NUL). Bytes
+    # are scanned only up to the end of the word holding the NUL; every later
+    # word must be all zero, one compare each.
+    var k = 0;
+    while (load8(e + k) != 0) { k = k + 1; }
+    k = k + 1;
+    while ((k & 7) != 0) {
+        if (load8(e + k) != 0) { return TULA_ERR_LAYOUT; }
+        k = k + 1;
+    }
+    while (k < TULA_NAME_CAP) {
+        if (load64(e + k) != 0) { return TULA_ERR_LAYOUT; }
+        k = k + 8;
+    }
+    var dt = load64(e + 48);
+    if (tula_packed_len(dt, 0) < 0) { return TULA_ERR_DTYPE; }
+    # Shape: dims past ndim are zero, the count is defined, and data_len is
+    # exactly the dtype's packed length for it.
+    k = load64(e + 56);
+    while (k < TULA_MAXDIM) {
+        if (load64(e + 64 + k * 8) != 0) { return TULA_ERR_SHAPE; }
+        k = k + 1;
+    }
+    var n = tula_entry_nelems(e);
+    if (n < 0) { return TULA_ERR_SHAPE; }
+    var dlen = load64(e + 136);
+    if (dlen != tula_packed_len(dt, n)) { return TULA_ERR_SHAPE; }
+    # Layout: the payload starts exactly where the previous tensor's 8-aligned
+    # end left off. That one rule rejects overlap, gaps, misalignment and
+    # out-of-manifest-order payloads.
+    var doff = load64(e + 128);
+    if (doff != cursor) { return TULA_ERR_LAYOUT; }
+    var padded = tula_align8(dlen);
+    if (padded > payload_len - doff) { return TULA_ERR_LAYOUT; }
+    k = dlen;
+    while (k < padded) {
+        if (load8(payload + doff + k) != 0) { return TULA_ERR_LAYOUT; }
+        k = k + 1;
+    }
+    return TULA_OK;
+}
+
+# Order of two sort records (+0 name hash, +8 entry pointer): by hash, then by
+# the 48-byte name fields when the hashes tie. Any total order serves — only
+# equality of neighbours is used. -1 / 0 / +1.
+fn _tula_rec_cmp(a, b): i64 {
+    var ha = load64(a);
+    var hb = load64(b);
+    if (ha < hb) { return 0 - 1; }
+    if (ha > hb) { return 1; }
+    var pa = load64(a + 8);
+    var pb = load64(b + 8);
+    var w = 0;
+    while (w < 6) {
+        var x = load64(pa + w * 8);
+        var y = load64(pb + w * 8);
+        if (x < y) { return 0 - 1; }
+        if (x > y) { return 1; }
+        w = w + 1;
+    }
+    return 0;
+}
+
+fn _tula_rec_swap(a, b): i64 {
+    var h = load64(a);
+    var p = load64(a + 8);
+    store64(a, load64(b));
+    store64(a + 8, load64(b + 8));
+    store64(b, h);
+    store64(b + 8, p);
+    return 0;
+}
+
+# Sift record `root` down the max-heap recs[0..end] (end inclusive).
+fn _tula_sift(recs, root, end): i64 {
+    loop {
+        var child = root * 2 + 1;
+        if (child > end) { return 0; }
+        var sw = root;
+        if (_tula_rec_cmp(recs + sw * 16, recs + child * 16) < 0) { sw = child; }
+        if (child + 1 <= end) {
+            if (_tula_rec_cmp(recs + sw * 16, recs + child * 16 + 16) < 0) { sw = child + 1; }
+        }
+        if (sw == root) { return 0; }
+        _tula_rec_swap(recs + root * 16, recs + sw * 16);
+        root = sw;
+    }
+    return 0;
+}
+
+# Heapsort n records: O(n log n) in the worst case, whatever the names. The
+# hash only orders the records; equal hashes fall back to comparing names, so
+# a crafted file whose names all collide just costs a 48-byte compare per step
+# — never quadratic, as a hash TABLE over untrusted names could be.
+fn _tula_heapsort(recs, n): i64 {
+    var start = (n - 2) / 2;
+    while (start >= 0) {
+        _tula_sift(recs, start, n - 1);
+        start = start - 1;
+    }
+    var end = n - 1;
+    while (end > 0) {
+        _tula_rec_swap(recs, recs + end * 16);
+        end = end - 1;
+        _tula_sift(recs, 0, end);
+    }
+    return 0;
+}
+
+# Fill `recs` (count x 16 bytes) with (name hash, entry pointer), sort, and
+# report TULA_ERR_DUP_NAME if two neighbours compare equal, else TULA_OK.
+fn _tula_sorted_unique(buf, recs, count): i64 {
+    var q = 0;
+    while (q < count) {
+        var e = _tula_ent(buf, q);
+        store64(recs + q * 16, _tula_name_hash(e));
+        store64(recs + q * 16 + 8, e);
+        q = q + 1;
+    }
+    _tula_heapsort(recs, count);
+    q = 1;
+    while (q < count) {
+        if (_tula_rec_cmp(recs + q * 16 - 16, recs + q * 16) == 0) { return TULA_ERR_DUP_NAME; }
+        q = q + 1;
+    }
+    return TULA_OK;
+}
+
+# TULA_ERR_DUP_NAME if two entries share a name, else TULA_OK. Runs after the
+# per-entry rules, so every name field is canonical (zero after its NUL) and
+# 48-byte equality IS name equality. Small manifests compare pairwise; larger
+# ones sort (hash, pointer) records — on the stack up to TULA_STRICT_STACK_N
+# tensors, beyond that in a private mapping, unmapped before returning.
+fn _tula_strict_unique(buf, count): i64 {
+    if (count < 2) { return TULA_OK; }
+    if (count < TULA_STRICT_SORT_MIN) {
+        var i = 0;
+        while (i < count) {
+            var j = i + 1;
+            while (j < count) {
+                if (_tula_name_eq(_tula_ent(buf, i), _tula_ent(buf, j)) == 1) { return TULA_ERR_DUP_NAME; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return TULA_OK;
+    }
+    if (count <= TULA_STRICT_STACK_N) {
+        var srecs[8192];   # TULA_STRICT_STACK_N * 16
+        return _tula_sorted_unique(buf, &srecs, count);
+    }
+    var bytes = count * 16;
+    var idx = mmap_anon(bytes);
+    if (idx == 0) { return TULA_ERR_OOM; }
+    var rc = _tula_sorted_unique(buf, idx, count);
+    cyr_munmap(idx, bytes);
+    return rc;
+}
+
+# The strict validator (1.2.0). Runs tula_validate first (and returns its code
+# on failure), then requires the buffer to be canonical:
+#   TULA_ERR_LAYOUT   — len is not exactly the file's total; a tensor's payload
+#                       does not start where the previous one's 8-aligned end
+#                       left off (overlap, gap, misalignment, reordering); the
+#                       payload runs past the last tensor; a padding byte or a
+#                       name byte after the NUL is non-zero;
+#   TULA_ERR_DTYPE    — a dtype this tula does not know;
+#   TULA_ERR_SHAPE    — a negative dim, a non-zero dim past ndim, an element
+#                       count over the cap, or data_len != the dtype's packed
+#                       length for the shape (a 0-dim entry holds one element);
+#   TULA_ERR_DUP_NAME — two tensors share a name;
+#   TULA_ERR_OOM      — no memory for the duplicate check (> 32 tensors).
+# Structure only, like tula_validate: authenticity is tula_verify_required. To
+# read a file strictly: r = tula_read_file(path) (or tula_open_mmap), then
+# tula_validate_strict(r, tula_total_len(r)).
+fn tula_validate_strict(buf, len): i64 {
+    var rc = tula_validate(buf, len);
+    if (rc != TULA_OK) { return rc; }
+    if (len != tula_total_len(buf)) { return TULA_ERR_LAYOUT; }
+    var count = load64(buf + 16);
+    var payload = buf + load64(buf + 32);
+    var payload_len = load64(buf + 40);
+    var cursor = 0;
+    var i = 0;
+    while (i < count) {
+        var e = _tula_ent(buf, i);
+        rc = _tula_strict_entry(e, payload, payload_len, cursor);
+        if (rc != TULA_OK) { return rc; }
+        cursor = cursor + tula_align8(load64(e + 136));
+        i = i + 1;
+    }
+    if (cursor != payload_len) { return TULA_ERR_LAYOUT; }
+    return _tula_strict_unique(buf, count);
+}
+
+# The "<name>.scale" sidecar of entry `e` (ADR 0002), checked for an unpack that
+# will read `need` scales: it must exist, be f64, pass tula_entry_payload_ok, and
+# hold at least `need` elements in at least need * 8 bytes. Returns the sidecar's
+# entry, or 0. `need` is what the caller's unpack reads: 1 for a per-tensor
+# scale, the row count for per-row, tula_nf4_blocks(n, block) for NF4. A name
+# over 41 chars returns 0: "<name>.scale" would not fit untruncated in 47.
+fn tula_find_scale(r, e, need): i64 {
+    if (need < 1) { return 0; }
+    var name = tula_entry_name(e);
+    var nlen = strlen(name);
+    if (nlen + 6 > TULA_NAME_MAX) { return 0; }
+    var key[48];
+    var k = 0;
+    while (k < nlen) {
+        store8(&key + k, load8(name + k));
+        k = k + 1;
+    }
+    var suf = ".scale";
+    var j = 0;
+    while (j < 6) {
+        store8(&key + nlen + j, load8(suf + j));
+        j = j + 1;
+    }
+    store8(&key + nlen + 6, 0);
+    var s = tula_find(r, &key);
+    if (s == 0) { return 0; }
+    if (tula_entry_dtype(s) != TULA_DT_F64) { return 0; }
+    if (tula_entry_payload_ok(s) != 1) { return 0; }
+    var n = tula_entry_nelems(s);
+    if (n < need) { return 0; }
+    if (tula_entry_data_len(s) < need * 8) { return 0; }   # need <= n <= 2^40: no overflow
+    return s;
+}

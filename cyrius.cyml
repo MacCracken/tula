@@ -16,7 +16,7 @@ entry = "programs/smoke.cyr"
 output = "build/tula_smoke"
 
 # `[lib]` feeds `cyrius distlib` — module order matters: error.cyr is dep-free;
-# format.cyr uses it. Don't reorder without re-running `cyrius distlib`.
+# format.cyr uses it; check.cyr (1.2.0) comes last, using format + dtype. Don't reorder without re-running `cyrius distlib`.
 [lib]
 modules = [
     "src/error.cyr",
@@ -24,6 +24,7 @@ modules = [
     "src/sign.cyr",
     "src/fileio.cyr",
     "src/dtype.cyr",
+    "src/check.cyr",
 ]
 
 [deps]

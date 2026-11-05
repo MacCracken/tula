@@ -65,41 +65,29 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   refuses arguments that corrupted or broke its output. Hot paths are 1.2–11.6×
   faster with byte-identical output. Fuzzing now runs against a guard page.
   105 → 178 assertions.
+- **1.2.0** (2026-11-04) — **real checkpoints, checked**, all additive:
+  `tula_builder_new_cap` (D-2: past 256 tensors); `tula_builder_add_checked`
+  (D-1 short term: refuses long and duplicate names, O(1) per add through a name
+  index); `tula_validate_strict` (D-4, new `src/check.cyr`: accepts only canonical
+  buffers, duplicates found by a worst-case O(n log n) sort); `tula_verify_required`
+  (D-5); `tula_find_scale` (D-6, the planned `quant_pair_ok`, returning the sidecar
+  entry); `tula_entry_nelems` (D-11); error codes 13–16. The builder now copies
+  names and shapes at add time. The fuzz PRNG's low bits were fixed. Plain-builder
+  output is byte-identical to 1.1.2's. 178 → 274 assertions.
 
 ---
 
 ## 1.2.x — real checkpoints, checked (additive API)
 
 **Goal:** a consumer can write a real model's tensor set, and reject anything
-inconsistent with one call each. Blocks: anukulana's Type-3 import of real
-checkpoints.
+inconsistent with one call each. 1.2.0 shipped it (above). Left in the line:
 
-- **1.2.0**
-  - **Sized builder** (D-2): `tula_builder_new_cap(max)`. `TULA_BUILDER_MAX` (256)
-    stays the frozen default for `tula_builder_new`. Real checkpoints exceed it
-    (Llama-2-7B: 291 tensors; Mixtral-8x7B: ~995). The builder layout is private,
-    so it can carry its own cap.
-  - **Checked add** (D-1, short term): `tula_builder_add_checked(...)` refuses a
-    name over 47 chars (`TULA_ERR_NAME_LONG`) and a name already in the builder
-    (new `TULA_ERR_DUP_NAME`) instead of truncating into a collision. The plain
-    add keeps its frozen truncating behaviour.
-  - **Strict validator** (D-4): `tula_validate_strict(buf, len)` = `tula_validate`
-    plus no overlapping tensors, unique names, 8-byte-aligned `data_off`, zero
-    unused dims, and `data_len == tula_packed_len(dtype, nelems)` for known
-    dtypes. New `TULA_ERR_*` codes, e.g. `OVERLAP` and `SHAPE`. This matches what
-    careful safetensors readers enforce (audit §4). Fuzz invariant: strict-accepted
-    ⊂ accepted, and checked-builder output is always strict-valid.
-  - **Signature required** (D-5): `tula_verify_required(r, pk)` → `TULA_OK` /
-    `TULA_ERR_UNSIGNED` / `TULA_ERR_SIG`, so rejecting a stripped signature is one
-    call.
-  - **Quant pair check** (D-6): `tula_quant_pair_ok(r, e, block)` — the
-    `"<name>.scale"` sidecar exists, is f64, passes `payload_ok`, and has at least
-    the scales the unpack will read (per-tensor, per-row or per-block).
-  - **Element count** (D-11): `tula_entry_nelems(e)` → count, or −1 for a negative
-    or overflowing shape, so consumers stop re-deriving it.
-  - Docs: `docs/api.md` section per helper; `examples/consumer.cyr` switched to the
-    strict validator + `verify_required` + `quant_pair_ok`.
-- **1.2.x patches** — fixes found while landing the above; no new surface.
+- **1.2.x patches** — fixes found as consumers adopt the 1.2.0 calls; no new
+  surface.
+- **Consumer migration** (cross-repo, not tula code): anukulana and ifran move to
+  `tula_builder_add_checked` / `tula_builder_new_cap` on the write side and
+  `tula_validate_strict` → `tula_verify_required` → `tula_find_scale` on the
+  read side, as `examples/consumer.cyr` does. ifran still pins tula 1.0.2.
 
 ## 1.3.x — real names, real dtypes
 
@@ -178,7 +166,7 @@ never incidental (STABILITY.md).
   load-seam, the control-plane checkpoint store — all pull `dist/tula.cyr` via
   `[deps.tula]`. Keep the format stable for them; a format bump is a coordinated
   event. 1.2.0's checked add and strict validator are what anukulana should
-  switch to first.
+  switch to first (see 1.2.x).
 - **Cross-repo asks:** sigil — multi-part Ed25519 sign (1.4.x) and the bayan
   binary-size issue.
 - **Ecosystem context:** the AGNOS planning docs `type3-weight-import.md`

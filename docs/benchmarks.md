@@ -49,6 +49,20 @@ re-divided for each element's block. Ternary unpack made a function call, a
 divide and a modulo per element. Each fix keeps the same arithmetic: the
 results are bit-identical, only faster.
 
+### Added in 1.2.0 (same machine and harness)
+
+| Op | 1.2.0 | Notes |
+|---|---:|---|
+| `tula_validate_strict`, 200 tensors | 42 µs | ~15 µs of per-entry rules + ~28 µs duplicate sort; vs 2.8 µs for `tula_validate` |
+| `tula_validate_strict`, 256 long names | 77 µs | names sharing a 13-byte prefix |
+| `tula_builder_add` | 171 ns | per add, including the name-index insert |
+| `tula_builder_add_checked` | 192 ns | per add, plus the length check and duplicate lookup |
+
+The strict duplicate check sorts (name hash, entry) records with a heapsort: worst
+case O(n log n) for any names, about 9 ns per comparison. Up to 512 tensors the
+records live on the stack; beyond that in a private mapping, unmapped afterwards.
+Measured on a 1,000-tensor file (realistic `model.layers.*` names, mapping path): **316 µs**.
+
 Earlier result (1.0.0, cyrius 6.3.27, tmpfs `/tmp`, ms resolution): write 34 ms,
 read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O only.
 

@@ -120,55 +120,169 @@ fn tula_name_write(dst, src): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.1.2 -> 10102).
+# Packed version int: major*10000 + minor*100 + patch (1.2.0 -> 10200).
 fn tula_version_int(): i64 {
-    return 10102;
+    return 10200;
 }
 
 # ---------------------------------------------------------------------------
 # builder — accumulate tensors, then serialize into one contiguous buffer
 # ---------------------------------------------------------------------------
-# builder layout: +0 count, +8 payload_total, then MAX entries of 48-byte meta
-#   (name_ptr, dtype, ndim, shape_ptr, data_ptr, data_len).
+# Builder layout (private; only the +0 count and +8 payload_total words are
+# relied on outside this file, by the tests):
+#   +0  count            +8  payload_total (sum of 8-aligned data_len)
+#   +16 cap              +24 name-index table ptr      +32 index mask
+#   +48 entries, TULA_BENTRY_SIZE each:
+#       [0, 144)  the tensor's manifest entry, ready to copy into the file —
+#                 name (truncated to 47, zero-padded), dtype, ndim, shape (unused
+#                 dims zero), data_off (the payload cursor at add time), data_len
+#       +144      data ptr (borrowed until finish)
+# The name and shape are COPIED at add time (1.2.0), so a caller can reuse one
+# name or shape buffer for every add; only the payload bytes stay borrowed.
+#
+# The name index is an open-addressing hash set over the stored 48-byte names,
+# 2..4 slots per tensor, so checked adds find a duplicate in O(1). The builder
+# is the caller's own trusted code, so an unkeyed hash is fine here; the reader
+# side never hashes untrusted names (tula_validate_strict sorts them instead).
 
-# Allocate an empty builder (room for TULA_BUILDER_MAX tensors).
+enum TulaBuilderLayout {
+    TULA_BHDR_SIZE   = 48;
+    TULA_BENTRY_SIZE = 152;
+}
+
+# Allocate an empty builder (room for TULA_BUILDER_MAX tensors). 0 if the
+# allocation fails.
 fn tula_builder_new(): i64 {
-    var b = alloc(16 + TULA_BUILDER_MAX * 48);
-    store64(b, 0);       # count
-    store64(b + 8, 0);   # payload_total
+    return tula_builder_new_cap(TULA_BUILDER_MAX);
+}
+
+# Allocate an empty builder with room for `max` tensors (1.2.0). Real checkpoints
+# pass TULA_BUILDER_MAX (Llama-2-7B has 291 tensors). Returns 0 if max is outside
+# [1, TULA_READ_MAX_TENSORS] — a file can't hold more than the reader accepts — or
+# if the allocation fails.
+fn tula_builder_new_cap(max): i64 {
+    if (max < 1) { return 0; }
+    if (max > TULA_READ_MAX_TENSORS) { return 0; }
+    var b = alloc(TULA_BHDR_SIZE + max * TULA_BENTRY_SIZE);
+    if (b == 0) { return 0; }
+    var slots = 2;
+    while (slots < max * 2) { slots = slots * 2; }
+    var tab = alloc(slots * 8);
+    if (tab == 0) { return 0; }
+    _tula_zero(tab, slots * 8);
+    store64(b + 0, 0);           # count
+    store64(b + 8, 0);           # payload_total
+    store64(b + 16, max);        # cap
+    store64(b + 24, tab);        # name index
+    store64(b + 32, slots - 1);  # index mask
+    store64(b + 40, 0);
     return b;
 }
 
-# Append a tensor. Returns 0 on success, or (builder unchanged):
-#   TULA_ERR_TOO_MANY — TULA_BUILDER_MAX tensors already added;
-#   TULA_ERR_NDIM     — ndim outside [0, TULA_MAXDIM];
-#   TULA_ERR_BOUNDS   — data_len < 0;
-#   TULA_ERR_TOO_BIG  — the payload would pass TULA_READ_MAX_BYTES.
-# Each rejected case used to be accepted and produce a file tula's own reader
-# rejects (ndim, size) or a corrupt buffer (a negative data_len moved the next
-# tensor's offset backwards over the manifest), so rejecting it loses nothing a
-# caller could have read back. Names over 47 chars are still truncated (frozen
-# v1 behaviour; see SECURITY.md on collisions).
-fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
+# Pointer to builder entry i.
+fn _tula_bentry(b, i): i64 {
+    return b + TULA_BHDR_SIZE + i * TULA_BENTRY_SIZE;
+}
+
+# Hash of a 48-byte name field.
+fn _tula_name_hash(k): i64 {
+    var h = 0x6A09E667F3BCC908;
+    var w = 0;
+    while (w < 6) {
+        h = (h ^ load64(k + w * 8)) * 0x100000001B3;
+        h = h ^ (h >> 31);
+        w = w + 1;
+    }
+    return h;
+}
+
+# 1 if two 48-byte name fields are identical.
+fn _tula_name_eq(a, b): i64 {
+    var w = 0;
+    while (w < 6) {
+        if (load64(a + w * 8) != load64(b + w * 8)) { return 0; }
+        w = w + 1;
+    }
+    return 1;
+}
+
+# The index slot holding name field `k`, or the empty slot where it belongs.
+fn _tula_bidx_slot(b, k): i64 {
+    var tab = load64(b + 24);
+    var mask = load64(b + 32);
+    var s = _tula_name_hash(k) & mask;
+    loop {
+        var v = load64(tab + s * 8);
+        if (v == 0) { return s; }
+        if (_tula_name_eq(_tula_bentry(b, v - 1), k) == 1) { return s; }
+        s = (s + 1) & mask;
+    }
+    return 0;
+}
+
+# The shared add. `checked` = 1 also refuses a name over 47 chars and a name the
+# builder already holds. On any error the builder is unchanged.
+fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, checked): i64 {
     var c = load64(b);
-    if (c >= TULA_BUILDER_MAX) { return TULA_ERR_TOO_MANY; }
+    if (c >= load64(b + 16))   { return TULA_ERR_TOO_MANY; }
     if (ndim < 0)              { return TULA_ERR_NDIM; }
     if (ndim > TULA_MAXDIM)    { return TULA_ERR_NDIM; }
     if (data_len < 0)          { return TULA_ERR_BOUNDS; }
     # data_len <= cap first, so the sum below cannot overflow.
     if (data_len > TULA_READ_MAX_BYTES) { return TULA_ERR_TOO_BIG; }
-    var grown = load64(b + 8) + tula_align8(data_len);
+    var cur = load64(b + 8);
+    var grown = cur + tula_align8(data_len);
     if (grown > TULA_READ_MAX_BYTES)    { return TULA_ERR_TOO_BIG; }
-    var m = b + 16 + c * 48;
-    store64(m + 0, name);
-    store64(m + 8, dtype);
-    store64(m + 16, ndim);
-    store64(m + 24, shape);
-    store64(m + 32, data);
-    store64(m + 40, data_len);
+    if (checked == 1) {
+        if (strlen(name) > TULA_NAME_MAX) { return TULA_ERR_NAME_LONG; }
+    }
+    # Stage the entry in slot c (not yet counted), then look its name up.
+    var m = _tula_bentry(b, c);
+    tula_name_write(m, name);
+    var s = _tula_bidx_slot(b, m);
+    var tab = load64(b + 24);
+    var seen = load64(tab + s * 8);
+    if (checked == 1) {
+        if (seen != 0) { return TULA_ERR_DUP_NAME; }
+    }
+    store64(m + 48, dtype);
+    store64(m + 56, ndim);
+    var k = 0;
+    while (k < TULA_MAXDIM) {
+        if (k < ndim) { store64(m + 64 + k * 8, load64(shape + k * 8)); }
+        else          { store64(m + 64 + k * 8, 0); }
+        k = k + 1;
+    }
+    store64(m + 128, cur);        # data_off
+    store64(m + 136, data_len);
+    store64(m + 144, data);
+    if (seen == 0) { store64(tab + s * 8, c + 1); }
     store64(b, c + 1);
     store64(b + 8, grown);
     return 0;
+}
+
+# Append a tensor. Returns 0 on success, or (builder unchanged):
+#   TULA_ERR_TOO_MANY — the builder's cap (TULA_BUILDER_MAX by default) reached;
+#   TULA_ERR_NDIM     — ndim outside [0, TULA_MAXDIM];
+#   TULA_ERR_BOUNDS   — data_len < 0;
+#   TULA_ERR_TOO_BIG  — the payload would pass TULA_READ_MAX_BYTES.
+# Names over 47 chars are truncated and duplicates are allowed (frozen v1
+# behaviour; two long names can become one stored name, see SECURITY.md) — use
+# tula_builder_add_checked to refuse both.
+fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
+    return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 0);
+}
+
+# Append a tensor, refusing what tula_builder_add would silently accept (1.2.0):
+# every tula_builder_add error, plus (builder unchanged)
+#   TULA_ERR_NAME_LONG — the name is over 47 chars (it would be truncated);
+#   TULA_ERR_DUP_NAME  — the builder already holds this stored name, from either
+#                        kind of add (an earlier plain add's truncated name too).
+# A builder fed only through this produces files tula_validate_strict accepts,
+# provided each data_len is the dtype's packed length for the shape.
+fn tula_builder_add_checked(b, name, dtype, shape, ndim, data, data_len): i64 {
+    return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 1);
 }
 
 # Serialize the builder into a fresh contiguous tula buffer. sig_len is 0 for an
@@ -200,32 +314,15 @@ fn tula_serialize(b, sig_len): i64 {
     store64(buf + 56, sig_len);   # 0 = unsigned; else 64 (Ed25519)
 
     var i = 0;
-    var cur = 0;
     while (i < count) {
-        var m = b + 16 + i * 48;
+        var m = _tula_bentry(b, i);
         var e = buf + manifest_off + i * TULA_ENTRY_SIZE;
-        tula_name_write(e + 0, load64(m + 0));
-        store64(e + 48, load64(m + 8));    # dtype
-        var ndim = load64(m + 16);
-        store64(e + 56, ndim);
-        var shape = load64(m + 24);
-        var k = 0;
-        while (k < TULA_MAXDIM) {
-            if (k < ndim) {
-                store64(e + 64 + k * 8, load64(shape + k * 8));
-            } else {
-                store64(e + 64 + k * 8, 0);
-            }
-            k = k + 1;
-        }
-        var dlen = load64(m + 40);
-        store64(e + 128, cur);
-        store64(e + 136, dlen);
-        var dst = buf + payload_off + cur;
-        _tula_copy(dst, load64(m + 32), dlen);
+        _tula_copy(e, m, TULA_ENTRY_SIZE);     # the entry image built at add time
+        var dlen = load64(m + 136);
+        var dst = buf + payload_off + load64(m + 128);
+        _tula_copy(dst, load64(m + 144), dlen);
         var padded = tula_align8(dlen);
         _tula_zero(dst + dlen, padded - dlen);   # 0..7 padding bytes
-        cur = cur + padded;
         i = i + 1;
     }
     if (sig_len > 0) { _tula_zero(buf + sig_off, sig_len); }

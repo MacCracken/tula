@@ -7,6 +7,86 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-04
+
+**Real checkpoints, checked.** An additive MINOR (ADR 0003): new functions and
+error codes only. Every 1.1.2 call behaves as before, the on-disk format is
+v1 unchanged, and the plain builder's output is **byte-identical** to 1.1.2's
+(diffed over randomized builders). This is the roadmap's 1.2.0 milestone; its
+items close audit D-1 (short term), D-2, D-4, D-5, D-6 and D-11
+([2026-11-04 audit](docs/audit/2026-11-04-audit.md) §5).
+
+### Added
+
+- **`tula_builder_new_cap(max)`** — a builder for up to `max` tensors (1 ..
+  `TULA_READ_MAX_TENSORS`). `tula_builder_new` keeps the frozen default of 256,
+  which real models pass (Llama-2-7B has 291 tensors).
+- **`tula_builder_add_checked(...)`** — the add that refuses what the plain one
+  silently accepts: a name over 47 chars (`TULA_ERR_NAME_LONG`, instead of
+  truncating it) and a name already in the builder (`TULA_ERR_DUP_NAME`). That
+  includes a plain add's truncated name, so the LoRA `lora_A` / `lora_B`
+  collision can no longer be written. It is O(1) per add, through a name index in
+  the builder.
+- **`tula_validate_strict(buf, len)`** — new module `src/check.cyr`. It accepts a
+  buffer only if it is **canonical**: exactly what a correct tula writer
+  produces. That means no overlapping tensors, no gaps or reordering, 8-aligned
+  offsets, zero padding and zero name bytes after the NUL, an exact total length,
+  known dtypes, zero dims past `ndim`, `data_len` equal to the dtype's packed
+  length for the shape, and unique names. Careful safetensors readers enforce the
+  same family of rules. Duplicates are found by a heapsort of (name hash, entry)
+  records, worst case O(n log n) whatever the names; untrusted names never go
+  into a hash table, so crafted collisions can't make the check quadratic.
+- **`tula_verify_required(r, pk)`** → `TULA_OK` / `TULA_ERR_UNSIGNED` /
+  `TULA_ERR_SIG`. A stripped signature (a valid unsigned file) is rejected in one
+  call.
+- **`tula_find_scale(r, e, need)`** — an entry's `"<name>.scale"` sidecar, checked
+  for an unpack that reads `need` scales (exists, f64, `payload_ok`, at least
+  `need` elements in at least `need * 8` bytes). It replaces the hand-written
+  sidecar checks.
+- **`tula_entry_nelems(e)`** — element count, overflow-safe. It is 1 for a 0-dim
+  entry (a scalar), 0 for an empty tensor, and −1 for a negative dim or a product
+  over the cap.
+- **Error codes** `TULA_ERR_DUP_NAME` (13), `TULA_ERR_LAYOUT` (14),
+  `TULA_ERR_SHAPE` (15) and `TULA_ERR_DTYPE` (16), with names in `tula_err_name`.
+
+### Changed
+
+- **The builder copies the name and shape at add time.** Before, it borrowed both
+  pointers until `finish`, so reusing one shape buffer across adds gave every
+  tensor the last shape. `data` is still borrowed until `finish`. Internally each
+  builder entry is now the ready-made 144-byte manifest entry, so serialize is a
+  straight copy. The builder layout is private.
+- **`tula_builder_new` returns 0 if its allocation fails** (it used to return an
+  unusable pointer).
+- `tula_err_name(TULA_ERR_TOO_MANY)` now reads "too many tensors (builder or
+  reader cap)": the reader returns it too.
+- **Reference consumer** (`examples/consumer.cyr`, a CI gate) writes through the
+  checked add and loads through `tula_validate_strict` → `tula_verify_required`
+  → `tula_find_scale`.
+- **Fuzz harness.** Its PRNG returned raw power-of-two LCG state, whose low bits
+  have tiny periods, so every `rng_below(s, small)` choice (mutation kind, offset,
+  value class) followed a short fixed pattern. Outputs now pass through the
+  splitmix64 finalizer, and accepted buffers rose 230k → 268k on the same
+  iteration count. The strict validator runs on every accepted buffer, and when
+  it accepts, a brute-force check must agree. A new phase fuzzes a 40-tensor
+  canonical file (past the pairwise threshold, so the heapsort runs) with
+  duplicate names injected.
+- **Bench**: strict validate (200 tensors: 42 µs; 256 long names: 77 µs) and
+  plain vs checked add (171 vs 192 ns per add).
+
+### Verified
+
+- Suite **178 → 274** assertions in 7 suites. New: `strict.tcyr` (67), plus 29
+  more in `builder.tcyr` for the sized builder, the checked add, and copy-at-add.
+- Mutations of the strict validator turn the suite red: skipping the sort,
+  dropping the padding check, allowing gaps. The last needed a new case, a gap
+  and an overlap that cancel, which only the cursor rule catches.
+- `make fuzz`: 2,303,000 iterations, 6,302 strict accepts all confirmed by brute
+  force, 147,167 duplicate-name verdicts, 0 faults, 0 invariant failures.
+- `fmt`, `lint`, `vet` and `deny` clean. `doc --check` 0 undocumented.
+  `make example` PASS. `make dist` OK (no stdlib sidecar needed).
+  `deps --verify` 60/60.
+
 ## [1.1.2] - 2026-11-04
 
 A P(-1) pass: hardening, optimization and repair. Report:

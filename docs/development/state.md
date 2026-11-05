@@ -23,22 +23,28 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.1.2** (`tula_version_int()` returns `10102`). 1.0.1–1.1.1 are
+VERSION is **1.2.0** (`tula_version_int()` returns `10200`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
-with byte-identical output, and no API or format change. Post-1.0 work
+with byte-identical output, and no API or format change. **1.2.0 — real
+checkpoints, checked** (additive): the sized builder, the checked add, the strict
+validator (`src/check.cyr`), `tula_verify_required`, `tula_find_scale`,
+`tula_entry_nelems`, error codes 13–16. Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.1.2)
+## Tests, fuzz, gates (1.2.0)
 
-**178 assertions** across 6 suites, all green: `builder.tcyr` 38, `dtype.tcyr` 50,
-`fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22, `sign.tcyr` 8. `dtype`
-and `builder` include differential tests against the 1.1.1 implementations.
-`make fuzz`: 2,003,000 iterations with every buffer ending at a `PROT_NONE` guard
-page, plus a payload-guard + unpack phase (40,472 entries), 0 faults. `fmt` /
-`lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`: 0 undocumented.
+**274 assertions** across 7 suites, all green: `builder.tcyr` 67, `strict.tcyr` 67,
+`dtype.tcyr` 50, `fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22,
+`sign.tcyr` 8. `dtype` and `builder` include differential tests against the 1.1.1
+implementations. `make fuzz`: 2,303,000 iterations with every buffer ending at a
+`PROT_NONE` guard page. It includes a payload-guard + unpack phase (49,360
+entries) and a strict phase, where 6,302 strict accepts were all confirmed by
+brute force and 147,167 duplicate-name verdicts came through the sort path.
+0 faults. `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
+0 undocumented.
 
 ## Toolchain
 
@@ -76,8 +82,8 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-**1.2.0 — real checkpoints** ([roadmap](roadmap.md)): a sized builder (real models
-pass 256 tensors), a checked add that refuses name collisions, a strict validator
-(overlap / duplicates / shape-vs-size), a signature-required verify, and a
-quant-sidecar check — all additive. 1.3.0 takes long names and F32/F16/BF16; 1.4.0
-the streaming writer for files over 2 GiB.
+**1.3.0 — real names, real dtypes** ([roadmap](roadmap.md)): the long-name
+extension (ADR 0004 first; the LoRA `lora_A`/`lora_B` collision is the acceptance
+test), then F32 / F16 / BF16. 1.4.0 is the streaming writer for files over 2 GiB.
+Meanwhile 1.2.x is consumer migration: anukulana and ifran adopt the checked add
+and strict reads (ifran still pins tula 1.0.2).

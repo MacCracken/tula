@@ -59,24 +59,43 @@ Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 | `TULA_ERR_TRUNCATED` | 3 | | `TULA_ERR_NDIM` | 10 |
 | `TULA_ERR_TOO_MANY` | 4 | | `TULA_ERR_HEADER` | 11 |
 | `TULA_ERR_NAME_LONG` | 5 | | `TULA_ERR_TOO_BIG` | 12 |
-| `TULA_ERR_OOM` | 6 | | `TULA_ERR_OTHER` | 99 |
+| `TULA_ERR_OOM` | 6 | | `TULA_ERR_DUP_NAME` | 13 |
+| | | | `TULA_ERR_LAYOUT` | 14 |
+| | | | `TULA_ERR_SHAPE` | 15 |
+| | | | `TULA_ERR_DTYPE` | 16 |
+| | | | `TULA_ERR_OTHER` | 99 |
+
+Codes 13–16 are new in 1.2.0, returned by the checked add and the strict
+validator.
 
 ---
 
 ## Builder (write) — `src/format.cyr`
 
-- `fn tula_builder_new() -> b` — allocate a builder (cap `TULA_BUILDER_MAX = 256`
-  tensors).
+- `fn tula_builder_new() -> b | 0` — allocate a builder (cap `TULA_BUILDER_MAX =
+  256` tensors).
+- `fn tula_builder_new_cap(max) -> b | 0` *(1.2.0)* — a builder for up to `max`
+  tensors, `1 ≤ max ≤ TULA_READ_MAX_TENSORS` (0 otherwise or on allocation
+  failure). Real checkpoints pass 256: Llama-2-7B has 291 tensors.
 - `fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len) -> 0 |
   TULA_ERR_*` — append a tensor. `name` cstring (≤47 chars, truncated
   otherwise — two long names can truncate to the same stored name, see
   `SECURITY.md`), `shape` an `i64[ndim]` array, `data`/`data_len` the raw payload
-  bytes (already packed for quantized dtypes). Pointers are borrowed until
+  bytes (already packed for quantized dtypes). The name and shape are **copied
+  at add** (1.2.0; before, they were borrowed until `finish`, so reusing one
+  shape buffer gave every tensor the last shape); `data` is borrowed until
   `finish`. Errors, each leaving the builder unchanged: `TULA_ERR_TOO_MANY`
-  (`TULA_BUILDER_MAX` reached), `TULA_ERR_NDIM` (`ndim` outside 0..8),
+  (the builder's cap reached), `TULA_ERR_NDIM` (`ndim` outside 0..8),
   `TULA_ERR_BOUNDS` (`data_len < 0`), `TULA_ERR_TOO_BIG` (the payload would pass
   `TULA_READ_MAX_BYTES`). *1.1.2: the last three were accepted before and wrote
   a corrupt or unreadable file.*
+- `fn tula_builder_add_checked(b, name, dtype, shape, ndim, data, data_len) -> 0 |
+  TULA_ERR_*` *(1.2.0)* — `tula_builder_add`, also refusing a name over 47 chars
+  (`TULA_ERR_NAME_LONG`, instead of truncating it) and a name the builder already
+  holds, from either kind of add (`TULA_ERR_DUP_NAME`). The check is O(1) per
+  add, through a name index. A builder fed only through this, with each
+  `data_len` equal to `tula_packed_len(dtype, nelems)`, writes files
+  `tula_validate_strict` accepts.
 - `fn tula_builder_finish(b) -> buf | 0` — serialize to one contiguous
   **unsigned** buffer (0 if the allocation fails). Use `tula_total_len(buf)` for
   its length. Every byte is written (alignment padding is zero), so the same
@@ -106,6 +125,10 @@ Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 - `fn tula_find(r, name) -> e | 0` — first entry with that name (exact match; a
   query over 47 chars never matches, since no stored name is that long).
 - `fn tula_is_signed(r) -> 0 | 64` — signature **presence** (length), not validity.
+- `fn tula_entry_nelems(e) -> n | -1` *(1.2.0, `src/dtype.cyr`)* — element count:
+  the product of the dims, so 1 for a 0-dim entry (a scalar) and 0 for an empty
+  tensor. −1 for a negative dim or a product over `TULA_READ_MAX_BYTES`
+  (overflow-safe).
 
 The reader is zero-copy over `buf`; accessors return pointers *into* it.
 
@@ -114,6 +137,10 @@ The reader is zero-copy over `buf`; accessors return pointers *into* it.
 - `fn tula_verify(r, pk) -> TulaSigStatus` — `TULA_SIG_UNSIGNED` (0) /
   `TULA_SIG_OK` (1) / `TULA_SIG_BAD` (2). `pk` is a 32-byte Ed25519 public key.
   Requires a buffer that passed `tula_open`/`tula_validate`.
+- `fn tula_verify_required(r, pk) -> TULA_OK | TULA_ERR_UNSIGNED | TULA_ERR_SIG`
+  *(1.2.0)* — the same check for a consumer that requires a signature. A stripped
+  signature leaves a valid *unsigned* file, which this rejects as firmly as a bad
+  one.
 
 Crypto is `sigil`'s; keys are the caller's (tula owns no key management).
 
@@ -134,6 +161,35 @@ tula files are self-describing (the header carries the total length). Both
 readers compare it with the file's real size via `lseek(SEEK_END)`, not
 `stat()`, and reject a source that can't be sized (a pipe). A file *longer* than
 its total opens, and the readers take exactly the declared bytes.
+
+## Consumer checks — `src/check.cyr` *(1.2.0)*
+
+- `fn tula_validate_strict(buf, len) -> TULA_OK | TULA_ERR_*` — runs
+  `tula_validate` (returning its code on failure), then accepts only a
+  **canonical** buffer, exactly what a correct tula writer produces:
+  - `TULA_ERR_LAYOUT`: `len` is not exactly the file's total; a tensor's payload
+    doesn't start where the previous one's 8-aligned end left off (overlap, gap,
+    misalignment, reordering); the payload runs past the last tensor; or a
+    padding byte, or a name byte after the NUL, is non-zero.
+  - `TULA_ERR_DTYPE`: an unknown dtype.
+  - `TULA_ERR_SHAPE`: a negative dim, a non-zero dim past `ndim`, or `data_len` ≠
+    `tula_packed_len(dtype, nelems)` (a 0-dim entry holds one element).
+  - `TULA_ERR_DUP_NAME`: two tensors share a name.
+  - `TULA_ERR_OOM`: no memory for the duplicate check (over 512 tensors).
+
+  Duplicates are found by a heapsort of (name hash, entry) records, worst case
+  O(n log n) whatever the names: untrusted names never go into a hash table, so
+  a crafted file can't make the check quadratic. ~210 ns per tensor
+  ([benchmarks](benchmarks.md)). Structure only; authenticity is
+  `tula_verify_required`. To read a file strictly, call `tula_read_file` /
+  `tula_open_mmap`, then `tula_validate_strict(r, tula_total_len(r))`.
+- `fn tula_find_scale(r, e, need) -> se | 0` — the `"<name>.scale"` sidecar of
+  entry `e` (ADR 0002), checked for an unpack that will read `need` scales. It
+  must exist, be f64, pass `tula_entry_payload_ok`, and hold at least `need`
+  elements in at least `need * 8` bytes. `need` is 1 for a per-tensor scale, the
+  row count for per-row, or `tula_nf4_blocks(nelems, block)` for NF4. Returns 0
+  for `need < 1`, or for a name over 41 chars, whose sidecar name couldn't be
+  stored untruncated.
 
 ## dtype payload helpers — `src/dtype.cyr`
 
@@ -180,18 +236,24 @@ Double-quant composes: int8-quantize a `"<name>.scale"` tensor and store its own
 
 ```
 # write
-b = tula_builder_new()
-tula_builder_add(b, "w", TULA_DT_F64, shape, ndim, data, len)
+b = tula_builder_new()                  # or tula_builder_new_cap(n) past 256 tensors
+if (tula_builder_add_checked(b, "w", TULA_DT_F64, shape, ndim, data, len) != 0) { ...fix input... }
 buf = tula_builder_finish_signed(b, sk)
 tula_write_file("model.tula", buf, tula_total_len(buf))
 
 # read (untrusted)
 r = tula_read_file("model.tula")        # 0 if malformed
 if (r == 0) { ...reject... }
-if (tula_verify(r, pk) != TULA_SIG_OK) { ...reject... }
+if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { ...reject... }
+if (tula_verify_required(r, pk) != TULA_OK) { ...reject... }
 e = tula_find(r, "w")
+if (e == 0) { ...reject... }
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
+# a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
 ```
+
+`tula_validate_strict` and `tula_verify_required` are 1.2.0. On 1.0–1.1, use
+`tula_verify(r, pk) != TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

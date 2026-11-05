@@ -1,0 +1,339 @@
+# tests/tcyr/strict.tcyr — the 1.2.0 consumer checks: tula_validate_strict (a
+# buffer passes iff it is canonical), tula_verify_required, tula_find_scale and
+# tula_entry_nelems. Each strict rule is broken one at a time on a canonical
+# fixture that covers all four dtypes, a 0-dim scalar and an empty tensor.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn shape2(a, b): i64 {
+    var s = alloc(16);
+    store64(s, a);
+    store64(s + 8, b);
+    return s;
+}
+
+fn filled(n, v): i64 {
+    var p = alloc(n + 8);
+    var i = 0;
+    while (i < n) { store8(p + i, v); i = i + 1; }
+    return p;
+}
+
+# A canonical builder: f64 [2,3] · int8 [5] · ternary [10] · nf4 [7] · f64 scalar
+# (0-dim) · f64 [0,4] (empty). Odd lengths, so every padding width is exercised.
+fn canon_builder(): i64 {
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "w", TULA_DT_F64, shape2(2, 3), 2, filled(48, 17), 48);
+    tula_builder_add_checked(b, "q", TULA_DT_INT8, shape1(5), 1, filled(5, 3), 5);
+    tula_builder_add_checked(b, "t", TULA_DT_TERNARY, shape1(10), 1, filled(3, 0x21), 3);
+    tula_builder_add_checked(b, "n", TULA_DT_NF4, shape1(7), 1, filled(4, 0x37), 4);
+    tula_builder_add_checked(b, "s", TULA_DT_F64, shape1(0), 0, filled(8, 9), 8);
+    tula_builder_add_checked(b, "e", TULA_DT_F64, shape2(0, 4), 2, filled(0, 0), 0);
+    return b;
+}
+
+fn canon(): i64 {
+    return tula_builder_finish(canon_builder());
+}
+
+fn entry_named(r, name): i64 {
+    return tula_find(r, name);
+}
+
+# Copy `len` bytes into a buffer `extra` bytes longer (zero-filled tail).
+fn grown_copy(buf, len, extra): i64 {
+    var p = alloc(len + extra + 8);
+    var i = 0;
+    while (i < len) { store8(p + i, load8(buf + i)); i = i + 1; }
+    while (i < len + extra) { store8(p + i, 0); i = i + 1; }
+    return p;
+}
+
+fn strict(buf): i64 {
+    return tula_validate_strict(buf, tula_total_len(buf));
+}
+
+fn test_canonical_passes() {
+    var buf = canon();
+    assert_eq(tula_validate(buf, tula_total_len(buf)), TULA_OK, "fixture validates");
+    assert_eq(strict(buf), TULA_OK, "checked-builder output is strict-valid");
+    var one = tula_builder_new();
+    tula_builder_add_checked(one, "only", TULA_DT_INT8, shape1(1), 1, filled(1, 1), 1);
+    assert_eq(strict(tula_builder_finish(one)), TULA_OK, "a one-tensor file is strict-valid");
+    var none = tula_builder_new();
+    assert_eq(strict(tula_builder_finish(none)), TULA_OK, "an empty file is strict-valid");
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, i + 5); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var sb = tula_builder_finish_signed(canon_builder(), sk);
+    assert_eq(strict(sb), TULA_OK, "signed checked-builder output is strict-valid");
+    return 0;
+}
+
+fn test_validate_errors_pass_through() {
+    var buf = canon();
+    var len = tula_total_len(buf);
+    assert_eq(tula_validate_strict(buf, len - 1), TULA_ERR_TRUNCATED, "a validate error is returned as is");
+    store64(buf, 0);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_MAGIC, "bad magic -> MAGIC, as validate");
+    return 0;
+}
+
+fn test_layout_rules() {
+    var buf = canon();
+    var len = tula_total_len(buf);
+    var big = grown_copy(buf, len, 8);
+    assert_eq(tula_validate(big, len + 8), TULA_OK, "trailing bytes pass validate");
+    assert_eq(tula_validate_strict(big, len + 8), TULA_ERR_LAYOUT, "trailing bytes -> LAYOUT");
+
+    buf = canon();
+    store8(entry_named(buf, "w") + 3, 90);                 # "w\0\0Z"
+    assert_eq(tula_validate(buf, len), TULA_OK, "a name byte after the NUL passes validate");
+    assert_eq(strict(buf), TULA_ERR_LAYOUT, "a name byte after the NUL -> LAYOUT");
+
+    buf = canon();
+    store64(entry_named(buf, "q") + 128, 0);               # q's payload over w's
+    assert_eq(tula_validate(buf, len), TULA_OK, "overlap passes validate");
+    assert_eq(strict(buf), TULA_ERR_LAYOUT, "overlapping tensors -> LAYOUT");
+
+    # A pure gap: a [8] at 0, b [1] at 8; grow the payload by 8 and move b to 16,
+    # so bytes 8..16 belong to no tensor and nothing else is wrong.
+    var gb = tula_builder_new();
+    tula_builder_add_checked(gb, "a", TULA_DT_INT8, shape1(8), 1, filled(8, 1), 8);
+    tula_builder_add_checked(gb, "b", TULA_DT_INT8, shape1(1), 1, filled(1, 2), 1);
+    var g0 = tula_builder_finish(gb);
+    var glen = tula_total_len(g0);
+    var gap = grown_copy(g0, glen, 8);
+    store64(gap + 40, load64(gap + 40) + 8);
+    var egb = gap + TULA_HEADER_SIZE + TULA_ENTRY_SIZE;
+    var bsrc = gap + load64(gap + 32) + 8;
+    store8(bsrc + 8, load8(bsrc));
+    store8(bsrc, 0);
+    store64(egb + 128, 16);
+    assert_eq(tula_validate(gap, glen + 8), TULA_OK, "a gap passes validate");
+    assert_eq(tula_validate_strict(gap, glen + 8), TULA_ERR_LAYOUT, "a gap between tensors -> LAYOUT");
+
+    # A gap and an overlap that cancel: a moved onto b, so bytes 0..8 belong to
+    # no tensor, yet the 8-aligned lengths still sum to payload_len. Only the
+    # "starts exactly at the cursor" rule catches this one.
+    var cb = tula_builder_new();
+    tula_builder_add_checked(cb, "a", TULA_DT_INT8, shape1(8), 1, filled(8, 1), 8);
+    tula_builder_add_checked(cb, "b", TULA_DT_INT8, shape1(8), 1, filled(8, 2), 8);
+    var cancel = tula_builder_finish(cb);
+    store64(cancel + TULA_HEADER_SIZE + 128, 8);
+    assert_eq(tula_validate(cancel, tula_total_len(cancel)), TULA_OK, "gap + overlap passes validate");
+    assert_eq(strict(cancel), TULA_ERR_LAYOUT, "a gap and an overlap that cancel -> LAYOUT");
+
+    buf = canon();
+    var eq = entry_named(buf, "q");
+    store64(eq + 128, load64(eq + 128) + 1);               # misaligned
+    assert_eq(strict(buf), TULA_ERR_LAYOUT, "a misaligned data_off -> LAYOUT");
+
+    buf = canon();
+    eq = entry_named(buf, "q");
+    var pad = buf + load64(buf + 32) + load64(eq + 128) + 5; # first padding byte after q
+    store8(pad, 1);
+    assert_eq(tula_validate(buf, len), TULA_OK, "a non-zero padding byte passes validate");
+    assert_eq(strict(buf), TULA_ERR_LAYOUT, "a non-zero padding byte -> LAYOUT");
+
+    # payload_len 8 past the last tensor (unsigned: grow the file to match)
+    buf = canon();
+    var g = grown_copy(buf, len, 8);
+    store64(g + 40, load64(g + 40) + 8);
+    assert_eq(tula_validate(g, len + 8), TULA_OK, "payload past the last tensor passes validate");
+    assert_eq(tula_validate_strict(g, len + 8), TULA_ERR_LAYOUT, "payload past the last tensor -> LAYOUT");
+    return 0;
+}
+
+fn test_shape_and_dtype_rules() {
+    var buf = canon();
+    var len = tula_total_len(buf);
+    store64(entry_named(buf, "q") + 64 + 8, 7);            # q is 1-D; dim 1 set
+    assert_eq(tula_validate(buf, len), TULA_OK, "a dim past ndim passes validate");
+    assert_eq(strict(buf), TULA_ERR_SHAPE, "a non-zero dim past ndim -> SHAPE");
+
+    buf = canon();
+    store64(entry_named(buf, "w") + 64, 0 - 2);
+    assert_eq(strict(buf), TULA_ERR_SHAPE, "a negative dim -> SHAPE");
+
+    buf = canon();
+    store64(entry_named(buf, "q") + 48, 9);
+    assert_eq(tula_validate(buf, len), TULA_OK, "an unknown dtype passes validate");
+    assert_eq(strict(buf), TULA_ERR_DTYPE, "an unknown dtype -> DTYPE");
+
+    var b = tula_builder_new();
+    tula_builder_add(b, "short", TULA_DT_F64, shape1(3), 1, filled(16, 1), 16);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "f64 [3] in 16 bytes -> SHAPE");
+    b = tula_builder_new();
+    tula_builder_add(b, "long", TULA_DT_INT8, shape1(3), 1, filled(8, 1), 8);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "int8 [3] in 8 bytes -> SHAPE (exact, not at-least)");
+    b = tula_builder_new();
+    tula_builder_add(b, "s2", TULA_DT_F64, shape1(0), 0, filled(16, 1), 16);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "a 0-dim f64 in 16 bytes -> SHAPE (one element)");
+    b = tula_builder_new();
+    tula_builder_add(b, "e2", TULA_DT_F64, shape2(0, 4), 2, filled(8, 1), 8);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "an empty tensor with bytes -> SHAPE");
+    return 0;
+}
+
+# A builder of n tensors named "t0000".."t<n-1>", the name at index `dup`
+# repeated at index n-1 when dup >= 0. Plain adds, so duplicates get in.
+fn named_file(n, dup): i64 {
+    var b = tula_builder_new_cap(n);
+    var nm = alloc(16);
+    var data = filled(1, 4);
+    var sh = shape1(1);
+    var i = 0;
+    while (i < n) {
+        var v = i;
+        if (i == n - 1) { if (dup >= 0) { v = dup; } }
+        store8(nm, 116);
+        store8(nm + 1, 48 + (v / 1000) % 10);
+        store8(nm + 2, 48 + (v / 100) % 10);
+        store8(nm + 3, 48 + (v / 10) % 10);
+        store8(nm + 4, 48 + v % 10);
+        store8(nm + 5, 0);
+        tula_builder_add(b, nm, TULA_DT_INT8, sh, 1, data, 1);
+        i = i + 1;
+    }
+    return tula_builder_finish(b);
+}
+
+fn test_duplicates() {
+    var b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_INT8, shape1(1), 1, filled(1, 1), 1);
+    tula_builder_add(b, "w", TULA_DT_INT8, shape1(1), 1, filled(1, 2), 1);
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_validate(buf, tula_total_len(buf)), TULA_OK, "duplicate names pass validate");
+    assert_eq(strict(buf), TULA_ERR_DUP_NAME, "duplicate names -> DUP_NAME");
+    # either side of the pairwise / sort threshold (32 | 33), and well past it
+    assert_eq(strict(named_file(32, 0 - 1)), TULA_OK, "32 distinct names (pairwise path)");
+    assert_eq(strict(named_file(32, 0)), TULA_ERR_DUP_NAME, "32 names, first == last (pairwise path)");
+    assert_eq(strict(named_file(33, 0 - 1)), TULA_OK, "33 distinct names (sort path)");
+    assert_eq(strict(named_file(33, 0)), TULA_ERR_DUP_NAME, "33 names, first == last (sort path)");
+    assert_eq(strict(named_file(1000, 0 - 1)), TULA_OK, "1000 distinct names");
+    assert_eq(strict(named_file(1000, 3)), TULA_ERR_DUP_NAME, "1000 names, #3 == #999");
+    assert_eq(strict(named_file(1000, 998)), TULA_ERR_DUP_NAME, "1000 names, adjacent pair");
+    assert_eq(strict(named_file(1000, 500)), TULA_ERR_DUP_NAME, "1000 names, a middle pair");
+    return 0;
+}
+
+fn test_verify_required() {
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, 3 * i + 1); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var sb = tula_builder_finish_signed(canon_builder(), sk);
+    var r = tula_open(sb, tula_total_len(sb));
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "valid signature -> TULA_OK");
+    var u = canon();
+    assert_eq(tula_verify_required(tula_open(u, tula_total_len(u)), pk), TULA_ERR_UNSIGNED, "unsigned -> UNSIGNED");
+    var w = tula_entry_data(r, tula_find(r, "w"));
+    store8(w, load8(w) ^ 1);
+    assert_eq(tula_validate_strict(sb, tula_total_len(sb)), TULA_OK, "a flipped payload bit is still strict-valid");
+    assert_eq(tula_verify_required(r, pk), TULA_ERR_SIG, "... but fails verify_required");
+    store8(w, load8(w) ^ 1);
+    var pk2 = alloc(32);
+    var sk2 = alloc(64);
+    store8(seed, 200);
+    ed25519_keypair(seed, sk2, pk2);
+    assert_eq(tula_verify_required(r, pk2), TULA_ERR_SIG, "wrong key -> SIG");
+    return 0;
+}
+
+fn test_find_scale() {
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "w", TULA_DT_NF4, shape1(100), 1, filled(50, 0x77), 50);
+    tula_builder_add_checked(b, "w.scale", TULA_DT_F64, shape1(2), 1, filled(16, 0), 16);
+    tula_builder_add_checked(b, "x", TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    tula_builder_add_checked(b, "y", TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    tula_builder_add_checked(b, "y.scale", TULA_DT_INT8, shape1(1), 1, filled(1, 1), 1);
+    tula_builder_add(b, "z", TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    tula_builder_add(b, "z.scale", TULA_DT_F64, shape1(4), 1, filled(8, 0), 8);   # lies: [4] in 8 bytes
+    tula_builder_add(b, "u", TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    tula_builder_add(b, "u.scale", TULA_DT_F64, shape1(0), 0, filled(8, 0), 8);   # 0-dim, 8 bytes
+    tula_builder_add(b, "v", TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    tula_builder_add(b, "v.scale", TULA_DT_F64, shape1(0), 0, filled(0, 0), 0);   # 0-dim, no bytes
+    var n41 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDE";       # 41 chars: sidecar fits in 47
+    var n42 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF";      # 42: it can't
+    tula_builder_add_checked(b, n41, TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    var s41 = "abcdefghijklmnopqrstuvwxyz0123456789ABCDE.scale";   # 47 chars
+    tula_builder_add_checked(b, s41, TULA_DT_F64, shape1(1), 1, filled(8, 0), 8);
+    tula_builder_add_checked(b, n42, TULA_DT_INT8, shape1(4), 1, filled(4, 1), 4);
+    var buf = tula_builder_finish(b);
+    var r = tula_open(buf, tula_total_len(buf));
+    assert(r != 0, "find_scale fixture opens");
+    var ew = tula_find(r, "w");
+    var need = tula_nf4_blocks(tula_entry_nelems(ew), TULA_NF4_BLOCK);
+    assert_eq(need, 2, "nf4 [100] at block 64 needs 2 scales");
+    assert(tula_find_scale(r, ew, need) == tula_find(r, "w.scale"), "w.scale found for 2 scales");
+    assert_eq(tula_find_scale(r, ew, 3), 0, "3 scales wanted, 2 held -> 0");
+    assert_eq(tula_find_scale(r, ew, 0), 0, "need 0 -> 0");
+    assert_eq(tula_find_scale(r, tula_find(r, "x"), 1), 0, "no sidecar -> 0");
+    assert_eq(tula_find_scale(r, tula_find(r, "y"), 1), 0, "an int8 sidecar -> 0");
+    assert_eq(tula_find_scale(r, tula_find(r, "z"), 1), 0, "a sidecar whose shape lies -> 0");
+    assert(tula_find_scale(r, tula_find(r, "u"), 1) == tula_find(r, "u.scale"), "a 0-dim 8-byte sidecar holds 1 scale");
+    assert_eq(tula_find_scale(r, tula_find(r, "u"), 2), 0, "... not 2");
+    assert_eq(tula_find_scale(r, tula_find(r, "v"), 1), 0, "a 0-dim sidecar with no bytes -> 0");
+    assert(tula_find_scale(r, tula_find(r, n41), 1) != 0, "a 41-char name's sidecar is found");
+    assert_eq(tula_find_scale(r, tula_find(r, n42), 1), 0, "a 42-char name has no untruncated sidecar -> 0");
+    return 0;
+}
+
+fn test_nelems() {
+    var e = alloc(TULA_ENTRY_SIZE);
+    var z = 0;
+    while (z < 18) { store64(e + z * 8, 0); z = z + 1; }
+    store64(e + 56, 2);
+    store64(e + 64, 2);
+    store64(e + 72, 3);
+    assert_eq(tula_entry_nelems(e), 6, "[2,3] -> 6");
+    store64(e + 56, 0);
+    assert_eq(tula_entry_nelems(e), 1, "0-dim -> 1 (a scalar)");
+    store64(e + 56, 2);
+    store64(e + 64, 0);
+    store64(e + 72, 5);
+    assert_eq(tula_entry_nelems(e), 0, "[0,5] -> 0 (empty)");
+    store64(e + 72, 0 - 5);
+    assert_eq(tula_entry_nelems(e), 0 - 1, "[0,-5] -> -1");
+    store64(e + 56, 1);
+    store64(e + 64, 0 - 1);
+    assert_eq(tula_entry_nelems(e), 0 - 1, "[-1] -> -1");
+    store64(e + 56, 3);
+    store64(e + 64, 0x40000000);
+    store64(e + 72, 0x40000000);
+    store64(e + 80, 2);
+    assert_eq(tula_entry_nelems(e), 0 - 1, "[2^30,2^30,2] -> -1 (over the cap)");
+    store64(e + 80, 0);
+    assert_eq(tula_entry_nelems(e), 0, "[2^30,2^30,0] -> 0 (empty, no overflow verdict)");
+    store64(e + 56, 9);
+    assert_eq(tula_entry_nelems(e), 0 - 1, "ndim 9 -> -1");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_canonical_passes();
+    test_validate_errors_pass_through();
+    test_layout_rules();
+    test_shape_and_dtype_rules();
+    test_duplicates();
+    test_verify_required();
+    test_find_scale();
+    test_nelems();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

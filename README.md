@@ -50,11 +50,16 @@ The full march M0→M5:
   file readers check the header against the real file size; hot paths 1.2–11.6×
   faster, byte-identical output.
 
-**178/178** assertions across 6 suites (builder · round-trip · sign · file-io ·
-dtype · hardening) + a >10⁶-iteration guard-page fuzz harness and an end-to-end
-consumer, all green. Deps: stdlib + **sigil** (Ed25519); the cyrius pin lives in
-`cyrius.cyml`. CI + release workflows in place. Post-1.0 changes are
-additive-only (SemVer); next is 1.2.0 (real checkpoints, checked). See
+- **1.2.0** — real checkpoints, checked: `tula_builder_new_cap`,
+  `tula_builder_add_checked`, `tula_validate_strict` (canonical layout, unique
+  names, shape ↔ size), `tula_verify_required`, `tula_find_scale`,
+  `tula_entry_nelems`.
+
+**274/274** assertions across 7 suites (builder · strict · round-trip · sign ·
+file-io · dtype · hardening) + a >2·10⁶-iteration guard-page fuzz harness and an
+end-to-end consumer, all green. Deps: stdlib + **sigil** (Ed25519); the cyrius
+pin lives in `cyrius.cyml`. CI + release workflows in place. Post-1.0 changes are
+additive-only (SemVer); next is 1.3.0 (long names, F32/F16/BF16). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test

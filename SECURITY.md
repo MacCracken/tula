@@ -50,15 +50,21 @@ For any buffer where `tula_open(buf, len) != 0`:
   attacker-sized strings or arrays to overflow — the class behind the 2024 GGUF
   parser CVEs (see the [audit](docs/audit/2026-11-04-audit.md)).
 
-## What the reader does NOT reject
+## Bounds vs consistency: `tula_validate` and `tula_validate_strict`
 
-`tula_validate` checks **bounds**, not **consistency**. A file that passes it
-can still have tensors that overlap or leave gaps, duplicate names, a `data_off`
-that is not 8-byte aligned, a shape that does not match `data_len`, or an
-unknown dtype. None of these lets tula's accessors read out of bounds, but a
-consumer that cares must check them itself (a strict validator is planned for
-1.2.0). Overlap matters for cost: many entries pointing at the same bytes make
-a small file decode into a lot of work.
+`tula_validate` (and so `tula_open` and the file readers) checks **bounds**, not
+**consistency**. A file that passes it can still have tensors that overlap or
+leave gaps, duplicate names, a `data_off` that is not 8-byte aligned, a shape
+that does not match `data_len`, or an unknown dtype. None of these lets tula's
+accessors read out of bounds. They stay accepted because 1.x writers can produce
+some of them (the plain builder allows duplicate names).
+
+**`tula_validate_strict` (1.2.0) rejects all of them.** It accepts only a
+canonical buffer, exactly what a correct tula writer produces. Run it on any
+file you didn't write. Overlap matters for cost too: many entries pointing at the
+same bytes make a small file decode into a lot of work, and strict rejects that.
+Its duplicate check sorts names (worst case O(n log n)) rather than hashing them,
+so crafted names can't make it quadratic.
 
 ## Caller responsibilities
 
@@ -70,23 +76,28 @@ a small file decode into a lot of work.
   `tula_entry_payload_ok` cross-checks dtype+shape against `data_len`
   (overflow-safe) so this is a one-line guard.
 - **Check a quantized tensor's scale sidecar too.** `tula_nf4_unpack` reads
-  `tula_nf4_blocks(n, block)` scales from the `"<name>.scale"` tensor. Run
-  `tula_entry_payload_ok` on the sidecar as well, and check that its element
-  count is at least that many. A 0-dim entry has no element count, so check its
-  `data_len` yourself if you read it as a scalar.
-- **Verify signatures you rely on.** `tula_verify` returns `TULA_SIG_UNSIGNED` /
-  `TULA_SIG_OK` / `TULA_SIG_BAD` — treat `UNSIGNED` and `BAD` as untrusted.
-  Stripping the signature from a signed file gives a valid *unsigned* file, so a
-  consumer that requires signatures must reject `UNSIGNED`, not only `BAD`.
+  `tula_nf4_blocks(n, block)` scales from the `"<name>.scale"` tensor. Get the
+  sidecar with `tula_find_scale(r, e, need)` (1.2.0): it returns 0 unless the
+  sidecar exists, is f64, and holds at least `need` scales. (By hand: run
+  `tula_entry_payload_ok` on the sidecar and check its element count.)
+  `tula_entry_payload_ok` treats a 0-dim entry as having no contract; under
+  `tula_validate_strict` a 0-dim entry must hold exactly one element.
+- **Verify signatures you rely on.** Stripping the signature from a signed file
+  gives a valid *unsigned* file, so a consumer that requires signatures must
+  reject `UNSIGNED`, not only `BAD`. `tula_verify_required(r, pk)` (1.2.0)
+  returns `TULA_OK` only for a valid signature. With `tula_verify`, treat both
+  `TULA_SIG_UNSIGNED` and `TULA_SIG_BAD` as untrusted.
 - **Map only files nobody else writes.** A `tula_open_mmap` mapping shows the
   file as it is now: a process that truncates or rewrites it after validation
   can change validated bytes, or make a later read SIGBUS. Use `tula_read_file`
   (a private copy) for files in a location others can write.
-- **Keep names unique and under 48 bytes when writing.** Names over 47
-  characters are truncated (frozen v1 behaviour), so two distinct long names can
+- **Write through `tula_builder_add_checked`** (1.2.0). The plain add truncates
+  names over 47 characters (frozen v1 behaviour), so two distinct long names can
   become the same stored name. The LoRA pair `…q_proj.lora_A.weight` /
   `…q_proj.lora_B.weight` under a `base_model.model.model.layers.N.self_attn.`
-  prefix does. `tula_find` returns the first match.
+  prefix does, and `tula_find` returns the first match. The checked add refuses
+  the long name (`TULA_ERR_NAME_LONG`) and any repeat (`TULA_ERR_DUP_NAME`).
+  Names that long need the 1.3.0 long-name extension.
 - **Manage your own keys.** Use a trustworthy source for `sk`/`pk`.
 
 ## Reporting a vulnerability

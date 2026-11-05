@@ -2,8 +2,13 @@
 # v1.0 "≥1 consumer green" gate. It plays the role of a quantizing checkpoint
 # writer + a hardened loader, exercising the whole public surface end-to-end:
 #
-#   quantize (ternary) -> builder + sidecar scale -> sign -> write -> read
-#   (untrusted) -> verify signature -> payload-ok guard -> unpack -> dequant.
+#   quantize (ternary) -> checked builder + sidecar scale -> sign -> write ->
+#   read (untrusted) -> strict validate -> signature required -> scale lookup +
+#   payload-ok guard -> unpack -> dequant.
+#
+# 1.2.0: written with tula_builder_add_checked (no silent name truncation, no
+# duplicates), loaded with tula_validate_strict + tula_verify_required +
+# tula_find_scale, so each consistency question is one call.
 #
 # In-repo it includes src/lib.cyr; a real external consumer pulls dist/tula.cyr
 # via [deps.tula] and supplies its own sigil (the bundle leaves ed25519_*
@@ -90,9 +95,9 @@ fn main(): i64 {
     store64(shapeB, bn);
 
     var b = tula_builder_new();
-    tula_builder_add(b, "layer.w", TULA_DT_TERNARY, shapeW, 1, packed, plen);
-    tula_builder_add(b, "layer.w.scale", TULA_DT_F64, shapeS, 1, gbuf, 8);
-    tula_builder_add(b, "layer.b", TULA_DT_F64, shapeB, 1, bias, bn * 8);
+    if (tula_builder_add_checked(b, "layer.w", TULA_DT_TERNARY, shapeW, 1, packed, plen) != 0) { return 1; }
+    if (tula_builder_add_checked(b, "layer.w.scale", TULA_DT_F64, shapeS, 1, gbuf, 8) != 0) { return 1; }
+    if (tula_builder_add_checked(b, "layer.b", TULA_DT_F64, shapeB, 1, bias, bn * 8) != 0) { return 1; }
     var buf = tula_builder_finish_signed(b, sk);
     var total = tula_total_len(buf);
 
@@ -108,26 +113,28 @@ fn main(): i64 {
     # ================================================================
     var r = tula_read_file(path);
     if (r == 0) { sput("FAIL: model did not open\n"); return 1; }
+
+    # 1. consistency — canonical layout, unique names, every shape matching its
+    #    bytes. After this, data_len == the dtype's packed length for every entry.
+    var src = tula_validate_strict(r, tula_total_len(r));
+    if (src != TULA_OK) { sput("FAIL: strict: "); sput(tula_err_name(src)); sput("\n"); return 1; }
     if (tula_count(r) != 3) { sput("FAIL: tensor count\n"); return 1; }
 
-    # 1. authenticity — UNSIGNED is as untrusted as BAD
-    if (tula_verify(r, pk) != TULA_SIG_OK) { sput("FAIL: signature\n"); return 1; }
+    # 2. authenticity — a stripped (UNSIGNED) file is rejected as firmly as BAD
+    if (tula_verify_required(r, pk) != TULA_OK) { sput("FAIL: signature\n"); return 1; }
     sput("signature: OK\n");
 
-    # 2. locate + guard the ternary weight AND its scale sidecar, then unpack +
-    #    dequant. Each tensor read gets its own payload_ok, and its rank and dims
-    #    are checked against what this consumer expects before they size anything.
+    # 3. locate the ternary weight and its per-tensor scale sidecar, then unpack +
+    #    dequant. Rank, dims and dtype are still checked against what THIS
+    #    consumer expects before they size anything — strict proves the file is
+    #    self-consistent, not that it is the model you wanted.
     var ew = tula_find(r, "layer.w");
-    var es = tula_find(r, "layer.w.scale");
     if (ew == 0) { sput("FAIL: layer.w missing\n"); return 1; }
-    if (es == 0) { sput("FAIL: layer.w.scale missing\n"); return 1; }
     if (tula_entry_dtype(ew) != TULA_DT_TERNARY) { sput("FAIL: layer.w dtype\n"); return 1; }
-    if (tula_entry_dtype(es) != TULA_DT_F64) { sput("FAIL: scale dtype\n"); return 1; }
     if (tula_entry_ndim(ew) != 1) { sput("FAIL: layer.w rank\n"); return 1; }
-    if (tula_entry_ndim(es) != 1) { sput("FAIL: scale rank\n"); return 1; }
-    if (tula_entry_dim(es, 0) != 1) { sput("FAIL: scale is not per-tensor\n"); return 1; }
     if (tula_entry_payload_ok(ew) != 1) { sput("FAIL: payload guard (weight)\n"); return 1; }
-    if (tula_entry_payload_ok(es) != 1) { sput("FAIL: payload guard (scale)\n"); return 1; }
+    var es = tula_find_scale(r, ew, 1);   # one per-tensor scale
+    if (es == 0) { sput("FAIL: layer.w.scale missing or short\n"); return 1; }
 
     var gamma2 = load64(tula_entry_data(r, es));
     var wn = tula_entry_dim(ew, 0);
