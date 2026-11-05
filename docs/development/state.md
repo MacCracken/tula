@@ -1,6 +1,6 @@
 # tula — Current State
 
-> **Last refresh**: 2026-11-04 | **Cadence**: every release.
+> **Last refresh**: 2026-11-05 | **Cadence**: every release.
 > `CLAUDE.md` is preferences / process (durable); this file is **state**
 > (volatile) — version, sizes, counts.
 
@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.6.0** (`tula_version_int()` returns `10600`). 1.0.1–1.1.1 are
+VERSION is **1.6.1** (`tula_version_int()` returns `10601`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -41,18 +41,25 @@ name index (`src/index.cyr`), sorted so crafted names can't degrade it, and the
 `make realmodels` gate over five real checkpoint inventories. **1.6.0 — file
 metadata** (ADR 0008): sorted key/value text pairs in the `__tula.meta__` table
 (`src/meta.cyr`), signed with the tensors, and readable by every 1.x reader.
+**1.6.1** (patch): on Linux the streaming writers build the file in a nameless
+`O_TMPFILE` inode and name it only once it is signed, closing ADR 0006's
+write-to-sign window (the named `O_EXCL` temp is the fallback); fuzz phase H
+checks the writers against `finish`; CI gains native aarch64 Linux and macOS
+runners.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.6.0)
+## Tests, fuzz, gates (1.6.1)
 
-**533 assertions** across 12 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
-`builder.tcyr` 67, `strict.tcyr` 67, `dtype.tcyr` 50, `floats.tcyr` 37,
-`stream.tcyr` 34, `fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22,
+**550 assertions** across 12 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
+`builder.tcyr` 67, `strict.tcyr` 67, `stream.tcyr` 51, `dtype.tcyr` 50,
+`floats.tcyr` 37, `fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22,
 `index.tcyr` 13, `sign.tcyr` 8.
-- `make fuzz` includes phase G (a metadata table under mutation, with brute-force
-  checks on strict accepts).
+- **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
+  consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
+  same on native `ubuntu-26.04-arm` (a hard gate) and `macos-14` (informational
+  until its first green run; tula has not yet run on macOS).
 - `make realmodels` (CI): GPT-2, Llama-2-7B, Mixtral-8x7B, a LoRA adapter and a
   QLoRA NF4 import (real names, ranks, counts and dtypes; dims ÷ 64), each
   written signed, read, strict-validated, verified and resolved by index.
@@ -64,13 +71,18 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
   against the hardware.
 - `dtype` and `builder` include differential tests against the 1.1.1
   implementations.
-- `make fuzz`: 2,603,000 iterations with every buffer ending at a `PROT_NONE`
-  guard page, 0 faults. It covers:
+- `make fuzz` (CI, ~1 min): 2,904,500 iterations with every buffer ending at a
+  `PROT_NONE` guard page, 0 faults. It covers:
   - a payload-guard + unpack phase (2.1M entries, all seven dtypes);
-  - a strict phase, where 14,455 strict accepts were all confirmed by brute
+  - a strict phase, where 26,968 strict accepts were all confirmed by brute
     force, including the find-name round trip;
-  - phase F, which mutates a names table. `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
-0 undocumented.
+  - phase F, which mutates a names table, and phase G, a metadata table;
+  - phase H (1.6.1): 1,500 random builders through the streaming writers (728
+    nameless, the rest on the named temp), every file byte-identical to
+    `finish`, 437 canonical ones strict-accepted, no temp left behind.
+
+  `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
+  0 undocumented.
 
 ## Toolchain
 
@@ -88,7 +100,7 @@ switch a build prints one `hint:` line naming the unused checkout.
 Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the bundle itself needs.
 tula needs none beyond what sigil's sidecar brings, so there is no `dist/tula.deps`.
 
-**Smoke binary: 590,952 B** (~100 KB code, 488 KB data). Most of the data is bayan's
+**Smoke binary: 591,456 B** (~100 KB code, 488 KB data). Most of the data is bayan's
 `lib/unicode/` tables, which sigil's bundle pulls in. DCE can't drop global initializers,
 and tula itself makes no bayan calls. It shrinks when sigil's open issue
 `2026-11-01-sigil-mldsa-pulls-bayans-unicode-tables.md` lands.
@@ -108,8 +120,8 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next is **1.6.x patches**: nameless `O_TMPFILE` temps for the streaming writers,
-the writers in the fuzzer, and cross-target CI. Later: 1.7.0 integer/boolean dtypes; 1.8.0 FP8 and int4;
+Next: the macOS CI leg becomes a hard gate once it runs green (a 1.6.x patch
+if it needs fixes), then 1.7.0 integer/boolean dtypes. Later: 1.8.0 FP8 and int4;
 1.9.x throughput; the 1.x.x research list; and v2 candidates
 ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

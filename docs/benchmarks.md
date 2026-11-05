@@ -93,6 +93,13 @@ and bit-identical (tested on every 16-bit code and midpoint, and 300k F32 cases)
 | `tula_verify_required`, 2.42 GB | 127–129 s | one SHA-512 pass |
 | sigil SHA-512 (measured directly) | ~18 MB/s | 64 MiB in 3.6 s; `ed25519_sign` 7.2 s, `ed25519_verify` 3.6 s |
 
+### 1.6.1: nameless temp files
+
+| Op | named temp | nameless (the Linux default) | Notes |
+|---|---:|---:|---|
+| `tula_builder_write_file`, 100 MB | 249 ms · 421 MB/s | 249 ms · 421 MB/s | three alternating runs each; the same work plus one `linkat` |
+| `make bigfile`: stream 2.42 GB | — | 5.7 s | 1.4.0 measured 5.6 s on the named path |
+
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
 adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is

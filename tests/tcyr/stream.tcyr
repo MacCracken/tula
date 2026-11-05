@@ -213,6 +213,71 @@ fn test_empty_builder_streams() {
     return 0;
 }
 
+# 1.6.1: on Linux the streaming writers build the file nameless (O_TMPFILE) and
+# name it only once it is complete and signed; the named O_EXCL temp is the
+# fallback. Both paths must give the same bytes and leave nothing behind.
+fn count_entries(dir): i64 {
+    return vec_len(dir_list(str_from(dir)));
+}
+
+fn test_nameless_and_fallback() {
+    xmkdir("build/test_stream_nameless", 0x1ED);
+    xrmdir("build/test_stream_nameless/adir");   # an earlier run's (the counts below need a clean dir)
+    var path = "build/test_stream_nameless/model.tula";
+    var b = small_builder(0x5A);
+    var lname = "base_model.model.model.layers.2.self_attn.v_proj.lora_A.weight";
+    tula_builder_add_long(b, lname, TULA_DT_INT8, alloc(8), 0, alloc(8), 1);
+    tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM");
+    var mem = tula_builder_finish(b);
+    var len = tula_total_len(mem);
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, 2 * i + 3); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var smem = tula_builder_finish_signed(b, sk);
+    var slen = tula_total_len(smem);
+    var out = alloc(slen + 64);
+
+    # Linux takes the nameless path; every other target the named temp.
+    var nameless = 1;
+    #ifdef CYRIUS_TARGET_MACOS
+    nameless = 0;
+    #endif
+    _tula_nameless_off = 0;
+    assert_eq(tula_builder_write_file(b, path), len, "unsigned write (default path)");
+    assert_eq(_tula_nameless_used, nameless, "on Linux the write went through a nameless O_TMPFILE inode");
+    assert_eq(file_read_all(path, out, slen + 64), len, "... file length");
+    assert(bytes_eq(out, mem, len), "... nameless output == tula_builder_finish");
+    assert_eq(tula_builder_write_file_signed(b, path, sk), slen, "signed write (default path)");
+    assert_eq(_tula_nameless_used, nameless, "... nameless too");
+    file_read_all(path, out, slen + 64);
+    assert(bytes_eq(out, smem, slen), "... nameless signed output == tula_builder_finish_signed");
+    assert_eq(count_entries("build/test_stream_nameless"), 1, "the nameless path leaves only the target");
+
+    _tula_nameless_off = 1;
+    assert_eq(tula_builder_write_file_signed(b, path, sk), slen, "signed write, named-temp fallback forced");
+    assert_eq(_tula_nameless_used, 0, "... it took the named path");
+    file_read_all(path, out, slen + 64);
+    assert(bytes_eq(out, smem, slen), "... same bytes as the nameless path");
+    assert_eq(count_entries("build/test_stream_nameless"), 1, "the named path leaves only the target");
+    _tula_nameless_off = 0;
+
+    # a failing nameless write (rename over a directory) leaves nothing behind
+    xmkdir("build/test_stream_nameless/adir", 0x1ED);
+    assert(tula_builder_write_file(b, "build/test_stream_nameless/adir") < 0,
+      "renaming the nameless file over a directory fails");
+    assert_eq(count_entries("build/test_stream_nameless"), 2, "... and leaves only the target and the directory");
+    assert(tula_builder_write_file(b, "build/test_stream_nameless/no_dir/x.tula") < 0,
+      "a missing directory fails on both paths");
+    var r = tula_read_file(path);
+    assert(r != 0, "the target still reads after the failed writes");
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "... and verifies (it is the last good write)");
+    xrmdir("build/test_stream_nameless/adir");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     test_stream_equals_memory();
@@ -221,6 +286,7 @@ fn main(): i64 {
     test_write_file_atomic();
     test_read_into_and_len();
     test_empty_builder_streams();
+    test_nameless_and_fallback();
     return assert_summary();
 }
 

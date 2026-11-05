@@ -221,11 +221,13 @@ Crypto is `sigil`'s; keys are the caller's (tula owns no key management).
   **stream** the builder's file to disk: exactly the bytes `tula_builder_finish(b)`
   returns, never held in memory, so there is no 2 GiB cap. The header, manifest
   and names table go through a 64 KiB staging buffer; each payload is written
-  straight from the caller's buffer. Atomic: a random `O_EXCL` sibling temp
-  `<path>.tula-<16 hex>.tmp` with the target's mode, written, fsync'd, renamed
-  over `path`, then the directory fsync'd. On any failure the temp is removed and
-  `path` is untouched. A symlink at `path` is replaced, not written through.
-  Returns the file's length or a negative errno.
+  straight from the caller's buffer. Atomic: a temp with the target's mode is
+  written, fsync'd, renamed over `path`, then the directory fsync'd. On Linux
+  *(1.6.1)* the temp is a nameless `O_TMPFILE` inode, linked under a random
+  sibling name only once complete; elsewhere (or without `O_TMPFILE` or `/proc`)
+  it is a random `O_EXCL` sibling `<path>.tula-<16 hex>.tmp`. On any failure the
+  temp is removed and `path` is untouched. A symlink at `path` is replaced, not
+  written through. Returns the file's length or a negative errno.
 - `fn tula_builder_write_file_signed(b, path, sk) -> file_len | <0` *(1.4.0)* —
   the same, Ed25519-signed: byte-identical to `tula_builder_finish_signed(b, sk)`.
   The content is written, mapped back read-only and signed (no heap copy), and

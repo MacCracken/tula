@@ -7,6 +7,59 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-05
+
+**The write path follow-through.** A patch: no new function, dtype or
+convention, and no format change. The streaming writers' output is
+**identical** to 1.6.0's (diffed: 300 random builders, 60 of them signed,
+written by both).
+
+### Changed
+
+- **Nameless temp files on Linux** (ADR 0006, amended).
+  `tula_builder_write_file(_signed)` now builds the file in an `O_TMPFILE` inode
+  in the target's directory. While it is written and signed it has no name, so
+  no other process can open it. Once it is complete, signed and fsync'd, it is
+  linked under a random sibling name (through `/proc/self/fd/N`, or
+  `AT_EMPTY_PATH`) and renamed over the target as before.
+  - This closes the write-to-sign window ADR 0006 recorded. Before 1.6.1, a
+    process with write access to the temp could change the bytes before they
+    were signed. Now any change after the file has a name breaks its signature.
+  - Where `O_TMPFILE` isn't available (an older kernel, a filesystem without
+    it, macOS and the other targets) or `/proc` isn't mounted, the writers use
+    the named `O_EXCL` temp of 1.4–1.6.0. Both are checked before anything is
+    written, so a fallback never writes the file twice.
+  - Mode, symlink and failure behaviour are unchanged, and so is the cost:
+    `make bigfile` streams 2.42 GB in 5.7 s, as in 1.6.0.
+  - `tula_write_file_atomic` (an in-memory buffer, nothing to sign) keeps the
+    stdlib's named temp.
+- **The streaming writers in the fuzzer** (phase H). 1,500 random builders are
+  written, unsigned or signed, through the nameless path or the named temp at
+  random. The builders use all three adds, every dtype plus an unknown one, 0–8
+  dims, colliding names and long names that share their key prefix, refused
+  adds, capped builders, metadata (replaced and refused keys, multi-byte UTF-8),
+  and now and then a tensor past the 64 KiB staging buffer.
+  - Each file must equal `tula_builder_finish(_signed)` byte for byte.
+  - A builder fed only canonical adds must give a file `tula_validate_strict`
+    accepts.
+  - No temp may be left behind.
+
+  Seven seeded writer bugs were all caught: a shifted big-chunk write, nonzero
+  padding, a wrong names record, a wrong metadata offset, a skipped rename, a
+  leaked temp and a skipped signature.
+- **Cross-target CI.** A new `cross-target` job runs the suites, the consumer,
+  `make realmodels`, `make bigfile` and the fuzzer natively on aarch64 Linux
+  (`ubuntu-26.04-arm`, a hard gate) and arm64 macOS (`macos-14`, informational
+  until its first green run: tula has not run on macOS yet). The `build` job now
+  runs the fuzzer too.
+  - Locally, the same steps pass on aarch64 under qemu. qemu runs on the host
+    kernel, which is why the job uses native runners.
+- **`stream.tcyr`** (+17 assertions): the nameless and the forced named-temp
+  paths give the same bytes, unsigned and signed, and each leaves only the
+  target. Failing writes (a directory at the target, a missing directory) leave
+  nothing behind. The late fallback (the file written, then not linkable) was
+  checked by mutation: the right bytes, and no stray files.
+
 ## [1.6.0] - 2026-11-04
 
 **File metadata.** An additive MINOR with no format change (ADR 0008). A

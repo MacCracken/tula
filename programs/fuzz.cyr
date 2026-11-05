@@ -28,6 +28,14 @@
 #      strictly increasing, get(key_i) == value_i, no NUL and no never-valid
 #      UTF-8 byte (C0, C1, F5..FF) in a value. Phase G mutates a canonical file
 #      holding metadata AND a names table, aiming at the metadata.
+#   8. (1.6.1) the streaming writers write exactly what finish returns. Phase H
+#      builds random builders (all three adds, every dtype and an unknown one,
+#      0..8 dims, short, colliding and long names, refused adds, metadata, a
+#      tensor past the 64 KiB staging buffer now and then) and writes each with
+#      tula_builder_write_file or _signed, through the nameless O_TMPFILE path or
+#      the named temp at random. The file must equal tula_builder_finish(_signed)
+#      byte for byte, and a builder fed only canonical adds must give a file
+#      tula_validate_strict accepts. No temp file may be left behind.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -49,6 +57,8 @@ enum FuzzCfg {
     FZ_STRICT_N     = 40;
     FZ_LONG_ITERS   = 300000;    # phase F: a long-name file, mutations aimed at its table
     FZ_META_ITERS   = 300000;    # phase G: a metadata + names file, mutations aimed at the metadata
+    FZ_WRITE_ITERS  = 1500;      # phase H: random builders through the streaming writers
+    FZ_POOL         = 135168;    # phase H: random payload bytes (> the 64 KiB stage + 60000)
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
     FZ_OUT_ELEMS    = 33024;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
@@ -417,6 +427,145 @@ fn check_opened(r, len): i64 {
     return ok;
 }
 
+# ---- phase H helpers: random builders ------------------------------------
+
+# A random NUL-terminated name in nm: usually 1..6 chars of a 6-letter alphabet
+# (so names collide), sometimes a long one sharing a 33-byte prefix (so long
+# names share their key's first 30 bytes and differ only in the hash).
+fn rand_name(s, nm): i64 {
+    var alpha = "ab._x0";
+    var n = 0;
+    if (rng_below(s, 4) == 0) {
+        var pre = "base_model.model.model.layers.0.";
+        while (load8(pre + n) != 0) { store8(nm + n, load8(pre + n)); n = n + 1; }
+        var tail = 1 + rng_below(s, 80);
+        var t = 0;
+        while (t < tail) { store8(nm + n, load8(alpha + rng_below(s, 6))); n = n + 1; t = t + 1; }
+    } else {
+        var len = 1 + rng_below(s, 6);
+        while (n < len) { store8(nm + n, load8(alpha + rng_below(s, 6))); n = n + 1; }
+    }
+    store8(nm + n, 0);
+    return n;
+}
+
+# A random shape in `shape`: 0..3 dims of 0..5 (a zero now and then), or 8 dims
+# of 1..2. Returns ndim; the element count goes to *ne.
+fn rand_shape(s, shape, ne): i64 {
+    var nd = rng_below(s, 4);
+    if (rng_below(s, 32) == 0) { nd = 8; }
+    var n = 1;
+    var k = 0;
+    while (k < nd) {
+        var d = 1 + rng_below(s, 5);
+        if (rng_below(s, 16) == 0) { d = 0; }
+        if (nd == 8) { d = 1 + rng_below(s, 2); }
+        store64(shape + k * 8, d);
+        n = n * d;
+        k = k + 1;
+    }
+    store64(ne, n);
+    return nd;
+}
+
+# A random metadata value in vb: 0..40 bytes of ASCII, two- and three-byte UTF-8,
+# and (one value in 20) a byte that is never valid UTF-8, which set_meta refuses.
+fn rand_value(s, vb): i64 {
+    var n = rng_below(s, 40);
+    var i = 0;
+    while (i < n) {
+        var pick = rng_below(s, 10);
+        if (pick == 0) {
+            store8(vb + i, 0xC3);
+            store8(vb + i + 1, 0xA9);
+            i = i + 2;
+        }
+        if (pick == 1) {
+            store8(vb + i, 0xE6);
+            store8(vb + i + 1, 0x97);
+            store8(vb + i + 2, 0xA5);
+            i = i + 3;
+        }
+        if (pick >= 2) {
+            store8(vb + i, 32 + rng_below(s, 95));
+            i = i + 1;
+        }
+    }
+    if (rng_below(s, 20) == 0) {
+        store8(vb, 0xFF);
+        if (i == 0) { i = 1; }
+    }
+    store8(vb + i, 0);
+    return i;
+}
+
+# A random builder: up to 10 steps, each an add (plain, checked or long, in
+# random proportion) or a metadata set, then, one builder in 24, an int8 tensor
+# of 65536..125535 bytes. *canon = 1 when every add that succeeded was a checked
+# or long add of a known dtype with its packed length, so the file is canonical.
+fn rand_builder(s, pool, nm, vb, shape, ne, canon): i64 {
+    var b = tula_builder_new();
+    if (rng_below(s, 10) == 0) { b = tula_builder_new_cap(1 + rng_below(s, 4)); }
+    store64(canon, 1);
+    var keys = alloc(64);
+    store64(keys + 0, "hf.config");
+    store64(keys + 8, "hf.architecture");
+    store64(keys + 16, "license");
+    store64(keys + 24, "a");
+    store64(keys + 32, "z.9-_");
+    store64(keys + 40, "tula.reserved");   # refused: reserved prefix
+    store64(keys + 48, "9bad");            # refused: starts with a digit
+    store64(keys + 56, "anukulana.source.sha256");
+    var steps = rng_below(s, 11);
+    var i = 0;
+    while (i < steps) {
+        if (rng_below(s, 5) == 0) {
+            rand_value(s, vb);
+            tula_builder_set_meta(b, load64(keys + rng_below(s, 8) * 8), vb);
+        } else {
+            rand_name(s, nm);
+            var nd = rand_shape(s, shape, ne);
+            var dt = rng_below(s, 8);                     # 7: no such dtype
+            var dl = tula_packed_len(dt, load64(ne));
+            var exact = 1;
+            if (dl < 0) { dl = rng_below(s, 64); exact = 0; }
+            var kind = rng_below(s, 3);
+            if (kind == 0) {
+                if (rng_below(s, 2) == 0) { dl = rng_below(s, 300); exact = 0; }
+            }
+            var data = pool + rng_below(s, FZ_POOL - dl);
+            var rc = 0;
+            if (kind == 0) { rc = tula_builder_add(b, nm, dt, shape, nd, data, dl); }
+            if (kind == 1) { rc = tula_builder_add_checked(b, nm, dt, shape, nd, data, dl); }
+            if (kind == 2) { rc = tula_builder_add_long(b, nm, dt, shape, nd, data, dl); }
+            if (rc == 0) {
+                if (kind == 0) { store64(canon, 0); }
+                if (exact == 0) { store64(canon, 0); }
+            }
+        }
+        i = i + 1;
+    }
+    if (rng_below(s, 24) == 0) {
+        var big = 65536 + rng_below(s, 60000);
+        store64(shape, big);
+        tula_builder_add_checked(b, "big", TULA_DT_INT8, shape, 1, pool + rng_below(s, FZ_POOL - big), big);
+    }
+    return b;
+}
+
+fn same_bytes(a, b, n): i64 {
+    var i = 0;
+    while (i + 8 <= n) {
+        if (load64(a + i) != load64(b + i)) { return 0; }
+        i = i + 8;
+    }
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 fn main(): i64 {
     alloc_init();
     var s = alloc(8);
@@ -426,7 +575,8 @@ fn main(): i64 {
     var z = 0;
     while (z < 16) { store64(st + z * 8, 0); z = z + 1; }
     # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
-    # +56 strict accepted  +64 strict DUP_NAME
+    # +56 strict accepted  +64 strict DUP_NAME  +72 stream writes  +80 nameless
+    # +88 canonical builders
 
     var guard = guard_region();
     if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
@@ -630,6 +780,52 @@ fn main(): i64 {
         mg = mg + 1;
     }
 
+    # ---- phase H: random builders through the streaming writers ----
+    xmkdir("build/fuzz_write", 0x1ED);
+    var wpath = "build/fuzz_write/f.tula";
+    var pool = alloc(FZ_POOL);
+    z = 0;
+    while (z < FZ_POOL / 8) { store64(pool + z * 8, rng_next(s)); z = z + 1; }
+    var wcap = FZ_POOL + 65536;
+    var wbuf = alloc(wcap);
+    var nm = alloc(160);
+    var vb = alloc(160);
+    var wshape = alloc(64);
+    var ne = alloc(8);
+    var canon = alloc(8);
+    var h = 0;
+    while (h < FZ_WRITE_ITERS) {
+        var bw = rand_builder(s, pool, nm, vb, wshape, ne, canon);
+        var signed = 0;
+        if (rng_below(s, 6) == 0) { signed = 1; }
+        var want = 0;
+        if (signed == 1) { want = tula_builder_finish_signed(bw, sk); }
+        else             { want = tula_builder_finish(bw); }
+        var wl = tula_total_len(want);
+        _tula_nameless_off = rng_below(s, 2);
+        var got = 0;
+        if (signed == 1) { got = tula_builder_write_file_signed(bw, wpath, sk); }
+        else             { got = tula_builder_write_file(bw, wpath); }
+        var wok = 1;
+        if (got != wl) { wok = 0; }
+        if (wok == 1) {
+            if (file_read_all(wpath, wbuf, wcap) != wl) { wok = 0; }
+        }
+        if (wok == 1) { wok = same_bytes(wbuf, want, wl); }
+        if (load64(canon) == 1) {
+            store64(st + 88, load64(st + 88) + 1);
+            if (tula_validate_strict(want, wl) != TULA_OK) { wok = 0; }
+        }
+        if (wok == 0) { store64(st + 16, load64(st + 16) + 1); }
+        store64(st + 72, load64(st + 72) + 1);
+        store64(st + 80, load64(st + 80) + _tula_nameless_used);
+        store64(st + 0, load64(st + 0) + 1);
+        h = h + 1;
+    }
+    _tula_nameless_off = 0;
+    # every temp was renamed into place or removed: the directory holds the target only
+    if (vec_len(dir_list(str_from("build/fuzz_write"))) != 1) { store64(st + 16, load64(st + 16) + 1); }
+
     var t1 = now_ns();
 
     sput("tula fuzz — reader hardening (M3) under hostile input\n");
@@ -641,11 +837,15 @@ fn main(): i64 {
     kv("  unpacked entries   : ", load64(st + 48));
     kv("  strict accepted    : ", load64(st + 56));
     kv("  strict DUP_NAME    : ", load64(st + 64));
+    kv("  stream writes      : ", load64(st + 72));
+    kv("    nameless         : ", load64(st + 80));
+    kv("    canonical        : ", load64(st + 88));
     kv("  elapsed ms         : ", (t1 - t0) / 1000000);
     var fails = load64(st + 16);
     kv("  invariant failures : ", fails);
     if (fails == 0) {
-        sput("RESULT: PASS (no crash or guard-page fault; every accepted buffer was sound)\n");
+        sput("RESULT: PASS (no crash or guard-page fault; every accepted buffer was sound;\n");
+        sput("        every streamed file matched finish)\n");
         return 0;
     }
     sput("RESULT: FAIL (invariant breach)\n");

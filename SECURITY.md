@@ -27,16 +27,20 @@ typed tensor manifest + payload with a `sigil`-signable header. It loads
 - **Writes don't destroy the previous file** (1.4.0, ADR 0006).
   `tula_builder_write_file(_signed)` and `tula_write_file_atomic` write a sibling
   temp file and rename it over the target only after an fsync. A failure or crash
-  leaves the old file intact. The temp is created with `O_CREAT|O_EXCL` (a
+  leaves the old file intact. A named temp is created with `O_CREAT|O_EXCL` (a
   planted file or symlink at its name is never opened or followed; a new random
   name is tried) under a 64-bit random name, with the existing target's mode, so
   it is never more readable than the result. A symlink at the target is
   replaced, not written through. `tula_write_file` keeps its frozen
   truncate-and-write behaviour.
 - **The signed streaming writer signs what it wrote.** It maps the temp file's
-  content and signs the mapping. A process with write access to that temp file
-  (only its owner, given its mode) could change it between the write and the
-  signature. Write into directories only you control.
+  content and signs the mapping. On Linux (1.6.1) that temp is a nameless
+  `O_TMPFILE` inode: no other process can open it before it is signed, and a
+  change made after it is named breaks the signature. On the named-temp
+  fallback (macOS and the other targets, a filesystem without `O_TMPFILE`, no
+  `/proc`), a process with write access to the temp (only its owner, given its
+  mode) could change it between the write and the signature. Write into
+  directories only you control.
 - **Out of scope** (by design — ADR 0001): the model/checkpoint *store*, the
   *importer*/LoRA path (`anukulana`), and tensor algebra (`rosnet`). tula does not
   interpret tensor semantics.

@@ -150,9 +150,9 @@ fn tula_name_write(dst, src): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.6.0 -> 10600).
+# Packed version int: major*10000 + minor*100 + patch (1.6.1 -> 10601).
 fn tula_version_int(): i64 {
-    return 10600;
+    return 10601;
 }
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # 0006 — Big files: stream from caller memory, sign the written file, replace atomically
 
-**Status**: Accepted
+**Status**: Accepted (amended 1.6.1: nameless temp files on Linux)
 **Date**: 2026-11-04
 
 ## Context
@@ -53,6 +53,19 @@ change.
   and `path` is untouched. A crash leaves the old file or the new one, never a
   mix. A symlink at `path` is replaced, not written through, as with the
   stdlib's `file_write_atomic`.
+- **Nameless on Linux (1.6.1).** The streaming writers first try to build the
+  file in an `O_TMPFILE` inode in `path`'s directory, created with the same mode.
+  It has no name while it is written, signed and `fsync`'d, so no other process
+  can open it. Only then is it linked under a random sibling name (`linkat`
+  through `/proc/self/fd/N`, or `AT_EMPTY_PATH` where the kernel allows it
+  unprivileged) and renamed over `path`, with the same directory `fsync`.
+  - The named `O_EXCL` temp above is the fallback, used where there is no
+    `O_TMPFILE` (an older kernel, a filesystem without it, macOS and the other
+    targets) or no `/proc`. Both are checked before anything is written. Only if
+    the finished inode then can't be linked (unexpected once `/proc` is there)
+    is the file written a second time, by the named path.
+  - The bytes are the same on both paths (the fuzzer's phase H writes through
+    each at random), and so are the mode, symlink and failure behaviour.
 - **`tula_write_file_atomic(path, buf, len)`** is the same guarantee for an
   in-memory buffer, delegating to the stdlib's `file_write_atomic`.
 - **Reading big files on the heap.** `tula_file_len(path)` returns the total a
@@ -73,10 +86,12 @@ change.
 - **Negative** — the streaming writers `fsync`, which costs time a plain `write`
   doesn't. Signing reads the whole file back through the page cache, about one
   extra pass. The writer needs `mmap` on the target (every cyrius Linux and
-  macOS target); without it the signed writer returns an error. Between writing
-  and mapping, a process with write access to the temp file could change what
-  gets signed. It is created with the target's mode and a random name, so only
-  the file's owner can.
+  macOS target); without it the signed writer returns an error. On the named
+  path, between writing and mapping, a process with write access to the temp
+  file could change what gets signed. It is created with the target's mode and a
+  random name, so only the file's owner can. On Linux (1.6.1) the file has no
+  name until it is signed, so that window is closed: a change made after the
+  file is named breaks the signature.
 - **Neutral** — `tula_write_file` keeps its frozen truncate-and-write semantics;
   callers who want crash safety use `tula_write_file_atomic`.
 
@@ -91,6 +106,9 @@ change.
 - **Raising `ALLOC_MAX`** or allocating the file with `mmap_anon`: rejected. It
   still holds the whole file in memory (14 GB for a 7B BF16 model) just to write
   it.
+- **`linkat` straight onto `path`** (no sibling name for the nameless inode):
+  not possible. `linkat` refuses an existing name, so replacing a file needs
+  the rename.
 - **Using the stdlib's private temp-file helper** (`_io_tmp_open`): rejected. It
   is a private symbol that can change at any toolchain bump. The pattern is
   rebuilt from public calls (`file_open` with `O_EXCL`, `random_bytes`, `xstat`,

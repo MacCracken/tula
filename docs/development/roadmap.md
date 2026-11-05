@@ -28,7 +28,8 @@
 - **Definition of done, every bite:** `make test` green · `cyrius fmt <files>`
   clean (CI gate) · `cyrius lint` no `warn ` lines · `cyrius doc --check src/*.cyr`
   0 undocumented · `cyrius deny programs/smoke.cyr` clean · `make fuzz` PASS ·
-  `make realmodels` and `make bigfile` PASS (CI gates) · `make dist` regenerated &
+  `make realmodels` and `make bigfile` PASS (CI gates, also on the
+  `cross-target` runners) · `make dist` regenerated &
   committed (CI dist-sync gate) · CHANGELOG `[Unreleased]` updated. A speed change
   also gets a differential test against the old code and before/after
   `make bench` numbers in `docs/benchmarks.md`. A new public behaviour gets a
@@ -67,23 +68,15 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ## 1.6.x — the write path follow-through
 
-**Goal:** the streaming writers lose their last exposure window, writer
-correctness is checked continuously, and the file paths are proven beyond
-x86_64 Linux.
+**Goal:** the write path's remaining loose ends, and the real-weights gate.
 
 - **1.6.x patches** (no new surface — a patch never adds a function, dtype or
   convention):
-  - **Nameless temp files**: the streaming writers create their temp with
-    Linux `O_TMPFILE` and `linkat` it into place, so between write and sign the
-    file has no name another process could open. That closes the window ADR
-    0006 records. Elsewhere they fall back to today's random `O_EXCL` name.
-  - **Writers in the fuzzer**: random builders (all three add kinds, every
-    dtype, long names) go through `tula_builder_write_file(_signed)`, and the
-    file must equal `tula_builder_finish(_signed)` byte for byte. Today
-    `stream.tcyr` checks 12 builders; this makes it continuous.
-  - **Cross-target CI**: the file-I/O suites and `make bigfile` on aarch64 Linux
-    and macOS runners (mmap, `lseek`, SIGBUS, rename and fsync semantics differ
-    in the details), not only x86_64 Linux.
+  - **macOS as a hard gate.** The `cross-target` CI job's arm64 macOS leg
+    (`macos-14`) is informational (`experimental: true`) until it first runs
+    green. Fix what it turns up, then make it blocking. tula has not yet run
+    on macOS. x86_64 macOS isn't covered: GitHub's hosted Intel runners are
+    scarce.
 - **Cross-repo** (not tula code):
   - **anukulana's migration**, which makes its `gpt2-tula` demo the
     real-weights gate. That demo already imports the real GPT-2 checkpoint,

@@ -31,7 +31,7 @@ Optional harnesses:
 
 ```sh
 make example   # end-to-end consumer (examples/consumer.cyr)
-make fuzz      # reader fuzz harness, >10^6 iterations
+make fuzz      # reader + streaming-writer fuzz harness, >10^6 iterations
 make bench     # write/read/mmap throughput
 ```
 

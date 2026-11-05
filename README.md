@@ -72,10 +72,16 @@ The full march M0→M5:
   `tula_meta_get`) for the architecture, config and provenance, in a table every
   1.x reader opens.
 
-**533/533** assertions across 12 suites (meta · names · builder · strict · dtype ·
+- **1.6.1** — on Linux the streaming writers build the file nameless
+  (`O_TMPFILE`) and name it only once it is signed; the writers are fuzzed
+  against the in-memory writer; CI runs on aarch64 Linux and macOS too.
+
+**550/550** assertions across 12 suites (meta · names · builder · strict · dtype ·
 floats · stream · file-io · hardening · round-trip · index · sign) + a
->2·10⁶-iteration guard-page fuzz harness, an end-to-end consumer, a real-model
-inventory gate and a 2.42 GB big-file gate, all green. Deps: stdlib + **sigil**
+>2·10⁶-iteration guard-page fuzz harness (which also checks the streaming
+writers against the in-memory one), an end-to-end consumer, a real-model
+inventory gate and a 2.42 GB big-file gate, all green on x86_64 Linux and on
+aarch64 Linux under qemu. CI adds native aarch64 Linux and macOS runners. Deps: stdlib + **sigil**
 (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
 place. Post-1.0 changes are additive-only (SemVer). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
@@ -84,10 +90,10 @@ place. Post-1.0 changes are additive-only (SemVer). See
 
 ```sh
 make build    # link-check the library via programs/smoke.cyr
-make test     # run tests/tcyr/*.tcyr (5 suites)
+make test     # run tests/tcyr/*.tcyr (12 suites)
 make dist     # regenerate dist/tula.cyr for consumers
 make example  # build + run the end-to-end consumer (examples/consumer.cyr)
-make fuzz     # reader fuzz harness (>10^6 iters)
+make fuzz     # reader + streaming-writer fuzz harness (>10^6 iters)
 make bench    # write/read/mmap throughput -> docs/benchmarks.md
 ```
 
