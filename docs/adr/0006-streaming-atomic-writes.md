@@ -66,6 +66,10 @@ change.
     is the file written a second time, by the named path.
   - The bytes are the same on both paths (the fuzzer's phase H writes through
     each at random), and so are the mode, symlink and failure behaviour.
+- **Requests of at most 1 GiB (1.6.1).** Every read and write tula makes asks for
+  at most 1 GiB at a time. macOS refuses a read or write over INT_MAX bytes
+  outright (EINVAL), where Linux returns a short count, so a single big tensor
+  or a whole-file read failed there.
 - **`tula_write_file_atomic(path, buf, len)`** is the same guarantee for an
   in-memory buffer, delegating to the stdlib's `file_write_atomic`.
 - **Reading big files on the heap.** `tula_file_len(path)` returns the total a
@@ -78,7 +82,8 @@ change.
 ## Consequences
 
 - **Positive** — checkpoints of any size up to the 1 TiB cap can be written,
-  signed and read. End to end on 2.42 GB: `make bigfile` (unsigned, a CI gate,
+  signed and read. End to end on 2.36 GB, one tensor over INT_MAX bytes
+  (1.6.1; 2.42 GB of 64 MiB tensors before): `make bigfile` (unsigned, a CI gate,
   seconds) and `make bigfile-signed` (signed and verified, run locally: minutes,
   because sigil's SHA-512 runs at ~18 MB/s). The bytes are identical to the
   in-memory writer's, so every reader, verifier and test applies. A crashed or failed write never destroys the previous file. No new

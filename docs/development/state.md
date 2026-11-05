@@ -59,11 +59,14 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
   same on native `ubuntu-26.04-arm` (a hard gate) and `macos-14` (informational
-  until its first green run; tula has not yet run on macOS).
+  until its first green run). macOS's first run passed the suites, the consumer
+  and realmodels, then failed `make bigfile`: reads and writes over INT_MAX
+  bytes, fixed in 1.6.1 and not yet re-run there.
 - `make realmodels` (CI): GPT-2, Llama-2-7B, Mixtral-8x7B, a LoRA adapter and a
   QLoRA NF4 import (real names, ranks, counts and dtypes; dims ÷ 64), each
   written signed, read, strict-validated, verified and resolved by index.
-- `make bigfile` (CI): a 2.42 GB file streamed, mapped, strict-validated and read
+- `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
+  mapped, strict-validated and read
   into a caller buffer.
 - `make bigfile-signed` (local; minutes, bound by sigil's ~18 MB/s SHA-512): the
   same, signed and verified.

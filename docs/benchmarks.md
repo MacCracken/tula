@@ -98,7 +98,9 @@ and bit-identical (tested on every 16-bit code and midpoint, and 300k F32 cases)
 | Op | named temp | nameless (the Linux default) | Notes |
 |---|---:|---:|---|
 | `tula_builder_write_file`, 100 MB | 249 ms · 421 MB/s | 249 ms · 421 MB/s | three alternating runs each; the same work plus one `linkat` |
-| `make bigfile`: stream 2.42 GB | — | 5.7 s | 1.4.0 measured 5.6 s on the named path |
+| `make bigfile` (1.6.0's shape): stream 2.42 GB | — | 5.7 s | 1.4.0 measured 5.6 s on the named path |
+| `make bigfile` (1.6.1): stream 2.36 GB, one 2.2 GB tensor | — | 6.3 s | requests of at most 1 GiB; `tula_read_file_into` 377 ms |
+| `make bigfile-signed` (1.6.1): write + sign 2.36 GB | — | 244 s | verify 121 s; still bound by sigil's SHA-512 |
 
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula

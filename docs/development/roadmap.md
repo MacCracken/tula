@@ -74,9 +74,10 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   convention):
   - **macOS as a hard gate.** The `cross-target` CI job's arm64 macOS leg
     (`macos-14`) is informational (`experimental: true`) until it first runs
-    green. Fix what it turns up, then make it blocking. tula has not yet run
-    on macOS. x86_64 macOS isn't covered: GitHub's hosted Intel runners are
-    scarce.
+    green. Its first run passed the suites, the consumer and realmodels, and
+    found the over-INT_MAX reads and writes 1.6.1 fixes. It has not yet reached
+    the fuzzer. Fix what else it turns up, then make it blocking. x86_64 macOS
+    isn't covered: GitHub's hosted Intel runners are scarce.
 - **Cross-repo** (not tula code):
   - **anukulana's migration**, which makes its `gpt2-tula` demo the
     real-weights gate. That demo already imports the real GPT-2 checkpoint,

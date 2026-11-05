@@ -10,11 +10,15 @@
 # the missing tail raised SIGBUS (mmap).
 
 # Read up to len bytes from fd, looping over short reads. Returns the bytes read
-# (fewer than len only at end of file) or a negative errno.
+# (fewer than len only at end of file) or a negative errno. Each request is at
+# most 1 GiB (1.6.1): macOS refuses a read of more than INT_MAX bytes outright
+# (EINVAL), where Linux caps it and returns short.
 fn _tula_read_full(fd, buf, len): i64 {
     var got = 0;
     while (got < len) {
-        var n = file_read(fd, buf + got, len - got);
+        var want = len - got;
+        if (want > 1073741824) { want = 1073741824; }
+        var n = file_read(fd, buf + got, want);
         if (n < 0) { return n; }
         if (n == 0) { return got; }
         got = got + n;
@@ -159,11 +163,15 @@ enum TulaStreamCfg {
 }
 
 # Write all n bytes at p to fd, looping over short writes. 0 or a negative errno;
-# a write that makes no progress is -EIO.
+# a write that makes no progress is -EIO. Each request is at most 1 GiB (1.6.1),
+# as in _tula_read_full: macOS refuses a write of more than INT_MAX bytes, so a
+# single tensor over 2 GiB would otherwise fail there.
 fn _tula_write_full(fd, p, n): i64 {
     var off = 0;
     while (off < n) {
-        var w = file_write(fd, p + off, n - off);
+        var want = n - off;
+        if (want > 1073741824) { want = 1073741824; }
+        var w = file_write(fd, p + off, want);
         if (w < 0) { return w; }
         if (w == 0) { return 0 - 5; }
         off = off + w;

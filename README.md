@@ -80,7 +80,7 @@ The full march M0→M5:
 floats · stream · file-io · hardening · round-trip · index · sign) + a
 >2·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
-inventory gate and a 2.42 GB big-file gate, all green on x86_64 Linux and on
+inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on
 aarch64 Linux under qemu. CI adds native aarch64 Linux and macOS runners. Deps: stdlib + **sigil**
 (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
 place. Post-1.0 changes are additive-only (SemVer). See

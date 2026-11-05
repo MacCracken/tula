@@ -9,10 +9,14 @@
 #   4. tula_read_file refuses it (one heap allocation can't hold it), and
 #      tula_read_file_into reads it into a caller-provided mapping.
 #
-# 36 tensors x 64 MiB (f64 [8 Mi]) = 2.25 GiB of payload. The tensors are views
-# into one 64 MiB + 288-byte buffer at 8-byte steps, so each tensor's data is
-# distinct (its first word is its index) while the program holds only ~64 MiB.
-# Writes ~2.3 GB under build/ and removes it.
+# 36 tensors: 35 of 4 MiB (f64 [512 Ki]) and, in the middle, one of 2 GiB +
+# 64 MiB (f64 [264 Mi], 2,214,592,512 bytes) — more than INT_MAX, the most macOS
+# moves in one read or write, so the writer's and readers' chunking is tested
+# (1.6.1), and the tensors after it start past the 2 GiB mark. 2.36 GB in all.
+# The tensors are views into one buffer at 8-byte steps, so each one's first
+# word is its index; only the words checked are written, and the buffer is
+# unmapped once the file is, so the program holds little beyond the read buffer.
+# Writes the file under build/ and removes it.
 #
 #   make bigfile          # unsigned: seconds (the CI gate)
 #   make bigfile-signed   # signed: minutes — bound by sigil's SHA-512 (~18 MB/s
@@ -22,7 +26,15 @@ include "src/lib.cyr"
 
 enum BigCfg {
     BG_TENSORS = 36;
-    BG_ELEMS   = 8388608;          # 8 Mi f64 = 64 MiB per tensor
+    BG_ELEMS   = 524288;           # 512 Ki f64 = 4 MiB per tensor
+    BG_BIG     = 17;               # this one is big:
+    BG_BIG_ELEMS = 276824064;      # 264 Mi f64 = 2,214,592,512 bytes > INT_MAX
+}
+
+# Elements of tensor t.
+fn telems(t): i64 {
+    if (t == BG_BIG) { return BG_BIG_ELEMS; }
+    return BG_ELEMS;
 }
 
 fn sput(s): i64 {
@@ -65,20 +77,23 @@ fn tname(buf, t): i64 {
 
 fn main(): i64 {
     alloc_init();
-    var bytes = BG_ELEMS * 8;
-    var span = bytes + BG_TENSORS * 8;
+    var span = BG_BIG_ELEMS * 8 + BG_TENSORS * 8;
     var base = mmap_anon(span);
     if (base == 0) { return fail("could not map the source buffer"); }
+    # word i = i for every word a check reads: all the small tensors' words, and
+    # the big one's last (its middle stays zero pages)
     var w = 0;
-    while (w < span / 8) { store64(base + w * 8, w); w = w + 1; }   # word i = i
+    while (w < BG_ELEMS + BG_TENSORS) { store64(base + w * 8, w); w = w + 1; }
+    var wl = BG_BIG + BG_BIG_ELEMS - 1;
+    store64(base + wl * 8, wl);
 
     var b = tula_builder_new_cap(BG_TENSORS);
     var shape = alloc(8);
-    store64(shape, BG_ELEMS);
     var nm = alloc(96);
     var t = 0;
     while (t < BG_TENSORS) {
-        if (tula_builder_add_long(b, tname(nm, t), TULA_DT_F64, shape, 1, base + t * 8, bytes) != 0) {
+        store64(shape, telems(t));
+        if (tula_builder_add_long(b, tname(nm, t), TULA_DT_F64, shape, 1, base + t * 8, telems(t) * 8) != 0) {
             return fail("add");
         }
         t = t + 1;
@@ -107,6 +122,7 @@ fn main(): i64 {
     #endif
     var t1 = now_ns();
     if (total <= 0x80000000) { return fail("streaming write"); }
+    cyr_munmap(base, span);   # the file holds it now
     kv("  file bytes           : ", total);
     kv("  write(+sign)+fsync ms: ", (t1 - t0) / 1000000);
 
@@ -131,11 +147,12 @@ fn main(): i64 {
         var e = tula_find_name(r, tname(nm, t));
         if (e == 0) { return fail("a tensor not found by full name"); }
         var p = tula_entry_data(r, e);
+        if (tula_entry_data_len(e) != telems(t) * 8) { return fail("a tensor's length"); }
         if (load64(p) != t) { return fail("a tensor's first word"); }
-        if (load64(p + bytes - 8) != t + BG_ELEMS - 1) { return fail("a tensor's last word"); }
+        if (load64(p + telems(t) * 8 - 8) != t + telems(t) - 1) { return fail("a tensor's last word"); }
         t = t + 1;
     }
-    sput("  36 tensors           : found by full name, first + last words exact\n");
+    sput("  36 tensors           : found by full name, first + last words exact (one > INT_MAX bytes)\n");
     tula_close_mmap(r);
 
     # 4. heap reads: one allocation can't, a caller's mapping can
@@ -148,12 +165,16 @@ fn main(): i64 {
     if (ri != into) { return fail("tula_read_file_into"); }
     var e9 = tula_find_name(ri, tname(nm, 35));
     if (load64(tula_entry_data(ri, e9)) != 35) { return fail("read_into data"); }
+    var eb = tula_find_name(ri, tname(nm, BG_BIG));
+    if (load64(tula_entry_data(ri, eb) + BG_BIG_ELEMS * 8 - 8) != wl) {
+        return fail("read_into: the big tensor's last word");
+    }
     kv("  read_into ms         : ", (t6 - t5) / 1000000);
     cyr_munmap(into, total);
 
     xunlink(path);
-    cyr_munmap(base, span);
-    sput("RESULT: PASS — a 2.3 GB checkpoint streamed, validated and read without a whole-file allocation\n");
+    sput("RESULT: PASS — a 2.36 GB checkpoint (one tensor > INT_MAX bytes) streamed, validated and read\n");
+    sput("        without a whole-file allocation\n");
     return 0;
 }
 

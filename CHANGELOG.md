@@ -14,6 +14,29 @@ convention, and no format change. The streaming writers' output is
 **identical** to 1.6.0's (diffed: 300 random builders, 60 of them signed,
 written by both).
 
+### Fixed
+
+- **Files over 2 GiB on macOS.** `tula_read_file_into` failed on any file over
+  INT_MAX bytes (2 GiB − 1), and the streaming writers failed on any single
+  tensor that big (Llama 3.1 405B's BF16 embedding is ~4.2 GB). tula read the
+  rest of the file, and wrote each payload, in one request. Linux caps a request
+  and returns a short count, which the loops handled. macOS refuses the request
+  with EINVAL. Each request is now at most 1 GiB. Found by the new macOS CI leg
+  on its first run.
+  - Reproduced on Linux with a probe whose reads and writes refuse more than
+    INT_MAX bytes, as Darwin's do. There 1.6.0 fails the old `make bigfile`
+    exactly as the macOS runner did, at `tula_read_file_into`. 1.6.1 passes,
+    never asking for more than 1 GiB.
+  - `make bigfile` now holds one 2.2 GB tensor, so the gate covers the write
+    side as well. Under the same probe, 1.6.0 and a fix to the read loop alone
+    both fail it, at the streaming write.
+  - Known limit: `tula_write_file` and `tula_write_file_atomic` hand their
+    buffer to the stdlib, whose write loop makes the same single request. On
+    macOS they fail with EINVAL (`path` untouched, for the atomic one) on a
+    buffer over INT_MAX bytes. That takes a caller's own buffer, or a
+    `tula_serialize` result of exactly 2 GiB (the allocation cap). Filed with
+    cyrius as `2026-11-05-tula-io-loops-one-request-over-int-max-fails-on-macos.md`.
+
 ### Changed
 
 - **Nameless temp files on Linux** (ADR 0006, amended).
@@ -30,7 +53,8 @@ written by both).
     the named `O_EXCL` temp of 1.4–1.6.0. Both are checked before anything is
     written, so a fallback never writes the file twice.
   - Mode, symlink and failure behaviour are unchanged, and so is the cost:
-    `make bigfile` streams 2.42 GB in 5.7 s, as in 1.6.0.
+    249 ms for 100 MB on either path, and 5.7 s for 1.6.0's 2.42 GB
+    `make bigfile` (5.6 s in 1.4.0).
   - `tula_write_file_atomic` (an in-memory buffer, nothing to sign) keeps the
     stdlib's named temp.
 - **The streaming writers in the fuzzer** (phase H). 1,500 random builders are

@@ -109,7 +109,7 @@ jobs:
           CYRIUS_DCE=1 cyrius build programs/realmodels.cyr build/tula_realmodels
           ./build/tula_realmodels
 
-      - name: Big file (1.4.0 gate — a 2.3 GB file streamed past the 2 GiB allocation cap)
+      - name: Big file (1.4.0 gate — 2.36 GB, one tensor over INT_MAX, past the 2 GiB allocation cap)
         # Unsigned: seconds. The signed variant (make bigfile-signed) takes minutes,
         # bound by sigil's SHA-512, and runs locally; signed streaming is checked
         # byte-for-byte against the in-memory writer in tests/tcyr/stream.tcyr.
@@ -187,7 +187,7 @@ jobs:
           CYRIUS_DCE=1 cyrius build programs/realmodels.cyr build/tula_realmodels
           ./build/tula_realmodels
 
-      - name: Big file (2.3 GB streamed, mapped, validated, read)
+      - name: Big file (2.36 GB, one tensor over INT_MAX; streamed, mapped, validated, read)
         run: |
           CYRIUS_DCE=1 cyrius build programs/bigfile.cyr build/tula_bigfile
           ./build/tula_bigfile
