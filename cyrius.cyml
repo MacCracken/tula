@@ -17,7 +17,8 @@ output = "build/tula_smoke"
 
 # `[lib]` feeds `cyrius distlib` — module order matters: error.cyr is dep-free;
 # format.cyr uses it; names.cyr (1.3.0) reads the long-name table; check.cyr
-# (1.2.0) comes last, using format + dtype + names. Don't reorder without re-running `cyrius distlib`.
+# (1.2.0) uses format + dtype + names; index.cyr (1.5.0) comes last, using
+# names + check's sort. Don't reorder without re-running `cyrius distlib`.
 [lib]
 modules = [
     "src/error.cyr",
@@ -27,6 +28,7 @@ modules = [
     "src/dtype.cyr",
     "src/names.cyr",
     "src/check.cyr",
+    "src/index.cyr",
 ]
 
 [deps]

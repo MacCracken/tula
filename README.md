@@ -63,12 +63,17 @@ The full march M0→M5:
   any size straight from tensor buffers and replaces the target atomically;
   `tula_read_file_into` reads them into a buffer of your own.
 
-**422/422** assertions across 10 suites (names · builder · strict · dtype · floats ·
-stream · file-io · hardening · round-trip · sign) + a >2·10⁶-iteration guard-page
-fuzz harness, an end-to-end consumer, and a 2.42 GB big-file gate, all green.
-Deps: stdlib + **sigil** (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI +
-release workflows in place. Post-1.0 changes are additive-only (SemVer); next is
-1.5.0 (lookup at scale). See
+- **1.5.0** — lookup at scale: a name index (`tula_index_new` / `tula_index_find`)
+  with O(log n) lookups that crafted names can't degrade, and a CI gate running
+  five real checkpoint inventories (GPT-2, Llama-2-7B, Mixtral-8x7B, LoRA, QLoRA)
+  end to end.
+
+**435/435** assertions across 11 suites (names · builder · strict · dtype · floats ·
+stream · file-io · hardening · round-trip · index · sign) + a
+>2·10⁶-iteration guard-page fuzz harness, an end-to-end consumer, a real-model
+inventory gate and a 2.42 GB big-file gate, all green. Deps: stdlib + **sigil**
+(Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
+place. Post-1.0 changes are additive-only (SemVer). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## Build & test

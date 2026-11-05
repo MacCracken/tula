@@ -19,6 +19,9 @@
 #      result is scanned to the NUL under the guard page), and on a strict
 #      accept, tula_find_name(tula_entry_full_name(e)) must be e for every
 #      entry. Phase F mutates a canonical file holding a names table.
+#   6. (1.5.0) the name index agrees with the scan: on every accepted buffer an
+#      index is built and tula_index_find must equal tula_find_name for each
+#      entry's full name and stored name, and for a long probe.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -315,8 +318,23 @@ fn check_opened(r, len): i64 {
         }
         i = i + 1;
     }
-    var lhit = tula_find_name(r, "base_model.model.model.layers.3.mlp.block_sparse_moe.experts.3.w2.weight");
+    var probe = "base_model.model.model.layers.3.mlp.block_sparse_moe.experts.3.w2.weight";
+    var lhit = tula_find_name(r, probe);
     var has = tula_has_long_names(r);
+    var ix = tula_index_new(r);
+    if (ix == 0) { ok = 0; }
+    if (ix != 0) {
+        if (tula_index_find(ix, probe) != lhit) { ok = 0; }
+        var j = 0;
+        while (j < c) {
+            var ej = tula_entry(r, j);
+            var fj = tula_entry_full_name(r, ej);
+            if (tula_index_find(ix, fj) != tula_find_name(r, fj)) { ok = 0; }
+            if (tula_index_find(ix, ej) != tula_find_name(r, ej)) { ok = 0; }
+            j = j + 1;
+        }
+        tula_index_free(ix);
+    }
     # exercise find() with a name that may or may not exist
     var hit = tula_find(r, "w.q");
     var sig = tula_is_signed(r);

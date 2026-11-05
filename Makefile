@@ -9,6 +9,7 @@
 #   make lint / fmt-check / vet  — quality gates
 #   make bigfile — 1.4.0 gate: a 2.3 GB file streamed, validated, read (CI)
 #   make bigfile-signed — the same, signed + verified (minutes: sigil's SHA-512)
+#   make realmodels — 1.5.0 gate: five real checkpoint inventories end to end (CI)
 #   make clean   — scrub build/
 
 CYRIUS ?= cyrius
@@ -79,6 +80,12 @@ bigfile-signed: check-lib-wiring
 	@mkdir -p build
 	CYRIUS_DCE=1 $(CYRIUS) build -D TULA_BIG_SIGNED programs/bigfile.cyr build/tula_bigfile_signed
 	./build/tula_bigfile_signed
+
+.PHONY: realmodels
+realmodels: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build programs/realmodels.cyr build/tula_realmodels
+	./build/tula_realmodels
 
 .PHONY: example
 example: check-lib-wiring

@@ -46,7 +46,8 @@ include "lib/sigil.cyr"
 # builds on it; sign.cyr adds Ed25519 sign/verify over sigil + format;
 # fileio.cyr and dtype.cyr build on format; names.cyr (1.3.0: the long-name
 # table's reader) builds on format; check.cyr (the strict validator + scale
-# lookup) builds on format, dtype and names.
+# lookup) builds on format, dtype and names; index.cyr (1.5.0: the sorted name
+# index) comes last, using names and check's sort.
 # ================================================================
 include "src/error.cyr"
 include "src/format.cyr"
@@ -55,3 +56,4 @@ include "src/fileio.cyr"
 include "src/dtype.cyr"
 include "src/names.cyr"
 include "src/check.cyr"
+include "src/index.cyr"

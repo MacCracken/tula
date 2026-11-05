@@ -99,6 +99,22 @@ adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is
 there: a tuned SHA-512 runs at hundreds of MB/s. It's on the roadmap as a
 cross-repo ask.
 
+### Added in 1.5.0
+
+| Op | 1.5.0 | Notes |
+|---|---:|---|
+| `tula_index_new`, 256 long names | 86 µs | canonical keys + hash + heapsort, one mapping |
+| `tula_index_find`, 256 short names | 259 ns | vs `tula_find` 790 ns |
+| `tula_index_find`, 256 long names | 581 ns | vs `tula_find_name` 2.1 µs (key hash + confirm) |
+| every name of 4,096 tensors | 3.1 ms by index (build included) | vs 44.8 ms by `tula_find_name`: 14.5× |
+| `make realmodels` (5 inventories) | 5.9 s | dominated by signing ~28 MB through sigil's SHA-512 |
+
+The index gains with n, since scans are O(n) and the index O(log n). The
+per-lookup constant (~250 ns short, ~580 ns long) is query canonicalization,
+the hash, and the full-name confirm. A long name also pays for its FNV-1a key
+and the names-table record search. In `make realmodels`, Mixtral's 995 tensors
+build in ~0.4 ms and resolve at ~0.8 µs each.
+
 Earlier result (1.0.0, cyrius 6.3.27, tmpfs `/tmp`, ms resolution): write 34 ms,
 read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O only.
 

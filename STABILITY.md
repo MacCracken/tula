@@ -43,7 +43,8 @@ These may change in a MINOR release without a major bump:
   `tula_name_write`, `tula_serialize`, `tula_hdr_total`, `tula_nf4_nearest`, and
   every `_tula_*` function. Treat them as private, together with the builder's
   in-memory layout and the internal tuning constants (`TULA_BHDR_SIZE`,
-  `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`).
+  `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`, and
+  from 1.5.0 the index layout `TULA_IDX_HDR` / `TULA_IDX_REC`).
 - **Benchmark numbers** and the fuzz/bench harness internals.
 - **The exact `TULA_ERR_*` returned** for a given malformed input may be refined
   to a more specific code (the *set* of codes only grows; a given input keeps

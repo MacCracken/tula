@@ -1,0 +1,128 @@
+# @public — tula name index (1.5.0, ADR 0007): find by full name in O(log n).
+#
+# tula_find / tula_find_name scan the manifest, so looking up every tensor of a
+# checkpoint by name is O(n^2). tula_index_new builds, once per opened buffer, a
+# sorted array of (name hash, canonical name) records; tula_index_find binary-
+# searches it. The file is untrusted, so the index is never a hash TABLE —
+# crafted names can't flood a sorted array: colliding hashes only cost a full
+# 48-byte compare per step, never more steps. Answers are exactly
+# tula_find_name's (and tula_index_find_scale's, tula_find_scale's).
+#
+# Layout — one private mapping, released by tula_index_free:
+#   +0 the reader handle r   +8 tensor count n   +16 mapping bytes   +24 keys base
+#   +32 the names table's entry (0 = none; found once, at build)
+#   +48 n x 16-byte records {hash of the key, key pointer}, sorted
+#   then n x 48-byte canonical keys, in entry order (so a key's position is its
+#   entry's index).
+
+enum TulaIndexLayout {
+    TULA_IDX_HDR = 48;
+    TULA_IDX_REC = 16;
+}
+
+# The canonical 48-byte key of entry e's stored name: its bytes up to the NUL,
+# zero-padded (bytes after a NUL never matter, as in tula_find). For a long name
+# the stored name is its key (ADR 0004), so it is used as is.
+fn _tula_canon_key(dst, e): i64 {
+    var w = 0;
+    while (w < 6) { store64(dst + w * 8, 0); w = w + 1; }
+    var k = 0;
+    while (k < TULA_NAME_MAX) {
+        var c = load8(e + k);
+        if (c == 0) { return dst; }
+        store8(dst + k, c);
+        k = k + 1;
+    }
+    return dst;
+}
+
+# Build the name index of an opened (validated) buffer `r` (1.5.0). Returns the
+# index, or 0 if its mapping can't be made. O(n log n) worst case for any names.
+# It points into r: use it only while r is valid, and release it with
+# tula_index_free.
+fn tula_index_new(r): i64 {
+    var n = tula_count(r);
+    var bytes = TULA_IDX_HDR + n * (TULA_IDX_REC + TULA_NAME_CAP);
+    var ix = mmap_anon(bytes);
+    if (ix == 0) { return 0; }
+    var recs = ix + TULA_IDX_HDR;
+    var keys = recs + n * TULA_IDX_REC;
+    store64(ix, r);
+    store64(ix + 8, n);
+    store64(ix + 16, bytes);
+    store64(ix + 24, keys);
+    store64(ix + 32, _tula_names_entry(r));
+    var i = 0;
+    while (i < n) {
+        var k = keys + i * TULA_NAME_CAP;
+        _tula_canon_key(k, tula_entry(r, i));
+        store64(recs + i * TULA_IDX_REC, _tula_name_hash(k));
+        store64(recs + i * TULA_IDX_REC + 8, k);
+        i = i + 1;
+    }
+    if (n >= 2) { _tula_heapsort(recs, n, 1); }
+    return ix;
+}
+
+# Release an index from tula_index_new. 0 is a no-op.
+fn tula_index_free(ix): i64 {
+    if (ix == 0) { return 0; }
+    return cyr_munmap(ix, load64(ix + 16));
+}
+
+# The entry, lowest index first, whose canonical stored name is the 48-byte
+# field q; or 0. A lower-bound binary search: equal records sit together in
+# entry order (the build sorts with the tiebreak), so the first is the lowest.
+fn _tula_index_lookup(ix, q): i64 {
+    var n = load64(ix + 8);
+    var recs = ix + TULA_IDX_HDR;
+    var qh = _tula_name_hash(q);
+    var qrec[16];
+    store64(&qrec, qh);
+    store64(&qrec + 8, q);
+    var lo = 0;
+    var hi = n;
+    while (lo < hi) {
+        var mid = (lo + hi) / 2;
+        var rh = load64(recs + mid * TULA_IDX_REC);
+        # the hash decides most steps in one compare; equal hashes compare keys
+        var less = 0;
+        if (rh < qh) { less = 1; }
+        if (rh == qh) {
+            if (_tula_rec_order(recs + mid * TULA_IDX_REC, &qrec, 0) < 0) { less = 1; }
+        }
+        if (less == 1) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    if (lo >= n) { return 0; }
+    var rec = recs + lo * TULA_IDX_REC;
+    if (_tula_rec_order(rec, &qrec, 0) != 0) { return 0; }
+    var idx = (load64(rec + 8) - load64(ix + 24)) / TULA_NAME_CAP;
+    return tula_entry(load64(ix), idx);
+}
+
+# tula_find_name for a full name a ‖ b, through the index.
+fn _tula_index_find2(ix, a, alen, b, blen): i64 {
+    var te = load64(ix + 32);
+    if (te == 0) {
+        if (alen + blen > TULA_NAME_MAX) { return 0; }   # no names table: no long names
+    }
+    var q[48];
+    _tula_query_field(&q, a, alen, b, blen);
+    return _tula_confirm_t(load64(ix), te, _tula_index_lookup(ix, &q), a, alen, b, blen);
+}
+
+# Find an entry by its full name, any length, in O(log n) (1.5.0): the same
+# answer tula_find_name(r, name) gives — the first matching entry, a long name
+# confirmed against the names table — or 0.
+fn tula_index_find(ix, name): i64 {
+    return _tula_index_find2(ix, name, strlen(name), "", 0);
+}
+
+# tula_find_scale through the index (1.5.0): entry e's "<full name>.scale"
+# sidecar, checked for an unpack reading `need` scales, or 0.
+fn tula_index_find_scale(ix, e, need): i64 {
+    if (need < 1) { return 0; }
+    var name = _tula_full_name_t(load64(ix), load64(ix + 32), e);
+    return _tula_scale_ok(_tula_index_find2(ix, name, strlen(name), ".scale", 6), need);
+}

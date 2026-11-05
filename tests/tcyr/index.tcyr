@@ -1,0 +1,220 @@
+# tests/tcyr/index.tcyr — the 1.5.0 name index (ADR 0007). Its contract is
+# equivalence: tula_index_find answers exactly as tula_find_name, and
+# tula_index_find_scale exactly as tula_find_scale, on every buffer — randomized
+# builders mixing plain / checked / long adds (so duplicates and names tables
+# appear), foreign-style name fields with bytes after the NUL, empty and
+# one-tensor files, and 1,000 tensors.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    return (x >> 33) & 0x7FFFFFFF;
+}
+
+fn shape1(a): i64 {
+    var p = alloc(8);
+    store64(p, a);
+    return p;
+}
+
+# A random name of 1..70 chars from a 4-letter alphabet (so collisions and
+# shared prefixes are common), with ".scale" appended to some.
+fn rand_name(s, buf): i64 {
+    var n = 1 + lcg(s) % 70;
+    var k = 0;
+    while (k < n) {
+        store8(buf + k, 97 + lcg(s) % 4);
+        k = k + 1;
+    }
+    store8(buf + n, 0);
+    return buf;
+}
+
+# Every query of interest against r and ix: each entry's full name and stored
+# field, each full name with ".scale", one char changed, cut short, plus absent
+# and empty names. Returns the number of disagreements with tula_find_name.
+fn check_equiv(r, ix, s): i64 {
+    var bad = 0;
+    var c = tula_count(r);
+    var q = alloc(160);
+    var i = 0;
+    while (i < c) {
+        var e = tula_entry(r, i);
+        var full = tula_entry_full_name(r, e);
+        if (tula_index_find(ix, full) != tula_find_name(r, full)) { bad = bad + 1; }
+        var field = tula_entry_name(e);
+        if (tula_index_find(ix, field) != tula_find_name(r, field)) { bad = bad + 1; }
+        var fl = strlen(full);
+        var k = 0;
+        while (k < fl) { store8(q + k, load8(full + k)); k = k + 1; }
+        store8(q + fl, 0);
+        if (fl > 0) {
+            store8(q + fl / 2, load8(q + fl / 2) ^ 1);              # one char changed
+            if (tula_index_find(ix, q) != tula_find_name(r, q)) { bad = bad + 1; }
+            store8(q + fl / 2, load8(q + fl / 2) ^ 1);
+            store8(q + fl - 1, 0);                                   # cut short
+            if (tula_index_find(ix, q) != tula_find_name(r, q)) { bad = bad + 1; }
+        }
+        var n1 = 1 + lcg(s) % 3;
+        var need = n1;
+        if (tula_index_find_scale(ix, e, need) != tula_find_scale(r, e, need)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    var j = 0;
+    while (j < 40) {
+        rand_name(s, q);
+        if (tula_index_find(ix, q) != tula_find_name(r, q)) { bad = bad + 1; }
+        j = j + 1;
+    }
+    if (tula_index_find(ix, "") != tula_find_name(r, "")) { bad = bad + 1; }
+    return bad;
+}
+
+fn random_builder(s): i64 {
+    var b = tula_builder_new_cap(200);
+    var nt = lcg(s) % 160;
+    var nm = alloc(96);
+    var t = 0;
+    while (t < nt) {
+        rand_name(s, nm);
+        if ((lcg(s) % 5) == 0) {
+            var l = strlen(nm);
+            var suf = ".scale";
+            var k = 0;
+            while (k < 6) { store8(nm + l + k, load8(suf + k)); k = k + 1; }
+            store8(nm + l + 6, 0);
+        }
+        var how = lcg(s) % 3;
+        var dt = TULA_DT_F64;
+        var len = 8 * (1 + lcg(s) % 3);
+        if ((lcg(s) % 4) == 0) { dt = TULA_DT_INT8; }
+        var d = alloc(len + 8);
+        var nel = len / 8;
+        if (dt == TULA_DT_INT8) { nel = len; }     # shape consistent with data_len
+        if (how == 0) { tula_builder_add(b, nm, dt, shape1(nel), 1, d, len); }
+        if (how == 1) { tula_builder_add_checked(b, nm, dt, shape1(nel), 1, d, len); }
+        if (how == 2) { tula_builder_add_long(b, nm, dt, shape1(nel), 1, d, len); }
+        t = t + 1;
+    }
+    # every other builder: a deliberate duplicate of tensor 0's stored name
+    if (load64(b) > 0) {
+        if ((lcg(s) & 1) == 0) {
+            var e0 = b + TULA_BHDR_SIZE;           # builder entry 0's stored field
+            var dn = alloc(48);
+            var q = 0;
+            while (q < 48) { store8(dn + q, load8(e0 + q)); q = q + 1; }
+            tula_builder_add(b, dn, TULA_DT_F64, shape1(1), 1, alloc(8), 8);
+        }
+    }
+    return b;
+}
+
+fn test_equivalence_random() {
+    var s = alloc(8);
+    store64(s, 271828);
+    var bad = 0;
+    var files = 0;
+    var longs = 0;
+    var dups = 0;
+    while (files < 40) {
+        var buf = tula_builder_finish(random_builder(s));
+        var r = tula_open(buf, tula_total_len(buf));
+        var ix = tula_index_new(r);
+        bad = bad + check_equiv(r, ix, s);
+        if (tula_has_long_names(r) == 1) { longs = longs + 1; }
+        if (tula_validate_strict(buf, tula_total_len(buf)) == TULA_ERR_DUP_NAME) { dups = dups + 1; }
+        tula_index_free(ix);
+        files = files + 1;
+    }
+    assert_eq(bad, 0, "index_find == find_name and index_find_scale == find_scale, 40 random files");
+    assert(longs > 10, "... many with names tables");
+    assert(dups > 3, "... several with duplicate names");
+    return 0;
+}
+
+fn test_foreign_name_fields() {
+    # bytes after a name's NUL: the index must ignore them, as tula_find does
+    var b = tula_builder_new();
+    var d = alloc(16);
+    tula_builder_add(b, "a", TULA_DT_F64, shape1(1), 1, d, 8);
+    tula_builder_add(b, "abcdefgh", TULA_DT_F64, shape1(1), 1, d, 8);
+    tula_builder_add(b, "a", TULA_DT_F64, shape1(1), 1, d, 8);
+    var buf = tula_builder_finish(b);
+    store8(buf + 64 + 3, 90);
+    store8(buf + 64 + 40, 90);
+    store8(buf + 64 + TULA_ENTRY_SIZE + 9, 90);
+    var r = tula_open(buf, tula_total_len(buf));
+    var ix = tula_index_new(r);
+    assert(tula_index_find(ix, "a") == tula_entry(r, 0), "garbage after the NUL ignored; the FIRST 'a' (entry 0)");
+    assert(tula_index_find(ix, "abcdefgh") == tula_entry(r, 1), "an 8-char name with garbage after its NUL");
+    var s = alloc(8);
+    store64(s, 5);
+    assert_eq(check_equiv(r, ix, s), 0, "... and every query agrees with find_name");
+    tula_index_free(ix);
+    return 0;
+}
+
+fn test_small_and_large() {
+    var e0 = tula_builder_finish(tula_builder_new());
+    var r0 = tula_open(e0, tula_total_len(e0));
+    var ix0 = tula_index_new(r0);
+    assert(ix0 != 0, "an index of an empty file");
+    assert_eq(tula_index_find(ix0, "x"), 0, "... finds nothing");
+    tula_index_free(ix0);
+    var n = 1000;
+    var b = tula_builder_new_cap(n);
+    var nm = alloc(96);
+    var pre = "model.layers.";
+    var i = 0;
+    while (i < n) {
+        var k = 0;
+        while (load8(pre + k) != 0) { store8(nm + k, load8(pre + k)); k = k + 1; }
+        store8(nm + k, 48 + i / 100);
+        store8(nm + k + 1, 48 + (i / 10) % 10);
+        store8(nm + k + 2, 48 + i % 10);
+        var suf = ".block_sparse_moe.experts.3.w2.weight";
+        if ((i & 1) == 0) { suf = ".mlp.down_proj.weight"; }
+        var j = 0;
+        while (load8(suf + j) != 0) { store8(nm + k + 3 + j, load8(suf + j)); j = j + 1; }
+        store8(nm + k + 3 + j, 0);
+        tula_builder_add_long(b, nm, TULA_DT_INT8, shape1(1), 1, shape1(i), 1);
+        i = i + 1;
+    }
+    var buf = tula_builder_finish(b);
+    var path = "build/test_index_1000.tula";
+    tula_write_file(path, buf, tula_total_len(buf));
+    var r = tula_open_mmap(path);
+    var ix = tula_index_new(r);
+    var found = 0;
+    var right = 0;
+    i = 0;
+    while (i < n) {
+        var e = tula_entry(r, i);
+        var hit = tula_index_find(ix, tula_entry_full_name(r, e));
+        if (hit != 0) { found = found + 1; }
+        if (hit == e) { right = right + 1; }
+        i = i + 1;
+    }
+    assert_eq(found, n, "1,000 tensors (half long-named): every full name found through the index");
+    assert_eq(right, n, "... each to its own entry");
+    var s = alloc(8);
+    store64(s, 99);
+    assert_eq(check_equiv(r, ix, s), 0, "... and every query agrees with find_name (mmap'd file)");
+    assert_eq(tula_index_free(ix), 0, "tula_index_free releases the mapping");
+    assert_eq(tula_index_free(0), 0, "tula_index_free(0) is a no-op");
+    tula_close_mmap(r);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_equivalence_random();
+    test_foreign_name_fields();
+    test_small_and_large();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

@@ -259,6 +259,23 @@ its total opens, and the readers take exactly the declared bytes.
   name over 47 chars is found through the names table. A file without one has no
   such sidecar, so there, as in 1.2.0, a name over 41 chars returns 0.
 
+## Name index — `src/index.cyr` *(1.5.0, ADR 0007)*
+
+For many lookups on one file: `tula_find` / `tula_find_name` scan the manifest,
+so looking up every tensor is O(n²). At 4,096 tensors that's 44.8 ms by scan and
+3.1 ms through the index, build included.
+- `fn tula_index_new(r) -> ix | 0` — build the index of an opened buffer: a
+  sorted array of (name hash, canonical name) records in one private mapping
+  (48 + 64·n bytes). Worst case O(n log n) for any names. It is never a hash
+  table, so a crafted file can't flood it. The index points into `r`, so use it
+  only while `r` is valid. 0 if the mapping fails.
+- `fn tula_index_find(ix, name) -> e | 0` — O(log n), and **exactly**
+  `tula_find_name(r, name)`'s answer: the first matching entry, any length, a
+  long name confirmed against the names table.
+- `fn tula_index_find_scale(ix, e, need) -> se | 0` — `tula_find_scale` through
+  the index.
+- `fn tula_index_free(ix)` — release it (`0` is a no-op).
+
 ## dtype payload helpers — `src/dtype.cyr`
 
 Pure, caller-driven transforms — they never touch the file layout. **Before
@@ -332,13 +349,15 @@ if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { ...reject... }
 if (tula_verify_required(r, pk) != TULA_OK) { ...reject... }
 e = tula_find_name(r, "w")              # any length (1.3.0); tula_find for <= 47
 if (e == 0) { ...reject... }
+# many lookups: ix = tula_index_new(r); e = tula_index_find(ix, name); tula_index_free(ix)
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
 # a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
 ```
 
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
-and `tula_builder_add_long` are 1.3.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
+index is 1.5.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

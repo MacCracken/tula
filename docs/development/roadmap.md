@@ -90,6 +90,13 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   - A new CI gate, `make bigfile`: 2.42 GB streamed past the 2 GiB allocation
     cap.
   - In-memory output byte-identical to 1.3.0's. 388 → 422 assertions.
+- **1.5.0** (2026-11-04) — **lookup at scale**, no format change (ADR 0007):
+  - The name index (`tula_index_new` / `_find` / `_find_scale` / `_free`): a
+    sorted array, O(log n) lookups that crafted names can't degrade, with
+    answers identical to `tula_find_name`.
+  - A new CI gate, `make realmodels`: five real checkpoint inventories (GPT-2,
+    Llama-2-7B, Mixtral-8x7B, a LoRA adapter, a QLoRA NF4 import) end to end.
+  - Output and lookups identical to 1.4.0's. 422 → 435 assertions.
 
 ---
 
@@ -103,7 +110,7 @@ inconsistent with one call each. 1.2.0 shipped it (above). Left in the line:
 - **Consumer migration** (cross-repo, not tula code): anukulana and ifran move to
   `tula_builder_add_checked` / `tula_builder_new_cap` on the write side and
   `tula_validate_strict` → `tula_verify_required` → `tula_find_scale` on the
-  read side, as `examples/consumer.cyr` does. ifran still pins tula 1.0.2.
+  read side, as `examples/consumer.cyr` does.
 
 ## 1.3.x — real names, real dtypes
 
@@ -137,12 +144,19 @@ signs a read-only mapping of the file it just wrote. Left in the line:
 
 ## 1.5.x — lookup at scale, and a real round-trip
 
-- **Name index**: `tula_index_new(r)` → O(1) `tula_index_find`. `tula_find` is a
-  linear scan (~3 ns/entry since 1.1.2), so looking up every tensor of a
-  thousands-of-tensors checkpoint is O(n²).
-- **Real checkpoint round-trip**: import a real (small) checkpoint through
-  anukulana → tula file → load, in CI, using 1.2–1.4. This replaces the old
-  "attn11 checkpoint" placeholder.
+**Goal:** large checkpoints are cheap to resolve by name, and real model
+inventories go through the whole codec. 1.5.0 shipped the index and the
+inventory gate (above). Left in the line:
+
+- **1.5.x patches** — fixes as importers adopt the index; no new surface.
+- **The real-weights round trip is anukulana's** (cross-repo). Its `gpt2-tula`
+  demo already imports the real GPT-2 safetensors, NF4-quantizes it, saves a
+  signed tula checkpoint, reloads it and checks the result bit for bit. It
+  runs on tula 1.0.1 and cyrius 6.6.2 (its manifest, read 2026-11-04), and needs
+  the checkpoint staged. Moving anukulana to the current toolchain and tula,
+  then running that demo in its own CI over `tula_builder_write_file_signed`,
+  `tula_open_mmap` and the index, is the real-weights gate. tula's CI can't run
+  it without depending on its own consumer.
 
 ## 1.x — later / research
 

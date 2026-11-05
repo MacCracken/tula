@@ -7,6 +7,78 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-04
+
+**Lookup at scale, and real checkpoint inventories.** An additive MINOR with no
+format change (ADR 0007). Every 1.4.0 call behaves as before. Output and lookup
+answers are **identical** to 1.4.0's: diffed over randomized builders mixing all
+three add kinds, covering strict verdicts and `tula_find_name` /
+`tula_find_scale` answers for every entry and for 300 random probes.
+
+### Added
+
+- **The name index** (`src/index.cyr`, ADR 0007):
+  - `tula_index_new(r)` builds, once per opened buffer, a sorted array of (name
+    hash, canonical name) records in one private mapping.
+  - `tula_index_find(ix, name)` binary-searches it in O(log n) and returns
+    **exactly** `tula_find_name`'s answer: the first matching entry, any length,
+    long names confirmed against the names table.
+  - `tula_index_find_scale(ix, e, need)` is `tula_find_scale` through the index;
+    `tula_index_free(ix)` releases it.
+  - It is a sorted array, not a hash table, because the file is untrusted:
+    crafted colliding names can't flood it, so build is O(n log n) and lookup
+    O(log n) whatever the names. Looking up all 4,096 tensors of a file takes
+    3.1 ms through the index, build included, against 44.8 ms by scan (14.5×).
+- **`make realmodels`**, a new CI gate. Five real checkpoint inventories, with
+  the real tensor names, ranks, counts and dtypes and every dim divided by 64,
+  each written signed by the streaming writer, mapped back, strict-validated and
+  verified. Every tensor is then resolved through the index **and**
+  `tula_find_name` (which must agree), its shape checked, and its payload
+  compared byte for byte:
+  - GPT-2-small (F32, 148 tensors, names as anukulana's importer reads them);
+  - Llama-2-7B (F16, 291);
+  - Mixtral-8x7B (BF16, 995, 768 of them long-named experts);
+  - a PEFT LoRA adapter (F32, 256, all long);
+  - a QLoRA-style NF4 import of Llama-2-7B (517, with `.scale` sidecars found
+    through `tula_index_find_scale`).
+- **ADR 0007** records the index design.
+
+### Changed
+
+- **Shared helpers for lookups**: `tula_find_name`, `tula_find_scale` and the
+  index confirm a candidate and check a scale sidecar through the same code, so
+  they can't disagree. The strict validator's heapsort gained a tiebreak flag:
+  strict keeps equal names equal, and the index orders them by entry, giving
+  first-match semantics.
+- **Fuzz harness**: every accepted buffer (500,973 per run) gets an index under
+  the guard page, and `tula_index_find` must equal `tula_find_name` on each
+  entry's full name, stored name, and a long probe. A run now takes 41 s
+  (was 24 s).
+- **Bench**: index build, short and long index lookups, and a 4,096-tensor
+  find-everything comparison.
+
+### Not in tula
+
+- **The real-*weights* round trip** (roadmap 1.5.x) belongs to anukulana. Its
+  `gpt2-tula` demo already imports the real GPT-2 safetensors, NF4-quantizes it,
+  saves a signed tula checkpoint, reloads it and checks the result bit for bit.
+  It runs on tula 1.0.1 and cyrius 6.6.2, and needs the 500 MB checkpoint
+  staged. Pulling anukulana into tula's CI would make tula depend on its own
+  consumer, so `make realmodels` covers the tula side (real inventories, through
+  every 1.2–1.5 path) and the roadmap lists anukulana's migration.
+
+### Verified
+
+- Suite **422 → 435** assertions in 11 suites. The new `index.cyr` checks
+  equivalence with `tula_find_name` and `tula_find_scale` over 40 random files
+  with duplicates and names tables, foreign-style name fields with bytes after
+  the NUL, an empty file, and 1,000 tensors (half long-named) on an mmap'd file.
+- Mutations are caught: dropping the tiebreak breaks first-match on duplicates,
+  and non-canonical keys break the foreign-field cases.
+- `make fuzz`, `make realmodels`, `make bigfile` and `make example` all PASS.
+- `fmt`, `lint`, `vet` and `deny` clean. `doc --check` 0 undocumented.
+  `make dist` OK.
+
 ## [1.4.0] - 2026-11-04
 
 **Big files.** An additive MINOR with no format change (ADR 0006). Checkpoints

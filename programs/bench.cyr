@@ -57,6 +57,14 @@ fn report_el(label, n, ns): i64 {
     return 0;
 }
 
+# Copy cstring s to p (with its NUL); returns its length.
+fn cat_into(p, s): i64 {
+    var k = 0;
+    while (load8(s + k) != 0) { store8(p + k, load8(s + k)); k = k + 1; }
+    store8(p + k, 0);
+    return k;
+}
+
 fn min_of(cur, round, dt): i64 {
     if (round == 0) { return dt; }
     if (dt < cur) { return dt; }
@@ -456,6 +464,78 @@ fn main(): i64 {
         round = round + 1;
     }
     report_op("find_name(L) : ", BN_FIND_N, lfmin);
+
+    # ---- the name index (1.5.0): build once, then O(log n) lookups ----
+    var ibmin = 0;
+    var ix = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        if (ix != 0) { tula_index_free(ix); }
+        var tib = now_ns();
+        ix = tula_index_new(lr);
+        ibmin = min_of(ibmin, round, now_ns() - tib);
+        round = round + 1;
+    }
+    report_op("index new(L) : ", 1, ibmin);
+    var ilmin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var til = now_ns();
+        var iq = 0;
+        while (iq < BN_FIND_N) {
+            if (tula_index_find(ix, load64(lnames + iq * 8)) == 0) { sput("index MISSED\n"); return 1; }
+            iq = iq + 1;
+        }
+        ilmin = min_of(ilmin, round, now_ns() - til);
+        round = round + 1;
+    }
+    report_op("index find(L): ", BN_FIND_N, ilmin);
+    tula_index_free(ix);
+    var ixs = tula_index_new(fr);
+    var ismin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var tis = now_ns();
+        var sq = 0;
+        while (sq < BN_FIND_N) {
+            if (tula_index_find(ixs, load64(names + sq * 8)) == 0) { sput("index MISSED\n"); return 1; }
+            sq = sq + 1;
+        }
+        ismin = min_of(ismin, round, now_ns() - tis);
+        round = round + 1;
+    }
+    report_op("index find(S): ", BN_FIND_N, ismin);
+    tula_index_free(ixs);
+
+    # ---- scaling: 4,096 tensors, every name looked up once ----
+    var bigb = tula_builder_new_cap(4096);
+    var bnames = alloc(4096 * 8);
+    var bi = 0;
+    while (bi < 4096) {
+        var bnm = alloc(48);
+        var bk = cat_into(bnm, "model.layers.");
+        bk = bk + put_dec(bnm + bk, bi);
+        store8(bnm + bk, 0);
+        cat_into(bnm + bk, ".mlp.up_proj.weight");
+        store64(bnames + bi * 8, bnm);
+        tula_builder_add(bigb, bnm, TULA_DT_F64, shape1, 1, d1, 8);
+        bi = bi + 1;
+    }
+    var bigr = tula_builder_finish(bigb);
+    var t8a = now_ns();
+    bi = 0;
+    while (bi < 4096) { chk = chk + tula_find_name(bigr, load64(bnames + bi * 8)); bi = bi + 1; }
+    var t8b = now_ns();
+    var bix = tula_index_new(bigr);
+    bi = 0;
+    while (bi < 4096) { chk = chk + tula_index_find(bix, load64(bnames + bi * 8)); bi = bi + 1; }
+    var t8c = now_ns();
+    tula_index_free(bix);
+    sput("all 4096 by find_name: ");
+    fmt_int((t8b - t8a) / 1000);
+    sput(" us   by index (build incl.): ");
+    fmt_int((t8c - t8b) / 1000);
+    sput(" us\n");
 
     sput("checksum: ");
     fmt_int(chk);

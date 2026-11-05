@@ -1,0 +1,390 @@
+# programs/realmodels.cyr — the 1.5.0 real-model inventory gate. Five real
+# checkpoint inventories go through every 1.2–1.5 path: the sized builder,
+# tula_builder_add_long, the dtype conversions, the signed streaming writer, mmap,
+# tula_validate_strict, tula_verify_required, the name index and
+# tula_index_find_scale.
+#
+# Inventories (tensor NAMES, ranks, counts and dtypes are the real ones; every
+# dimension is divided by RM_SCALE so the gate runs in seconds):
+#   gpt2      — GPT-2-small, F32, 148 tensors. Names as anukulana's importer reads
+#               them from the real model.safetensors (h.<L>.*, wte, wpe, ln_f).
+#   llama2-7b — Llama-2-7B, F16, 291 tensors (Hugging Face naming; hidden 4096,
+#               intermediate 11008, vocab 32000).
+#   mixtral   — Mixtral-8x7B, BF16, 995 tensors; its expert names
+#               (…block_sparse_moe.experts.<j>.w1.weight) pass 47 chars.
+#   lora      — a PEFT LoRA adapter for Llama-2-7B, F32, r 16, q/k/v/o: 256
+#               tensors, every name 62+ chars (base_model.model.model.layers…).
+#   qlora     — Llama-2-7B as a QLoRA-style import: each 2-D weight NF4 with its
+#               f64 "<name>.scale" sidecar (ADR 0002), the 1-D norms F16: 517.
+#
+# Every payload is a real conversion (tula_*_pack / tula_nf4_pack) of an f64
+# signal. Every tensor is found through the index AND tula_find_name, which must
+# agree; its rank, dims and dtype are checked; its payload is compared byte for
+# byte with what was written. A real-WEIGHTS round trip is anukulana's (its
+# gpt2-tula demo imports the real checkpoint); see the roadmap.
+#
+#   make realmodels
+
+include "src/lib.cyr"
+
+enum RmCfg {
+    RM_SCALE   = 64;
+    RM_MAXT    = 1100;
+    RM_REC     = 64;       # per-tensor record: name, ndim, d0, d1, dtype, nelems, packed, len
+    RM_SIGNAL  = 1048576;  # f64 signal elements (>= the largest scaled tensor + RM_MAXT)
+}
+
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+fn rm_kvs(label, n): i64 {
+    sput(label);
+    fmt_int(n);
+    return 0;
+}
+
+# ---- name building -------------------------------------------------------
+fn rm_cat(buf, len, s): i64 {
+    var k = 0;
+    while (load8(s + k) != 0) {
+        store8(buf + len + k, load8(s + k));
+        k = k + 1;
+    }
+    store8(buf + len + k, 0);
+    return len + k;
+}
+
+fn rm_cati(buf, len, n): i64 {
+    if (n >= 10) { len = rm_cati(buf, len, n / 10); }
+    store8(buf + len, 48 + n % 10);
+    store8(buf + len + 1, 0);
+    return len + 1;
+}
+
+# ---- the model context ------------------------------------------------------
+# +0 builder  +8 tensors added  +16 records  +24 dtype for 2-D weights
+# +32 dtype for 1-D tensors  +40 nf4 mode (2-D weights NF4 + sidecar)  +48 signal
+# +56 long names added
+fn rm_ctx_new(dt2, dt1, nf4, sig): i64 {
+    var m = alloc(64);
+    store64(m, tula_builder_new_cap(RM_MAXT));
+    store64(m + 8, 0);
+    store64(m + 16, alloc(RM_MAXT * RM_REC));
+    store64(m + 24, dt2);
+    store64(m + 32, dt1);
+    store64(m + 40, nf4);
+    store64(m + 48, sig);
+    store64(m + 56, 0);
+    return m;
+}
+
+fn rm_scaled(d): i64 {
+    var s = d / RM_SCALE;
+    if (s < 1) { s = 1; }
+    return s;
+}
+
+# Pack nel f64 values from `src` as dtype into a fresh buffer; returns it.
+fn rm_pack_as(dt, src, nel): i64 {
+    var p = alloc(tula_packed_len(dt, nel) + 8);
+    if (dt == TULA_DT_F64) {
+        var i = 0;
+        while (i < nel) { store64(p + i * 8, load64(src + i * 8)); i = i + 1; }
+    }
+    if (dt == TULA_DT_F32) { tula_f32_pack(src, nel, p); }
+    if (dt == TULA_DT_F16) { tula_f16_pack(src, nel, p); }
+    if (dt == TULA_DT_BF16) { tula_bf16_pack(src, nel, p); }
+    return p;
+}
+
+# Record + add one tensor (the name in `nm`, a real shape d0 or [d0, d1]).
+fn rm_put(m, nm, dt, ndim, d0, d1, packed, nel): i64 {
+    var t = load64(m + 8);
+    var rec = load64(m + 16) + t * RM_REC;
+    var nl = strlen(nm);
+    var copy = alloc(nl + 1);
+    var k = 0;
+    while (k <= nl) { store8(copy + k, load8(nm + k)); k = k + 1; }
+    var len = tula_packed_len(dt, nel);
+    store64(rec, copy);
+    store64(rec + 8, ndim);
+    store64(rec + 16, d0);
+    store64(rec + 24, d1);
+    store64(rec + 32, dt);
+    store64(rec + 40, nel);
+    store64(rec + 48, packed);
+    store64(rec + 56, len);
+    var sh = alloc(16);
+    store64(sh, d0);
+    store64(sh + 8, d1);
+    var rc = tula_builder_add_long(load64(m), nm, dt, sh, ndim, packed, len);
+    if (rc != 0) {
+        sput("FAIL: add ");
+        sput(nm);
+        sput("\n");
+        syscall(60, 1);
+    }
+    if (nl > TULA_NAME_MAX) { store64(m + 56, load64(m + 56) + 1); }
+    store64(m + 8, t + 1);
+    return 0;
+}
+
+# A tensor of the real shape (d0) or (d0, d1), scaled; 2-D weights take dt2
+# (or NF4 + an f64 sidecar in nf4 mode), 1-D tensors dt1.
+fn rm_add(m, nm, ndim, d0, d1): i64 {
+    var s0 = rm_scaled(d0);
+    var s1 = 1;
+    if (ndim == 2) { s1 = rm_scaled(d1); }
+    var nel = s0 * s1;
+    var src = load64(m + 48) + load64(m + 8) * 8;   # a different window per tensor
+    if (ndim == 2) {
+        if (load64(m + 40) == 1) {
+            var nb = tula_nf4_blocks(nel, TULA_NF4_BLOCK);
+            var codes = alloc(tula_nf4_bytes(nel) + 8);
+            var scales = alloc(nb * 8 + 8);
+            tula_nf4_pack(src, nel, TULA_NF4_BLOCK, scales, codes);
+            rm_put(m, nm, TULA_DT_NF4, 2, s0, s1, codes, nel);
+            var l = strlen(nm);
+            l = rm_cat(nm, l, ".scale");
+            rm_put(m, nm, TULA_DT_F64, 1, nb, 0, scales, nb);
+            store8(nm + l - 6, 0);
+            return 0;
+        }
+        rm_put(m, nm, load64(m + 24), 2, s0, s1, rm_pack_as(load64(m + 24), src, nel), nel);
+        return 0;
+    }
+    rm_put(m, nm, load64(m + 32), 1, s0, 0, rm_pack_as(load64(m + 32), src, nel), nel);
+    return 0;
+}
+
+# ---- the inventories ---------------------------------------------------------
+fn rm_gpt2(m): i64 {
+    var nm = alloc(128);
+    var n = rm_cat(nm, 0, "wte.weight");
+    rm_add(m, nm, 2, 50257, 768);
+    n = rm_cat(nm, 0, "wpe.weight");
+    rm_add(m, nm, 2, 1024, 768);
+    var L = 0;
+    while (L < 12) {
+        var b = rm_cat(nm, 0, "h.");
+        b = rm_cati(nm, b, L);
+        b = rm_cat(nm, b, ".");
+        rm_cat(nm, b, "ln_1.weight");        rm_add(m, nm, 1, 768, 0);
+        rm_cat(nm, b, "ln_1.bias");          rm_add(m, nm, 1, 768, 0);
+        rm_cat(nm, b, "attn.c_attn.weight"); rm_add(m, nm, 2, 768, 2304);
+        rm_cat(nm, b, "attn.c_attn.bias");   rm_add(m, nm, 1, 2304, 0);
+        rm_cat(nm, b, "attn.c_proj.weight"); rm_add(m, nm, 2, 768, 768);
+        rm_cat(nm, b, "attn.c_proj.bias");   rm_add(m, nm, 1, 768, 0);
+        rm_cat(nm, b, "ln_2.weight");        rm_add(m, nm, 1, 768, 0);
+        rm_cat(nm, b, "ln_2.bias");          rm_add(m, nm, 1, 768, 0);
+        rm_cat(nm, b, "mlp.c_fc.weight");    rm_add(m, nm, 2, 768, 3072);
+        rm_cat(nm, b, "mlp.c_fc.bias");      rm_add(m, nm, 1, 3072, 0);
+        rm_cat(nm, b, "mlp.c_proj.weight");  rm_add(m, nm, 2, 3072, 768);
+        rm_cat(nm, b, "mlp.c_proj.bias");    rm_add(m, nm, 1, 768, 0);
+        L = L + 1;
+    }
+    rm_cat(nm, 0, "ln_f.weight");
+    rm_add(m, nm, 1, 768, 0);
+    rm_cat(nm, 0, "ln_f.bias");
+    rm_add(m, nm, 1, 768, 0);
+    return 148;
+}
+
+fn rm_llama(m): i64 {
+    var nm = alloc(128);
+    rm_cat(nm, 0, "model.embed_tokens.weight");
+    rm_add(m, nm, 2, 32000, 4096);
+    var L = 0;
+    while (L < 32) {
+        var b = rm_cat(nm, 0, "model.layers.");
+        b = rm_cati(nm, b, L);
+        b = rm_cat(nm, b, ".");
+        rm_cat(nm, b, "self_attn.q_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "self_attn.k_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "self_attn.v_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "self_attn.o_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "mlp.gate_proj.weight");           rm_add(m, nm, 2, 11008, 4096);
+        rm_cat(nm, b, "mlp.up_proj.weight");             rm_add(m, nm, 2, 11008, 4096);
+        rm_cat(nm, b, "mlp.down_proj.weight");           rm_add(m, nm, 2, 4096, 11008);
+        rm_cat(nm, b, "input_layernorm.weight");         rm_add(m, nm, 1, 4096, 0);
+        rm_cat(nm, b, "post_attention_layernorm.weight"); rm_add(m, nm, 1, 4096, 0);
+        L = L + 1;
+    }
+    rm_cat(nm, 0, "model.norm.weight");
+    rm_add(m, nm, 1, 4096, 0);
+    rm_cat(nm, 0, "lm_head.weight");
+    rm_add(m, nm, 2, 32000, 4096);
+    return 291;
+}
+
+fn rm_mixtral(m): i64 {
+    var nm = alloc(128);
+    rm_cat(nm, 0, "model.embed_tokens.weight");
+    rm_add(m, nm, 2, 32000, 4096);
+    var L = 0;
+    while (L < 32) {
+        var b = rm_cat(nm, 0, "model.layers.");
+        b = rm_cati(nm, b, L);
+        b = rm_cat(nm, b, ".");
+        rm_cat(nm, b, "self_attn.q_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "self_attn.k_proj.weight");        rm_add(m, nm, 2, 1024, 4096);
+        rm_cat(nm, b, "self_attn.v_proj.weight");        rm_add(m, nm, 2, 1024, 4096);
+        rm_cat(nm, b, "self_attn.o_proj.weight");        rm_add(m, nm, 2, 4096, 4096);
+        rm_cat(nm, b, "block_sparse_moe.gate.weight");   rm_add(m, nm, 2, 8, 4096);
+        var j = 0;
+        while (j < 8) {
+            var e = rm_cat(nm, b, "block_sparse_moe.experts.");
+            e = rm_cati(nm, e, j);
+            rm_cat(nm, e, ".w1.weight");                 rm_add(m, nm, 2, 14336, 4096);
+            rm_cat(nm, e, ".w2.weight");                 rm_add(m, nm, 2, 4096, 14336);
+            rm_cat(nm, e, ".w3.weight");                 rm_add(m, nm, 2, 14336, 4096);
+            j = j + 1;
+        }
+        rm_cat(nm, b, "input_layernorm.weight");         rm_add(m, nm, 1, 4096, 0);
+        rm_cat(nm, b, "post_attention_layernorm.weight"); rm_add(m, nm, 1, 4096, 0);
+        L = L + 1;
+    }
+    rm_cat(nm, 0, "model.norm.weight");
+    rm_add(m, nm, 1, 4096, 0);
+    rm_cat(nm, 0, "lm_head.weight");
+    rm_add(m, nm, 2, 32000, 4096);
+    return 995;
+}
+
+fn rm_lora(m): i64 {
+    var nm = alloc(128);
+    var L = 0;
+    while (L < 32) {
+        var b = rm_cat(nm, 0, "base_model.model.model.layers.");
+        b = rm_cati(nm, b, L);
+        b = rm_cat(nm, b, ".self_attn.");
+        var t = 0;
+        while (t < 4) {
+            var p = b;
+            if (t == 0) { p = rm_cat(nm, b, "q_proj"); }
+            if (t == 1) { p = rm_cat(nm, b, "k_proj"); }
+            if (t == 2) { p = rm_cat(nm, b, "v_proj"); }
+            if (t == 3) { p = rm_cat(nm, b, "o_proj"); }
+            rm_cat(nm, p, ".lora_A.weight");             rm_add(m, nm, 2, 16, 4096);
+            rm_cat(nm, p, ".lora_B.weight");             rm_add(m, nm, 2, 4096, 16);
+            t = t + 1;
+        }
+        L = L + 1;
+    }
+    return 256;
+}
+
+# ---- run one model ---------------------------------------------------------------
+fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
+    var m = rm_ctx_new(dt2, dt1, nf4, sig);
+    var want = 0;
+    if (which == 0) { want = rm_gpt2(m); }
+    if (which == 1) { want = rm_llama(m); }
+    if (which == 2) { want = rm_mixtral(m); }
+    if (which == 3) { want = rm_lora(m); }
+    if (which == 4) { rm_llama(m); want = 517; }   # 291 + a sidecar for each of the 226 2-D weights
+    var n = load64(m + 8);
+    if (n != want) { sput("FAIL: tensor count\n"); return 1; }
+    var path = "build/tula_realmodel.tula";
+    var total = tula_builder_write_file_signed(load64(m), path, sk);
+    if (total <= 0) { sput("FAIL: write\n"); return 1; }
+    var r = tula_open_mmap(path);
+    if (r == 0) { sput("FAIL: open\n"); return 1; }
+    if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { sput("FAIL: strict\n"); return 1; }
+    if (tula_verify_required(r, pk) != TULA_OK) { sput("FAIL: signature\n"); return 1; }
+    var longs = load64(m + 56);
+    var table = 0;
+    if (longs > 0) { table = 1; }
+    if (tula_count(r) != n + table) { sput("FAIL: file tensor count\n"); return 1; }
+    if (tula_has_long_names(r) != table) { sput("FAIL: names table presence\n"); return 1; }
+    var ti = now_ns();
+    var ix = tula_index_new(r);
+    var t_ix = now_ns() - ti;
+    if (ix == 0) { sput("FAIL: index\n"); return 1; }
+    var recs = load64(m + 16);
+    var tl = now_ns();
+    var i = 0;
+    while (i < n) {
+        var e = tula_index_find(ix, load64(recs + i * RM_REC));
+        if (e == 0) { sput("FAIL: index miss\n"); return 1; }
+        i = i + 1;
+    }
+    var t_look = now_ns() - tl;
+    i = 0;
+    while (i < n) {
+        var rec = recs + i * RM_REC;
+        var nm = load64(rec);
+        var e2 = tula_index_find(ix, nm);
+        if (e2 != tula_find_name(r, nm)) { sput("FAIL: index != find_name: "); sput(nm); sput("\n"); return 1; }
+        if (tula_entry_dtype(e2) != load64(rec + 32)) { sput("FAIL: dtype\n"); return 1; }
+        if (tula_entry_ndim(e2) != load64(rec + 8)) { sput("FAIL: rank\n"); return 1; }
+        if (tula_entry_dim(e2, 0) != load64(rec + 16)) { sput("FAIL: dim 0\n"); return 1; }
+        if (load64(rec + 8) == 2) {
+            if (tula_entry_dim(e2, 1) != load64(rec + 24)) { sput("FAIL: dim 1\n"); return 1; }
+        }
+        if (tula_entry_nelems(e2) != load64(rec + 40)) { sput("FAIL: nelems\n"); return 1; }
+        var len = load64(rec + 56);
+        if (tula_entry_data_len(e2) != len) { sput("FAIL: data_len\n"); return 1; }
+        var p = tula_entry_data(r, e2);
+        var q = load64(rec + 48);
+        var k = 0;
+        while (k < len) {
+            if (load8(p + k) != load8(q + k)) { sput("FAIL: payload bytes\n"); return 1; }
+            k = k + 1;
+        }
+        if (streq(tula_entry_full_name(r, e2), nm) == 0) { sput("FAIL: full name\n"); return 1; }
+        if (tula_entry_dtype(e2) == TULA_DT_NF4) {
+            var need = tula_nf4_blocks(tula_entry_nelems(e2), TULA_NF4_BLOCK);
+            var sc = tula_index_find_scale(ix, e2, need);
+            if (sc == 0) { sput("FAIL: NF4 sidecar\n"); return 1; }
+            if (sc != tula_find_scale(r, e2, need)) { sput("FAIL: index_find_scale != find_scale\n"); return 1; }
+        }
+        i = i + 1;
+    }
+    tula_index_free(ix);
+    tula_close_mmap(r);
+    xunlink(path);
+    sput(label);
+    rm_kvs(" tensors ", n);
+    rm_kvs(" (long names ", longs);
+    rm_kvs(")  bytes ", total);
+    rm_kvs("  index build us ", t_ix / 1000);
+    rm_kvs("  lookup ns ", t_look / n);
+    sput("\n");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var sig = alloc(RM_SIGNAL * 8);
+    var i = 0;
+    while (i < RM_SIGNAL) {
+        var v = f64_div(f64_from((i * 7919) % 20011 - 10005), f64_from(4093));
+        store64(sig + i * 8, v);
+        i = i + 1;
+    }
+    var seed = alloc(32);
+    i = 0;
+    while (i < 32) { store8(seed + i, 3 * i + 17); i = i + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    sput("tula real-model inventory gate (1.5.0)\n");
+    var fails = 0;
+    fails = fails + rm_run("  gpt2-small   F32 ", 0, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
+    fails = fails + rm_run("  llama-2-7b   F16 ", 1, TULA_DT_F16, TULA_DT_F16, 0, sig, sk, pk);
+    fails = fails + rm_run("  mixtral-8x7b BF16", 2, TULA_DT_BF16, TULA_DT_BF16, 0, sig, sk, pk);
+    fails = fails + rm_run("  lora-llama2  F32 ", 3, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
+    fails = fails + rm_run("  qlora-llama2 NF4 ", 4, TULA_DT_NF4, TULA_DT_F16, 1, sig, sk, pk);
+    if (fails == 0) {
+        sput("RESULT: PASS — five real checkpoint inventories written, signed, read and resolved by name\n");
+        return 0;
+    }
+    sput("RESULT: FAIL\n");
+    return 1;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

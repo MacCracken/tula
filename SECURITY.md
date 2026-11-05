@@ -79,6 +79,13 @@ same bytes make a small file decode into a lot of work, and strict rejects that.
 Its duplicate check sorts names (worst case O(n log n)) rather than hashing them,
 so crafted names can't make it quadratic.
 
+**The name index (1.5.0) is built over untrusted names**, so it is a sorted array
+searched by bisection, never a hash table (ADR 0007). Crafted colliding names
+cost a full name comparison per step, never more steps. Building is
+O(n log n) and lookup O(log n) whatever the file holds. The fuzzer builds an
+index for every accepted buffer, under the guard page, and checks that it agrees
+with `tula_find_name`.
+
 **The names table (1.3.0) is read as untrusted too.** It is recognized only by
 its name, dtype, magic and a record count that fits its bytes. Each record is
 bounds-checked when `tula_entry_full_name` reads it; one that doesn't hold up is

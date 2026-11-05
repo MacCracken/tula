@@ -10,7 +10,8 @@ generated `dist/tula.cyr` bundle.
 `src/lib.cyr` is the **only** file that carries `include` directives. It includes
 the stdlib set, then `sigil`, then the tula domain modules in dependency order.
 The domain modules (`src/error.cyr`, `src/format.cyr`, `src/sign.cyr`,
-`src/fileio.cyr`, `src/dtype.cyr`, `src/names.cyr`, `src/check.cyr`) are **flat** — they contain no `include` lines
+`src/fileio.cyr`, `src/dtype.cyr`, `src/names.cyr`, `src/check.cyr`,
+`src/index.cyr`) are **flat** — they contain no `include` lines
 at all and reference symbols defined in earlier-included modules as if they were
 in the same scope.
 
@@ -37,8 +38,9 @@ bundle is compile-clean for consumers.
 - **Order matters.** `error.cyr` is dep-free; `format.cyr` builds on it; `sign.cyr`
   and `fileio.cyr` build on `format.cyr`; `dtype.cyr` uses `format.cyr` accessors;
   `names.cyr` (1.3.0: the long-name table's reader) uses `format.cyr`;
-  `check.cyr` (1.2.0: the strict validator + scale lookup) comes last, using
-  `format.cyr`, `dtype.cyr` and `names.cyr`.
+  `check.cyr` (1.2.0: the strict validator + scale lookup) uses `format.cyr`,
+  `dtype.cyr` and `names.cyr`; `index.cyr` (1.5.0: the name index) comes last,
+  using `names.cyr` and `check.cyr`'s sort.
   Reordering `[lib].modules` without re-running `make dist` breaks the bundle.
 
 - **`lib/` is a build artifact.** It is populated by `cyrius deps` from
