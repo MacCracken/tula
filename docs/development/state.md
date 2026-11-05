@@ -23,27 +23,29 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.0.3** (`tula_version_int()` returns `10003`). 1.0.1–1.0.3 are
-toolchain/dep realigns with no source or format change (see `CHANGELOG.md`). Post-1.0 work
+VERSION is **1.1.0** (`tula_version_int()` returns `10100`). 1.0.1–1.1.0 are
+toolchain/dep realigns with no API or format change (see `CHANGELOG.md`). Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
 ## Toolchain
 
-Cyrius pin **6.6.20** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
-**sigil 3.13.10** (Ed25519), the last sigil tag pinned within 6.6.x. Local dev
-resolves sigil via `path = "../sigil"`; CI/release resolve via `[deps.sigil]`
-**git+tag** — so the sigil tag must exist on GitHub for CI + the release to pass.
+Cyrius pin **6.7.9** (`cyrius.cyml`). Deps: the sigil-consumer stdlib set +
+**sigil 3.13.15** (Ed25519), the sigil release that pins 6.7.9. Every build resolves
+`[deps.sigil]` **git+tag**, local and CI alike (cyrius ≥ 6.7.6, git first). The sigil
+tag must exist on GitHub for CI + the release to pass.
 
-**Under 6.6.x the `path` override wins**, even when it isn't the declared tag. So a
-local `cyrius build` / `test` builds whatever `../sigil` is checked out at. To test
-the declared graph, drop the `path` line for the run (or move `../sigil` to the tag).
-The 6.7.6 note in `roadmap.md` makes the tag the default.
+**Local sigil work:** `CYRIUS_LOCAL=1` (or `--local`) builds the `../sigil` working
+tree under `build/local-deps/`; `lib/` and `cyrius.lock` stay the tag's. Without the
+switch a build prints one `hint:` line naming the unused checkout.
 
-**Pin history:** 6.3.27 → 6.5.27 (2026-08-17) → 6.6.2 (2026-09-11) → **6.6.20**
-(2026-11-04). Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the
-bundle itself needs. tula needs none beyond what sigil's sidecar brings, so there is
-no `dist/tula.deps`.
+**Expected warning:** `./lib/ shadows version-pinned …/6.7.9/lib … sigil 3.13.15
+(pinned: 3.13.11)`. The toolchain ships an older sigil copy; the declared tag wins.
+
+**Pin history:** 6.3.27 → 6.5.27 (2026-08-17) → 6.6.2 (2026-09-11) → 6.6.20
+(2026-11-04, 1.0.3) → **6.7.9** (2026-11-04, 1.1.0). Since 6.6.18, `cyrius distlib`
+writes a sidecar only for leaves the bundle itself needs. tula needs none beyond what
+sigil's sidecar brings, so there is no `dist/tula.deps`. Smoke binary: 251,280 B.
 
 ## Build artifacts
 

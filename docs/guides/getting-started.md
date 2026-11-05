@@ -1,6 +1,6 @@
 # Getting started
 
-> **Last Updated**: 2026-07-01
+> **Last Updated**: 2026-11-04
 
 Build and test tula, then write and read a signed weight file. tula is a
 **library** (no CLI binary) — the "run" step is the consumer example.
@@ -10,8 +10,10 @@ Build and test tula, then write and read a signed weight file. tula is a
 - **Cyrius toolchain** — the version is pinned in `cyrius.cyml` under
   `[package].cyrius` (the pin is the single source of truth; run `cyrius --version`
   to confirm your install matches).
-- **`sigil`** — the Ed25519 dependency. Local dev resolves it via `path = "../sigil"`
-  (clone `sigil` next to `tula`); CI resolves it via git+tag.
+- **`sigil`** — the Ed25519 dependency, resolved from its git tag (fetched on the
+  first build). To build against a local sigil checkout instead, clone `sigil` next
+  to `tula` and set `CYRIUS_LOCAL=1` (or pass `--local`); `path = "../sigil"` is
+  read only then.
 - Linux x86_64 is the primary target.
 
 ## Build and test

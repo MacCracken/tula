@@ -34,9 +34,11 @@ jobs:
       - name: Resolve dependencies
         # `cyrius deps` reads [deps] from cyrius.cyml: the stdlib set (copied
         # from the installed toolchain) plus `sigil` (fetched from GitHub via
-        # [deps.sigil] git+tag — the `path = "../sigil"` override only applies
-        # to local dev, where sigil is a sibling checkout). Requires the sigil
-        # tag to exist on GitHub. lib/ must be a real dir, never a symlink.
+        # [deps.sigil] git+tag). The `path = "../sigil"` beside it is read only
+        # in local mode (CYRIUS_LOCAL=1 / --local), which CI never sets, so CI
+        # and a default local build resolve the same tag (cyrius >= 6.7.6).
+        # Requires the sigil tag to exist on GitHub. lib/ must be a real dir,
+        # never a symlink.
         run: |
           rm -rf lib
           mkdir lib

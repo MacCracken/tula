@@ -7,6 +7,45 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-04
+
+No API addition and no format change. The public surface and on-disk format v1 are
+exactly 1.0.3's. The minor bump marks the move to the 6.7 toolchain line and git-first
+dependency resolution.
+
+### Changed
+
+- **Toolchain `6.6.20` → `6.7.9`.** No source change. `lib/` re-resolved by `cyrius deps` from the
+  6.7.9 snapshot (52 files, `deps --verify` clean).
+- **`[deps.sigil]` tag `3.13.10` → `3.13.15`**, the sigil release that pins 6.7.9 (and sigil's
+  latest). It's also what libro, kavach, daimon and the other sigil consumers on 6.7.18 pin.
+  3.13.11–3.13.15 are additive-only for API (one new `x509_name_constraints_check_ca`), and
+  tula's Ed25519 calls are unchanged. sigil's stdlib sidecar is identical to 3.13.10's, so
+  `[deps].stdlib` doesn't move.
+- **Smoke binary 516,656 → 251,280 B.** sigil 3.13.12 shrank a 256 KB static buffer to 4 KB, so
+  the `array local … gets STATIC storage` and `large static data` build warnings are gone.
+- **Git first (cyrius ≥ 6.7.6).** Every build now resolves the sigil tag, a dev box's included.
+  `path = "../sigil"` is read only in local mode (`CYRIUS_LOCAL=1` / `--local`), which builds
+  under `build/local-deps/` and leaves `lib/` + `cyrius.lock` untouched. The comments in
+  `cyrius.cyml` and `ci.yml`, plus `getting-started.md`, `state.md` and the roadmap's sigil
+  bullet, now say so. The roadmap's 6.7.6 to-do is marked applied. Its `cyrius deps --locked`
+  item doesn't apply: tula's CI has no lock guard and `cyrius.lock` stays gitignored.
+
+### Notes
+
+- Builds print `./lib/ shadows version-pinned …/versions/6.7.9/lib … sigil 3.13.15 (pinned:
+  3.13.11)`. The 6.7.9 toolchain ships its own sigil copy from before 3.13.12. The declared
+  `[deps.sigil]` tag is what `lib/` holds and what CI builds. The `cyrius lib sync --full`
+  the warning suggests is refused here (lock and snapshot disagree) and isn't needed.
+  `CYRIUS_NO_WARN_SHADOW_LIB=1` silences it.
+
+### Verified
+
+- Suite **105/105** (5 suites). Lint, fmt and vet clean. `make example` PASS. `make fuzz`
+  2,003,000 iterations, 0 invariant failures. `make bench` and `make dist` OK
+  (`dist/tula.cyr` changes only in its version lines). Local mode checked too: it builds
+  `../sigil` from `build/local-deps/` with `lib/` and `cyrius.lock` byte-identical afterwards.
+
 ## [1.0.3] - 2026-11-04
 
 ### Changed

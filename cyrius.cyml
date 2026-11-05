@@ -5,7 +5,7 @@ description = "tula (तुला — balance / scale; the instrument that weigh
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/tula"
 language = "cyrius"
-cyrius = "6.6.20"
+cyrius = "6.7.9"
 
 # tula is a library — no CLI binary. `cyrius build` targets a smoke program
 # that links the full include chain to prove src/lib.cyr parses/links clean.
@@ -58,11 +58,14 @@ stdlib = [
 ]
 
 # sigil — the sovereign crypto boundary (Ed25519 sign/verify for the signed
-# header). git+path+tag: local dev resolves via path=../sigil; CI resolves via
-# git+tag (mirrors libro). tula's own dist/tula.cyr leaves ed25519_* unresolved
-# (consumer supplies sigil) — the standard consumer-bundle pattern.
+# header). git+tag is what every build resolves, a dev box's included (cyrius
+# >= 6.7.6, git first). `path` is a dev override read only in local mode
+# (CYRIUS_LOCAL=1 or --local), which builds ../sigil's working tree under
+# build/local-deps/ and leaves lib/ + cyrius.lock alone. tula's own
+# dist/tula.cyr leaves ed25519_* unresolved (consumer supplies sigil) — the
+# standard consumer-bundle pattern.
 [deps.sigil]
 git = "https://github.com/MacCracken/sigil.git"
 path = "../sigil"
-tag = "3.13.10"
+tag = "3.13.15"
 modules = ["dist/sigil.cyr"]
