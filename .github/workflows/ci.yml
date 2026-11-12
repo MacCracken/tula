@@ -144,7 +144,10 @@ jobs:
             os: ubuntu-26.04-arm
             experimental: false
           - name: arm64 macOS
-            os: macos-14
+            # macos-15 is arm64 (macos-15-intel is the Intel image). GitHub
+            # retired macos-14, the image 1.6.1 first ran green on, on
+            # 2026-11-02; jobs asking for it get no runner.
+            os: macos-15
             # A hard gate since 1.6.2: informational until its first green run,
             # which was 1.6.1's (every step, the fuzzer included).
             experimental: false

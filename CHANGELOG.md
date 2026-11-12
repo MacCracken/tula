@@ -55,6 +55,9 @@ the fuzzer's phase H.
   (`macos-14`) ran green on 1.6.1's final commit: the suites, the consumer,
   realmodels, bigfile and the fuzzer. It is no longer `experimental`, so a
   failure there fails CI and the release. x86_64 macOS is still not covered.
+  - The leg now runs on `macos-15` (arm64). GitHub retired the macOS 14 image on
+    2026-11-02, so a job asking for `macos-14` got no runner ("The
+    configuration 'macos-14-arm64-us-default' is not supported").
 - **`make bigfile` writes the file back out.** After `tula_read_file_into`, the
   2.36 GB buffer goes through `tula_write_file_atomic`, then `tula_write_file`
   over the copy, and each copy is compared with the buffer word for word. One

@@ -60,8 +60,9 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
 `index.tcyr` 13, `sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
-  same on native `ubuntu-26.04-arm` and `macos-14`, both hard gates (macOS since
-  1.6.2, after 1.6.1's run went green end to end). x86_64 macOS isn't covered.
+  same on native `ubuntu-26.04-arm` and `macos-15` (arm64), both hard gates
+  (macOS since 1.6.2, after 1.6.1's run on `macos-14` went green end to end;
+  GitHub retired that image on 2026-11-02). x86_64 macOS isn't covered.
 - `make realmodels` (CI): GPT-2, Llama-2-7B, Mixtral-8x7B, a LoRA adapter and a
   QLoRA NF4 import (real names, ranks, counts and dtypes; dims ÷ 64), each
   written signed, read, strict-validated, verified and resolved by index.
