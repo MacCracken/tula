@@ -7,7 +7,9 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
-**Compact formats: FP8 and INT4** (1.8.0). An additive MINOR with no format
+## [1.8.0] - 2026-11-12
+
+**Compact formats: FP8 and INT4.** An additive MINOR with no format
 change (ADRs 0010 and 0011). FP8 checkpoints and 4-bit imports are stored at
 their own size, under their own dtypes. A file that doesn't use them is byte for
 byte what 1.7.0 writes. Diffed against 1.7.0 on 400 random builders (dtypes

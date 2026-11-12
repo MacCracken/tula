@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.7.0** (`tula_version_int()` returns `10700`). 1.0.1–1.1.1 are
+VERSION is **1.8.0** (`tula_version_int()` returns `10800`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -52,8 +52,7 @@ request), so buffers over INT_MAX bytes work on macOS too.
 `TULA_DT_I16/I32/I64/U8/BOOL` = codes 7–11, stored raw; strict rejects a BOOL
 byte other than 0 or 1 with `TULA_ERR_VALUE` (19). 1.6.2 reads such files (open,
 verify, names, metadata); its strict says `TULA_ERR_DTYPE`.
-**1.8.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.7.0):
-compact formats. OCP FP8 `TULA_DT_F8_E4M3` / `F8_E5M2` = codes 12–13 (ADR 0010),
+**1.8.0 — compact formats**: OCP FP8 `TULA_DT_F8_E4M3` / `F8_E5M2` = codes 12–13 (ADR 0010),
 exact non-saturating conversions in integer arithmetic; `TULA_DT_INT4` = 14
 (ADR 0011), signed codes with an f64 `.scale` sidecar, quantized by Q4_0's rule,
 strict-checked for an odd count's unused nibble. 1.7.0 reads such files; its
@@ -62,7 +61,7 @@ Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.8.0, unreleased)
+## Tests, fuzz, gates (1.8.0)
 
 **757 assertions** across 15 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81
 (1.8.0), `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
@@ -148,7 +147,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: cut 1.8.0 (FP8 and INT4, in `[Unreleased]`); then 1.9.x throughput
-(the FP8 and INT4 helpers are per-element calls today). Later: the 1.x.x
+Next: 1.9.x throughput (the FP8 and INT4 helpers are per-element calls today);
+1.8.x patches only for fixes importers turn up. Later: the 1.x.x
 research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.
