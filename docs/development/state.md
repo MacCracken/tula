@@ -49,28 +49,36 @@ runners. **1.6.2** (patch): the macOS leg is a hard gate, and `tula_write_file` 
 `tula_write_file_atomic` write through tula's own loop (at most 1 GiB per
 request), so buffers over INT_MAX bytes work on macOS too.
 **1.7.0 — integer and boolean dtypes** (ADR 0009):
-`TULA_DT_I16/I32/I64/U8/BOOL` = codes 7–11, stored raw; strict rejects a BOOL byte other than 0 or 1 with
-`TULA_ERR_VALUE` (19). 1.6.2 reads such files (open, verify, names, metadata);
-its strict says `TULA_ERR_DTYPE`.
+`TULA_DT_I16/I32/I64/U8/BOOL` = codes 7–11, stored raw; strict rejects a BOOL
+byte other than 0 or 1 with `TULA_ERR_VALUE` (19). 1.6.2 reads such files (open,
+verify, names, metadata); its strict says `TULA_ERR_DTYPE`.
+**1.8.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.7.0):
+compact formats. OCP FP8 `TULA_DT_F8_E4M3` / `F8_E5M2` = codes 12–13 (ADR 0010),
+exact non-saturating conversions in integer arithmetic; `TULA_DT_INT4` = 14
+(ADR 0011), signed codes with an f64 `.scale` sidecar, quantized by Q4_0's rule,
+strict-checked for an odd count's unused nibble. 1.7.0 reads such files; its
+strict says `TULA_ERR_DTYPE`.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.7.0)
+## Tests, fuzz, gates (1.8.0, unreleased)
 
-**628 assertions** across 13 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
-`stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67, `ints.tcyr` 61 (1.7.0),
-`dtype.tcyr` 50, `floats.tcyr` 37, `fileio.tcyr` 30, `hardening.tcyr` 30,
-`roundtrip.tcyr` 22, `index.tcyr` 13, `sign.tcyr` 8.
+**757 assertions** across 15 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81
+(1.8.0), `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
+`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48 (1.8.0), `floats.tcyr` 37,
+`fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22, `index.tcyr` 13,
+`sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
   same on native `ubuntu-26.04-arm` and `macos-15` (arm64), both hard gates
   (macOS since 1.6.2, after 1.6.1's run on `macos-14` went green end to end;
   GitHub retired that image on 2026-11-02). x86_64 macOS isn't covered.
 - `make realmodels` (CI): GPT-2, Llama-2-7B, Mixtral-8x7B, a LoRA adapter, a
-  QLoRA NF4 import and (1.7.0) a GPTQ 4-bit Llama-2-7B (I32 `qweight` /
-  `qzeros` / `g_idx`, F16 `scales`; 963 tensors), with real names, ranks, counts
-  and dtypes, dims ÷ 64. Each is written signed, read, strict-validated,
+  QLoRA NF4 import, (1.7.0) a GPTQ 4-bit Llama-2-7B (I32 `qweight` / `qzeros` /
+  `g_idx`, F16 `scales`; 963 tensors), and (1.8.0) Llama-2-7B as an FP8 E4M3
+  import (291) and as a Q4_0-style INT4 import with `.scale` sidecars (517), with
+  real names, ranks, counts and dtypes, dims ÷ 64. Each is written signed, read, strict-validated,
   verified and resolved by index.
 - `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
   mapped, strict-validated, read into a caller buffer, and (1.6.2) written back
@@ -79,22 +87,27 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
 - `make bigfile-signed` (local; minutes, bound by sigil's ~18 MB/s SHA-512): the
   same, signed and verified.
 - `floats` checks F16/BF16 exhaustively (every code, every midpoint) and F32
-  against the hardware.
+  against the hardware; `fp8` does the same for E4M3/E5M2 (every code, every
+  midpoint, overflow and underflow edges, 40,000 values against a brute-force
+  oracle). Outside the repo an exact-rational reference agreed on all 512 FP8
+  decodes and 400,000 encodes.
 - `dtype` and `builder` include differential tests against the 1.1.1
   implementations.
-- `make fuzz` (CI, ~70 s): 3,204,500 iterations with every buffer ending at a
+- `make fuzz` (CI, ~65 s): 3,204,500 iterations with every buffer ending at a
   `PROT_NONE` guard page, 0 faults. It covers:
-  - a payload-guard + unpack phase (3.56M entries, all twelve dtypes, each
+  - a payload-guard + unpack phase (4.60M entries, all fifteen dtypes, each
     data_len held to the fuzzer's own size table);
-  - a strict phase, where 89,657 strict accepts were all confirmed by brute
-    force, including the find-name round trip, every BOOL byte 0/1 and the
-    size table; 13,694 BOOL rejections (`TULA_ERR_VALUE`);
+  - a strict phase, where 92,821 strict accepts were all confirmed by brute
+    force, including the find-name round trip, every BOOL byte 0/1, an odd
+    INT4's last high nibble and the size table; 12,821 `TULA_ERR_VALUE`
+    rejections;
   - phase F, which mutates a names table, and phase G, a metadata table;
-  - phase H (1.6.1): 1,500 random builders through the streaming writers (762
+  - phase H (1.6.1): 1,500 random builders through the streaming writers (737
     nameless, the rest on the named temp), every file byte-identical to
-    `finish`, 467 canonical ones strict-accepted, no temp left behind;
-  - phase I (1.7.0): 300,000 mutations of a file holding all five integer and
-    boolean dtypes, aimed at BOOL bytes, dtype fields and shapes.
+    `finish`, 446 canonical ones strict-accepted, no temp left behind;
+  - phase I (1.7.0; 1.8.0 adds FP8 and INT4): 300,000 mutations of a file
+    holding the integer, boolean, FP8 and INT4 dtypes, aimed at payload
+    bytes, dtype fields and shapes.
 
   `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
   0 undocumented.
@@ -115,7 +128,7 @@ switch a build prints one `hint:` line naming the unused checkout.
 Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the bundle itself needs.
 tula needs none beyond what sigil's sidecar brings, so there is no `dist/tula.deps`.
 
-**Smoke binary: 595,632 B** (~100 KB code, 488 KB data). Most of the data is bayan's
+**Smoke binary: 595,664 B** (~100 KB code, 488 KB data). Most of the data is bayan's
 `lib/unicode/` tables, which sigil's bundle pulls in. DCE can't drop global initializers,
 and tula itself makes no bayan calls. It shrinks when sigil's open issue
 `2026-11-01-sigil-mldsa-pulls-bayans-unicode-tables.md` lands.
@@ -135,7 +148,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: 1.8.0 FP8 and int4 (codes from 12); 1.7.x patches only for fixes
-importers turn up. Later: 1.9.x throughput; the 1.x.x research list; and v2 candidates
-([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
+Next: cut 1.8.0 (FP8 and INT4, in `[Unreleased]`); then 1.9.x throughput
+(the FP8 and INT4 helpers are per-element calls today). Later: the 1.x.x
+research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

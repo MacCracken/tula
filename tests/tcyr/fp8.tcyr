@@ -1,0 +1,356 @@
+# tests/tcyr/fp8.tcyr — the 1.8.0 FP8 dtypes (ADR 0010): OCP E4M3 and E5M2,
+# converted to and from f64 in integer arithmetic. Checked exhaustively, as
+# F16/BF16 are: every one of the 256 codes of each format round-trips and the
+# finite ones are strictly ordered; every midpoint between neighbours rounds to
+# the even one, and the f64 values one ulp either side round to their own side;
+# overflow (NaN for E4M3, inf for E5M2, no saturation), underflow, signed zero,
+# NaN; and 40,000 random f64 values against a brute-force nearest-code oracle.
+# Then the array helpers, sizes, strict and a file round trip.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn fbits(n, d): i64 {
+    return f64_div(f64_from(n), f64_from(d));
+}
+
+# 2^k as f64 bits, for -1022 <= k <= 1023.
+fn pow2(k): i64 {
+    return (k + 1023) << 52;
+}
+
+# The next f64 above / below a positive x: its bit pattern plus / minus one.
+# (Written as calls: in cyrius `f64_from(464) + 1` is float addition.)
+fn ulp_up(x): i64 {
+    return x + 1;
+}
+
+fn ulp_down(x): i64 {
+    return x - 1;
+}
+
+fn is_nan(x): i64 {
+    if (((x >> 52) & 0x7FF) != 0x7FF) { return 0; }
+    if ((x & 0xFFFFFFFFFFFFF) == 0) { return 0; }
+    return 1;
+}
+
+fn to8(fmt, x): i64 {
+    if (fmt == 0) { return tula_f64_to_e4m3(x); }
+    return tula_f64_to_e5m2(x);
+}
+
+fn from8(fmt, h): i64 {
+    if (fmt == 0) { return tula_e4m3_to_f64(h); }
+    return tula_e5m2_to_f64(h);
+}
+
+# The largest positive finite code, and the NaN-or-inf boundary.
+fn top_code(fmt): i64 {
+    if (fmt == 0) { return 0x7E; }   # 448
+    return 0x7B;                      # 57344
+}
+
+fn test_codes_and_sizes() {
+    assert_eq(TULA_DT_F8_E4M3, 12, "F8_E4M3 is code 12");
+    assert_eq(TULA_DT_F8_E5M2, 13, "F8_E5M2 is code 13");
+    assert_eq(tula_packed_len(TULA_DT_F8_E4M3, 10), 10, "e4m3: 1 byte each");
+    assert_eq(tula_packed_len(TULA_DT_F8_E5M2, 10), 10, "e5m2: 1 byte each");
+    return 0;
+}
+
+fn test_known_values() {
+    assert_eq(tula_e4m3_to_f64(0x38), f64_from(1), "e4m3 0x38 = 1.0");
+    assert_eq(tula_e4m3_to_f64(0x7E), f64_from(448), "e4m3 0x7E = 448, the largest");
+    assert_eq(tula_e4m3_to_f64(0x78), f64_from(256), "e4m3 0x78 = 256: the top exponent holds normals");
+    assert_eq(tula_e4m3_to_f64(0x77), f64_from(240), "e4m3 0x77 = 240");
+    assert_eq(tula_e4m3_to_f64(0x08), pow2(0 - 6), "e4m3 0x08 = 2^-6, the smallest normal");
+    assert_eq(tula_e4m3_to_f64(0x01), pow2(0 - 9), "e4m3 0x01 = 2^-9, the smallest subnormal");
+    assert_eq(tula_e4m3_to_f64(0x07), f64_mul(f64_from(7), pow2(0 - 9)), "e4m3 0x07 = 7 x 2^-9");
+    assert_eq(tula_e4m3_to_f64(0x80), 0x8000000000000000, "e4m3 0x80 = -0");
+    assert_eq(tula_e4m3_to_f64(0xFE), f64_from(0 - 448), "e4m3 0xFE = -448");
+    assert_eq(tula_e4m3_to_f64(0x7F), 0x7FFE000000000000, "e4m3 0x7F = NaN (quiet, mantissa 111)");
+    assert_eq(tula_e4m3_to_f64(0xFF), 0xFFFE000000000000, "e4m3 0xFF = -NaN");
+    assert_eq(tula_e5m2_to_f64(0x3C), f64_from(1), "e5m2 0x3C = 1.0");
+    assert_eq(tula_e5m2_to_f64(0x7B), f64_from(57344), "e5m2 0x7B = 57344, the largest");
+    assert_eq(tula_e5m2_to_f64(0x7C), 0x7FF0000000000000, "e5m2 0x7C = +inf");
+    assert_eq(tula_e5m2_to_f64(0xFC), 0xFFF0000000000000, "e5m2 0xFC = -inf");
+    assert_eq(is_nan(tula_e5m2_to_f64(0x7D)), 1, "e5m2 0x7D is NaN");
+    assert_eq(tula_e5m2_to_f64(0x04), pow2(0 - 14), "e5m2 0x04 = 2^-14, the smallest normal");
+    assert_eq(tula_e5m2_to_f64(0x01), pow2(0 - 16), "e5m2 0x01 = 2^-16, the smallest subnormal");
+    assert_eq(tula_f64_to_e4m3(f64_from(1)), 0x38, "1.0 -> e4m3 0x38");
+    assert_eq(tula_f64_to_e5m2(f64_from(0 - 2)), 0xC0, "-2.0 -> e5m2 0xC0");
+    return 0;
+}
+
+# Every code: a finite code round-trips exactly; a NaN comes back NaN with its
+# sign; the finite positives are strictly increasing; -x mirrors x.
+fn exhaustive(fmt, label): i64 {
+    var round = 0;
+    var nans = 0;
+    var mirror = 0;
+    var c = 0;
+    while (c < 256) {
+        var v = from8(fmt, c);
+        if (is_nan(v) == 1) {
+            var back = to8(fmt, v);
+            if (is_nan(from8(fmt, back)) == 1) {
+                if ((back & 0x80) == (c & 0x80)) { nans = nans + 1; }
+            }
+        } else {
+            if (to8(fmt, v) == c) { round = round + 1; }
+            if (to8(fmt, v ^ 0x8000000000000000) == (c ^ 0x80)) { mirror = mirror + 1; }
+        }
+        c = c + 1;
+    }
+    var order = 1;
+    c = 1;
+    while (c <= top_code(fmt)) {
+        if (f64_gt(from8(fmt, c), from8(fmt, c - 1)) != 1) { order = 0; }
+        c = c + 1;
+    }
+    var nan_codes = 2;   # e4m3: 0x7F, 0xFF
+    if (fmt == 1) { nan_codes = 6; }   # e5m2: 0x7D-0x7F, 0xFD-0xFF
+    assert_eq(round + nans, 256, label);
+    assert_eq(nans, nan_codes, "... NaN codes stay NaN, sign kept");
+    assert_eq(mirror, 256 - nan_codes, "... and every finite or infinite -x is x with the sign bit");
+    assert_eq(order, 1, "... finite positives strictly increasing");
+    return 0;
+}
+
+fn test_exhaustive() {
+    exhaustive(0, "e4m3: all 256 codes round-trip");
+    exhaustive(1, "e5m2: all 256 codes round-trip");
+    return 0;
+}
+
+# Every midpoint between neighbouring positive finite codes (zero and the
+# smallest subnormal included) rounds to the even code; one f64 ulp below goes
+# down, one above goes up. Also the midpoint past the largest finite value.
+fn midpoints(fmt, label): i64 {
+    var even = 0;
+    var below = 0;
+    var above = 0;
+    var pairs = 0;
+    var c = 0;
+    while (c < top_code(fmt)) {
+        var lo = from8(fmt, c);
+        var hi = from8(fmt, c + 1);
+        var mid = f64_div(f64_add(lo, hi), f64_from(2));
+        var want = c;
+        if ((c & 1) == 1) { want = c + 1; }
+        if (to8(fmt, mid) == want) { even = even + 1; }
+        if (to8(fmt, ulp_down(mid)) == c) { below = below + 1; }
+        if (to8(fmt, ulp_up(mid)) == c + 1) { above = above + 1; }
+        pairs = pairs + 1;
+        c = c + 1;
+    }
+    assert_eq(even, pairs, label);
+    assert_eq(below, pairs, "... one ulp below a midpoint rounds down");
+    assert_eq(above, pairs, "... one ulp above rounds up");
+    return 0;
+}
+
+fn test_midpoints() {
+    midpoints(0, "e4m3: every midpoint (126 pairs) rounds to the even code");
+    midpoints(1, "e5m2: every midpoint (123 pairs) rounds to the even code");
+    return 0;
+}
+
+fn test_overflow_underflow() {
+    # E4M3: no saturation. 464 is the midpoint between 448 and the next step
+    # (480, the NaN pattern's place): ties to even, 448. Anything above is NaN.
+    assert_eq(tula_f64_to_e4m3(f64_from(464)), 0x7E, "e4m3: 464 ties to 448");
+    assert_eq(tula_f64_to_e4m3(ulp_up(f64_from(464))), 0x7F, "e4m3: just past 464 -> NaN, not saturated");
+    assert_eq(tula_f64_to_e4m3(f64_from(1000000)), 0x7F, "e4m3: 1e6 -> NaN");
+    assert_eq(tula_f64_to_e4m3(f64_from(0 - 1000000)), 0xFF, "e4m3: -1e6 -> -NaN");
+    assert_eq(tula_f64_to_e4m3(0x7FF0000000000000), 0x7F, "e4m3: +inf -> NaN");
+    assert_eq(tula_f64_to_e4m3(0xFFF0000000000000), 0xFF, "e4m3: -inf -> -NaN");
+    assert_eq(tula_f64_to_e4m3(0x7FF8000000000000), 0x7F, "e4m3: NaN -> NaN");
+    assert_eq(tula_f64_to_e4m3(0xFFF8000000000001), 0xFF, "e4m3: -NaN -> -NaN");
+    # E5M2: IEEE-like. 61440 is the midpoint between 57344 and 65536 (inf).
+    assert_eq(tula_f64_to_e5m2(f64_from(61440)), 0x7C, "e5m2: 61440 ties to even: inf");
+    assert_eq(tula_f64_to_e5m2(ulp_down(f64_from(61440))), 0x7B, "e5m2: just below -> 57344");
+    assert_eq(tula_f64_to_e5m2(f64_from(1000000)), 0x7C, "e5m2: 1e6 -> inf");
+    assert_eq(tula_f64_to_e5m2(0xFFF0000000000000), 0xFC, "e5m2: -inf -> -inf");
+    assert_eq(tula_f64_to_e5m2(0x7FF8000000000000), 0x7E, "e5m2: the default NaN -> 0x7E (quiet, top payload bit)");
+    assert_eq(tula_f64_to_e5m2(0xFFFC000000000000), 0xFF, "e5m2: -NaN with payload 11 -> 0xFF");
+    # underflow: correctly rounded subnormals, no flush, the sign kept
+    assert_eq(tula_f64_to_e4m3(pow2(0 - 10)), 0x00, "e4m3: 2^-10 (half the smallest) ties to 0");
+    assert_eq(tula_f64_to_e4m3(ulp_up(pow2(0 - 10))), 0x01, "e4m3: just above -> 2^-9");
+    assert_eq(tula_f64_to_e4m3(f64_mul(f64_from(3), pow2(0 - 11))), 0x01, "e4m3: 0.75 x 2^-9 -> 2^-9");
+    assert_eq(tula_f64_to_e4m3(f64_from(0) ^ 0x8000000000000000), 0x80, "e4m3: -0 -> -0");
+    assert_eq(tula_f64_to_e4m3(1), 0x00, "e4m3: an f64 subnormal -> 0");
+    assert_eq(tula_f64_to_e4m3(pow2(0 - 1000) ^ 0x8000000000000000), 0x80, "e4m3: -2^-1000 -> -0");
+    assert_eq(tula_f64_to_e5m2(pow2(0 - 17)), 0x00, "e5m2: 2^-17 ties to 0");
+    assert_eq(tula_f64_to_e5m2(f64_mul(f64_from(3), pow2(0 - 17))), 0x02, "e5m2: 1.5 x 2^-16 ties to 2 x 2^-16");
+    assert_eq(tula_f64_to_e5m2(pow2(0 - 300)), 0x00, "e5m2: 2^-300 -> 0");
+    # the subnormal-to-normal step carries cleanly
+    assert_eq(tula_f64_to_e4m3(f64_mul(f64_from(15), pow2(0 - 10))), 0x08, "e4m3: 7.5 x 2^-9 ties up to 2^-6 (0x08)");
+    return 0;
+}
+
+# A random f64 in [2^lo, 2^hi): random exponent and 52-bit fraction.
+fn rand_f64(s, lo, hi): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    var span = hi - lo;
+    var e = lo + ((x >> 40) & 0xFFFFFF) % span;
+    var y = x * 2862933555777941757 + 3037000493;
+    return pow2(e) | ((y >> 12) & 0xFFFFFFFFFFFFF);
+}
+
+# Brute force: the code nearest x > 0 among the positive finite codes, ties to
+# the even code; past the top, the format's overflow. Each difference between x
+# and a neighbour is exact in f64 (they're within a factor of 2, Sterbenz), so
+# the comparison is exact.
+fn oracle(fmt, x): i64 {
+    var top = top_code(fmt);
+    var maxv = from8(fmt, top);
+    if (f64_gt(x, maxv) == 1) {
+        var step = f64_sub(maxv, from8(fmt, top - 1));
+        var lim = f64_add(maxv, f64_div(step, f64_from(2)));   # 464 / 61440
+        if (f64_lt(x, lim) == 1) { return top; }
+        if (fmt == 0) {
+            if (f64_eq(x, lim) == 1) { return top; }   # ties to 0x7E (even); 0x7F is NaN
+            return 0x7F;
+        }
+        return 0x7C;                                    # e5m2: ties go to inf (even)
+    }
+    var lo = 0;
+    var hi = top;
+    while (hi - lo > 1) {
+        var mid = (lo + hi) / 2;
+        if (f64_gt(from8(fmt, mid), x) == 1) { hi = mid; } else { lo = mid; }
+    }
+    if (f64_eq(from8(fmt, hi), x) == 1) { return hi; }
+    var dl = f64_sub(x, from8(fmt, lo));
+    var dh = f64_sub(from8(fmt, hi), x);
+    if (f64_lt(dl, dh) == 1) { return lo; }
+    if (f64_lt(dh, dl) == 1) { return hi; }
+    if ((lo & 1) == 0) { return lo; }
+    return hi;
+}
+
+fn test_oracle() {
+    var s = alloc(8);
+    store64(s, 0x5DEECE66D);
+    var agree = 0;
+    var neg = 0;
+    var i = 0;
+    while (i < 20000) {
+        var x = rand_f64(s, 0 - 12, 10);   # e4m3: below the smallest subnormal to past 448
+        if (tula_f64_to_e4m3(x) == oracle(0, x)) { agree = agree + 1; }
+        if (tula_f64_to_e4m3(x ^ 0x8000000000000000) == (oracle(0, x) | 0x80)) { neg = neg + 1; }
+        i = i + 1;
+    }
+    assert_eq(agree, 20000, "e4m3: 20,000 random f64 values agree with the brute-force oracle");
+    assert_eq(neg, 20000, "... and their negations");
+    agree = 0;
+    neg = 0;
+    i = 0;
+    while (i < 20000) {
+        var y = rand_f64(s, 0 - 19, 17);   # e5m2: below 2^-16 to past 57344
+        if (tula_f64_to_e5m2(y) == oracle(1, y)) { agree = agree + 1; }
+        if (tula_f64_to_e5m2(y ^ 0x8000000000000000) == (oracle(1, y) | 0x80)) { neg = neg + 1; }
+        i = i + 1;
+    }
+    assert_eq(agree, 20000, "e5m2: 20,000 random f64 values agree with the brute-force oracle");
+    assert_eq(neg, 20000, "... and their negations");
+    return 0;
+}
+
+# The array helpers are the scalar conversions, element by element.
+fn test_arrays() {
+    var n = 256;
+    var codes = alloc(n);
+    var c = 0;
+    while (c < n) { store8(codes + c, c); c = c + 1; }
+    var wide = alloc(n * 8);
+    var back = alloc(n);
+    var fmt = 0;
+    while (fmt < 2) {
+        if (fmt == 0) { assert_eq(tula_e4m3_unpack(codes, n, wide), n, "e4m3_unpack returns n"); }
+        else          { assert_eq(tula_e5m2_unpack(codes, n, wide), n, "e5m2_unpack returns n"); }
+        var same = 1;
+        c = 0;
+        while (c < n) {
+            if (load64(wide + c * 8) != from8(fmt, c)) { same = 0; }
+            c = c + 1;
+        }
+        assert_eq(same, 1, "... every code as the scalar widen gives it");
+        if (fmt == 0) { assert_eq(tula_e4m3_pack(wide, n, back), n, "e4m3_pack returns n"); }
+        else          { assert_eq(tula_e5m2_pack(wide, n, back), n, "e5m2_pack returns n"); }
+        same = 1;
+        c = 0;
+        while (c < n) {
+            if (load8(back + c) != (to8(fmt, load64(wide + c * 8)) & 0xFF)) { same = 0; }
+            c = c + 1;
+        }
+        assert_eq(same, 1, "... and pack is the scalar narrow");
+        fmt = fmt + 1;
+    }
+    return 0;
+}
+
+fn test_file_round_trip() {
+    var n = 300;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(src + i * 8, f64_div(f64_from(i * 37 - 5000), f64_from(64)));
+        i = i + 1;
+    }
+    var a = alloc(n + 8);
+    var b2 = alloc(n + 8);
+    tula_e4m3_pack(src, n, a);
+    tula_e5m2_pack(src, n, b2);
+    var sh = alloc(16);
+    store64(sh, 3);
+    store64(sh + 8, 100);
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "model.layers.0.mlp.down_proj.weight", TULA_DT_F8_E4M3, sh, 2, a, n);
+    tula_builder_add_checked(b, "grad", TULA_DT_F8_E5M2, sh, 2, b2, n);
+    tula_builder_add(b, "short", TULA_DT_F8_E4M3, sh, 2, a, n - 1);
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    var r = tula_open(buf, len);
+    assert(r != 0, "an fp8 file opens");
+    assert_eq(tula_entry_payload_ok(tula_find(r, "grad")), 1, "e5m2 [3,100] in 300 bytes: payload_ok");
+    assert_eq(tula_entry_payload_ok(tula_find(r, "short")), 0, "e4m3 [3,100] in 299 bytes: refused");
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_SHAPE, "... and strict says SHAPE");
+    b = tula_builder_new();
+    tula_builder_add_checked(b, "w", TULA_DT_F8_E4M3, sh, 2, a, n);
+    tula_builder_add_checked(b, "g", TULA_DT_F8_E5M2, sh, 2, b2, n);
+    buf = tula_builder_finish(b);
+    len = tula_total_len(buf);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "a canonical fp8 file is strict-accepted");
+    var p = tula_entry_data(buf, tula_find(buf, "w"));
+    store8(p, 0x7F);   # NaN is a value like any other: no value rule
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "... every byte is an fp8 value, NaN included");
+    var out = alloc(n * 8);
+    tula_e5m2_unpack(tula_entry_data(buf, tula_find(buf, "g")), n, out);
+    var ok = 1;
+    i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != tula_e5m2_to_f64(load8(b2 + i))) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "e5m2 read back from the file, exact");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_codes_and_sizes();
+    test_known_values();
+    test_exhaustive();
+    test_midpoints();
+    test_overflow_underflow();
+    test_oracle();
+    test_arrays();
+    test_file_round_trip();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

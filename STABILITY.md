@@ -10,8 +10,10 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
 - **On-disk format v1** — the 64-byte header and 144-byte manifest entry layout,
   field offsets, `TULA_MAGIC`, `TULA_VERSION`, the dtype codes
   (`TULA_DT_F64/INT8/TERNARY/NF4`, from 1.3.0 `F32/F16/BF16` with ADR 0005's
-  conversion semantics, and from 1.7.0 `I16/I32/I64/U8/BOOL` with ADR 0009's raw
-  encodings and BOOL's 0/1 rule), the signed-header scheme (Ed25519 over `[0, sig_off)`,
+  conversion semantics, from 1.7.0 `I16/I32/I64/U8/BOOL` with ADR 0009's raw
+  encodings and BOOL's 0/1 rule, and from 1.8.0 `F8_E4M3/F8_E5M2` with ADR
+  0010's conversion semantics and `INT4` with ADR 0011's nibble order, its
+  unused-nibble rule and the Q4_0 quantization rule), the signed-header scheme (Ed25519 over `[0, sig_off)`,
   `sig_len ∈ {0, 64}`), and from 1.3.0 the long-name convention (ADR 0004): the
   key formula, the `__tula.names__` table layout, and its magic. From 1.6.0 also
   the metadata convention (ADR 0008): the `__tula.meta__` table's position,
@@ -24,7 +26,8 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
 - **Public constants** — `TULA_DT_*`, `TULA_SIG_*`, the `TULA_ERR_*` codes and
   their numeric values, and the format constants (`TULA_HEADER_SIZE`,
   `TULA_ENTRY_SIZE`, `TULA_NAME_CAP`, `TULA_MAXDIM`, `TULA_BUILDER_MAX`,
-  `TULA_NF4_BLOCK`, `TULA_READ_MAX_TENSORS`, `TULA_READ_MAX_BYTES`).
+  `TULA_NF4_BLOCK`, from 1.8.0 `TULA_INT4_BLOCK`, `TULA_READ_MAX_TENSORS`,
+  `TULA_READ_MAX_BYTES`).
 
 ## What each bump means (post-1.0)
 

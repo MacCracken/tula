@@ -1,4 +1,4 @@
-# programs/realmodels.cyr — the 1.5.0 real-model inventory gate. Six real
+# programs/realmodels.cyr — the 1.5.0 real-model inventory gate. Eight real
 # checkpoint inventories go through every 1.2–1.5 path: the sized builder,
 # tula_builder_add_long, the dtype conversions, the signed streaming writer, mmap,
 # tula_validate_strict, tula_verify_required, the name index and
@@ -20,9 +20,14 @@
 #               linear layer as qweight I32 [in/8, out], qzeros I32 [in/128,
 #               out/8], scales F16 [in/128, out] and g_idx I32 [in] (each scaled
 #               row's real group); embeddings, norms and lm_head F16: 963.
+#   fp8       — (1.8.0) Llama-2-7B as an FP8 import: each 2-D weight OCP E4M3,
+#               the 1-D norms BF16: 291.
+#   q4        — (1.8.0) Llama-2-7B as a Q4_0-style import: each 2-D weight INT4
+#               with its per-32 f64 "<name>.scale" sidecar (ADR 0011), the norms
+#               F16: 517.
 #
-# Every float payload is a real conversion (tula_*_pack / tula_nf4_pack) of an
-# f64 signal; an I32 one holds the low words of the signal's bit patterns. Each
+# Every float payload is a real conversion (tula_*_pack / tula_nf4_pack /
+# tula_int4_pack) of an f64 signal; an I32 one holds the low words of the signal's bit patterns. Each
 # file also carries metadata (1.6.0, ADR 0008) — the architecture, a config
 # excerpt, the source — read back after the signed round trip.
 # Every tensor is found through the index AND tula_find_name, which must
@@ -72,7 +77,8 @@ fn rm_cati(buf, len, n): i64 {
 
 # ---- the model context ------------------------------------------------------
 # +0 builder  +8 tensors added  +16 records  +24 dtype for 2-D weights
-# +32 dtype for 1-D tensors  +40 nf4 mode (2-D weights NF4 + sidecar)  +48 signal
+# +32 dtype for 1-D tensors  +40 quant mode (2-D weights + an f64 sidecar: 1 NF4,
+# 2 INT4)  +48 signal
 # +56 long names added
 fn rm_ctx_new(dt2, dt1, nf4, sig): i64 {
     var m = alloc(64);
@@ -103,6 +109,7 @@ fn rm_pack_as(dt, src, nel): i64 {
     if (dt == TULA_DT_F32) { tula_f32_pack(src, nel, p); }
     if (dt == TULA_DT_F16) { tula_f16_pack(src, nel, p); }
     if (dt == TULA_DT_BF16) { tula_bf16_pack(src, nel, p); }
+    if (dt == TULA_DT_F8_E4M3) { tula_e4m3_pack(src, nel, p); }   # 1.8.0
     return p;
 }
 
@@ -139,7 +146,7 @@ fn rm_put(m, nm, dt, ndim, d0, d1, packed, nel): i64 {
 }
 
 # A tensor of the real shape (d0) or (d0, d1), scaled; 2-D weights take dt2
-# (or NF4 + an f64 sidecar in nf4 mode), 1-D tensors dt1.
+# (or NF4 / INT4 + an f64 sidecar in quant mode 1 / 2), 1-D tensors dt1.
 fn rm_add(m, nm, ndim, d0, d1): i64 {
     var s0 = rm_scaled(d0);
     var s1 = 1;
@@ -157,6 +164,18 @@ fn rm_add(m, nm, ndim, d0, d1): i64 {
             l = rm_cat(nm, l, ".scale");
             rm_put(m, nm, TULA_DT_F64, 1, nb, 0, scales, nb);
             store8(nm + l - 6, 0);
+            return 0;
+        }
+        if (load64(m + 40) == 2) {
+            var qb = tula_int4_blocks(nel, TULA_INT4_BLOCK);
+            var q4 = alloc(tula_int4_bytes(nel) + 8);
+            var qs = alloc(qb * 8 + 8);
+            tula_int4_pack(src, nel, TULA_INT4_BLOCK, qs, q4);
+            rm_put(m, nm, TULA_DT_INT4, 2, s0, s1, q4, nel);
+            var l2 = strlen(nm);
+            l2 = rm_cat(nm, l2, ".scale");
+            rm_put(m, nm, TULA_DT_F64, 1, qb, 0, qs, qb);
+            store8(nm + l2 - 6, 0);
             return 0;
         }
         rm_put(m, nm, load64(m + 24), 2, s0, s1, rm_pack_as(load64(m + 24), src, nel), nel);
@@ -356,6 +375,8 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
     if (which == 3) { want = rm_lora(m); }
     if (which == 4) { rm_llama(m); want = 517; }   # 291 + a sidecar for each of the 226 2-D weights
     if (which == 5) { want = rm_gptq(m); }
+    if (which == 6) { want = rm_llama(m); }
+    if (which == 7) { rm_llama(m); want = 517; }   # 291 + a sidecar for each 2-D weight
     var n = load64(m + 8);
     if (n != want) { sput("FAIL: tensor count\n"); return 1; }
     var arch = "GPT2LMHeadModel";
@@ -379,6 +400,14 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
     if (which == 5) {
         arch = "LlamaForCausalLM";
         cfg = "{\"quantization_config\": {\"quant_method\": \"gptq\", \"bits\": 4, \"group_size\": 128}}";
+    }
+    if (which == 6) {
+        arch = "LlamaForCausalLM";
+        cfg = "{\"quantization\": \"fp8\", \"format\": \"e4m3\"}";
+    }
+    if (which == 7) {
+        arch = "LlamaForCausalLM";
+        cfg = "{\"quantization\": \"q4_0\", \"block\": 32}";
     }
     var bld = load64(m);
     if (tula_builder_set_meta(bld, "hf.architecture", arch) != 0) { sput("FAIL: set_meta\n"); return 1; }
@@ -442,6 +471,15 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
             if (sc == 0) { sput("FAIL: NF4 sidecar\n"); return 1; }
             if (sc != tula_find_scale(r, e2, need)) { sput("FAIL: index_find_scale != find_scale\n"); return 1; }
         }
+        if (tula_entry_dtype(e2) == TULA_DT_INT4) {
+            var need4 = tula_int4_blocks(tula_entry_nelems(e2), TULA_INT4_BLOCK);
+            var sc4 = tula_index_find_scale(ix, e2, need4);
+            if (sc4 == 0) { sput("FAIL: INT4 sidecar\n"); return 1; }
+            if (sc4 != tula_find_scale(r, e2, need4)) {
+                sput("FAIL: index_find_scale != find_scale (int4)\n");
+                return 1;
+            }
+        }
         i = i + 1;
     }
     var mcount = tula_meta_count(r);
@@ -474,7 +512,7 @@ fn main(): i64 {
     var sk = alloc(64);
     var pk = alloc(32);
     ed25519_keypair(seed, sk, pk);
-    sput("tula real-model inventory gate (1.5.0; metadata 1.6.0; integer dtypes 1.7.0)\n");
+    sput("tula real-model inventory gate (1.5.0; metadata 1.6.0; integer dtypes 1.7.0; fp8, int4 1.8.0)\n");
     var fails = 0;
     fails = fails + rm_run("  gpt2-small   F32 ", 0, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
     fails = fails + rm_run("  llama-2-7b   F16 ", 1, TULA_DT_F16, TULA_DT_F16, 0, sig, sk, pk);
@@ -482,8 +520,10 @@ fn main(): i64 {
     fails = fails + rm_run("  lora-llama2  F32 ", 3, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
     fails = fails + rm_run("  qlora-llama2 NF4 ", 4, TULA_DT_NF4, TULA_DT_F16, 1, sig, sk, pk);
     fails = fails + rm_run("  gptq-llama2  I32 ", 5, TULA_DT_I32, TULA_DT_F16, 0, sig, sk, pk);
+    fails = fails + rm_run("  fp8-llama2   E4M3", 6, TULA_DT_F8_E4M3, TULA_DT_BF16, 0, sig, sk, pk);
+    fails = fails + rm_run("  q4-llama2    INT4", 7, TULA_DT_INT4, TULA_DT_F16, 2, sig, sk, pk);
     if (fails == 0) {
-        sput("RESULT: PASS — six real checkpoint inventories written, signed, read and resolved by name\n");
+        sput("RESULT: PASS — eight real checkpoint inventories written, signed, read and resolved by name\n");
         return 0;
     }
     sput("RESULT: FAIL\n");

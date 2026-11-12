@@ -41,6 +41,9 @@ enum TulaDType {
     TULA_DT_I64     = 9;   # signed 64-bit, two's complement, 8 bytes LE (1.7.0, ADR 0009)
     TULA_DT_U8      = 10;  # unsigned 8-bit, 1 byte (1.7.0, ADR 0009)
     TULA_DT_BOOL    = 11;  # 1 byte: 0 false, 1 true, nothing else (1.7.0, ADR 0009)
+    TULA_DT_F8_E4M3 = 12;  # OCP FP8 E4M3 (no inf; NaN S.1111.111), 1 byte (1.8.0, ADR 0010)
+    TULA_DT_F8_E5M2 = 13;  # OCP FP8 E5M2 (IEEE-like), 1 byte (1.8.0, ADR 0010)
+    TULA_DT_INT4    = 14;  # signed 4-bit codes, 2 per byte, low nibble first (1.8.0, ADR 0011)
 }
 
 # The long-name table (1.3.0, ADR 0004): a reserved int8 tensor named
@@ -517,8 +520,9 @@ fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
 #   TULA_ERR_DUP_NAME  — the builder already holds this stored name, from either
 #                        kind of add (an earlier plain add's truncated name too).
 # A builder fed only through this produces files tula_validate_strict accepts,
-# provided each data_len is the dtype's packed length for the shape and (1.7.0)
-# each BOOL payload holds only 0 and 1 bytes. Payloads are never read here.
+# provided each data_len is the dtype's packed length for the shape, (1.7.0)
+# each BOOL payload holds only 0 and 1 bytes, and (1.8.0) an INT4 tensor of odd
+# length leaves its last high nibble zero. Payloads are never read here.
 fn tula_builder_add_checked(b, name, dtype, shape, ndim, data, data_len): i64 {
     return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 1);
 }

@@ -31,7 +31,7 @@ enum TulaErrCode {
     TULA_ERR_DTYPE     = 16;   # dtype unknown to this tula (strict) (1.2.0)
     TULA_ERR_NAMES     = 17;   # the long-name table is malformed (strict) (1.3.0)
     TULA_ERR_META      = 18;   # a bad metadata key/value, or a malformed table (1.6.0)
-    TULA_ERR_VALUE     = 19;   # a payload value its dtype doesn't allow (strict) (1.7.0)
+    TULA_ERR_VALUE     = 19;   # a payload value its dtype doesn't allow (strict) (1.7.0; INT4 1.8.0)
     TULA_ERR_OTHER     = 99;   # catch-all
 }
 
@@ -106,6 +106,9 @@ enum TulaDType {
     TULA_DT_I64     = 9;   # signed 64-bit, two's complement, 8 bytes LE (1.7.0, ADR 0009)
     TULA_DT_U8      = 10;  # unsigned 8-bit, 1 byte (1.7.0, ADR 0009)
     TULA_DT_BOOL    = 11;  # 1 byte: 0 false, 1 true, nothing else (1.7.0, ADR 0009)
+    TULA_DT_F8_E4M3 = 12;  # OCP FP8 E4M3 (no inf; NaN S.1111.111), 1 byte (1.8.0, ADR 0010)
+    TULA_DT_F8_E5M2 = 13;  # OCP FP8 E5M2 (IEEE-like), 1 byte (1.8.0, ADR 0010)
+    TULA_DT_INT4    = 14;  # signed 4-bit codes, 2 per byte, low nibble first (1.8.0, ADR 0011)
 }
 
 # The long-name table (1.3.0, ADR 0004): a reserved int8 tensor named
@@ -582,8 +585,9 @@ fn tula_builder_add(b, name, dtype, shape, ndim, data, data_len): i64 {
 #   TULA_ERR_DUP_NAME  — the builder already holds this stored name, from either
 #                        kind of add (an earlier plain add's truncated name too).
 # A builder fed only through this produces files tula_validate_strict accepts,
-# provided each data_len is the dtype's packed length for the shape and (1.7.0)
-# each BOOL payload holds only 0 and 1 bytes. Payloads are never read here.
+# provided each data_len is the dtype's packed length for the shape, (1.7.0)
+# each BOOL payload holds only 0 and 1 bytes, and (1.8.0) an INT4 tensor of odd
+# length leaves its last high nibble zero. Payloads are never read here.
 fn tula_builder_add_checked(b, name, dtype, shape, ndim, data, data_len): i64 {
     return _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, 1);
 }
@@ -1861,7 +1865,8 @@ fn tula_builder_write_file_signed(b, path, sk): i64 {
 # compiler ships f64_add/sub/mul/div/abs/round/from/to/lt/gt/eq as builtins.
 
 enum TulaDtypeCfg {
-    TULA_NF4_BLOCK = 64;    # default NF4 block size (QLoRA convention)
+    TULA_NF4_BLOCK  = 64;   # default NF4 block size (QLoRA convention)
+    TULA_INT4_BLOCK = 32;   # default INT4 block size (GGUF's Q4_0) (1.8.0, ADR 0011)
 }
 
 # ---------------------------------------------------------------------------
@@ -2190,6 +2195,9 @@ fn tula_packed_len(dtype, nelems): i64 {
     if (dtype == TULA_DT_I64)     { return nelems * 8; }   # 1.7.0
     if (dtype == TULA_DT_U8)      { return nelems; }       # 1.7.0
     if (dtype == TULA_DT_BOOL)    { return nelems; }       # 1.7.0
+    if (dtype == TULA_DT_F8_E4M3) { return nelems; }       # 1.8.0
+    if (dtype == TULA_DT_F8_E5M2) { return nelems; }       # 1.8.0
+    if (dtype == TULA_DT_INT4)    { return tula_int4_bytes(nelems); }   # 1.8.0
     return 0 - 1;
 }
 
@@ -2419,6 +2427,206 @@ fn tula_f16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 5, 
 fn tula_bf16_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 8, 7, 2); }
 # Unpack n bfloat16 values from `src` into f64[n] `dst`. Returns n.
 fn tula_bf16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 8, 7, 2); }
+
+# ---------------------------------------------------------------------------
+# FP8: E4M3 and E5M2 (1.8.0, ADR 0010), the OCP 8-bit floats, converted to and
+# from f64 in integer arithmetic, as F32/F16/BF16 are (ADR 0005).
+#
+#   E5M2 (5 exponent bits, bias 15, 2 mantissa bits) is IEEE-like: inf and NaN
+#   live on the all-ones exponent, so it takes the shared narrow/widen above.
+#   E4M3 (4 exponent bits, bias 7, 3 mantissa bits; PyTorch's float8_e4m3fn)
+#   has no infinities: the all-ones exponent holds normal values up to 448, and
+#   only S.1111.111 is NaN.
+#
+#   f64 -> fp8: round to nearest, ties to even, straight from the f64; subnormals
+#   kept (no flush); the sign of zero kept. No saturation: a value that rounds
+#   past the largest finite (448 / 57344) becomes NaN in E4M3 and +-inf in
+#   E5M2, and so does +-inf. A NaN stays NaN with its sign (E5M2 keeps the top
+#   payload bit, quiet; E4M3 has one NaN per sign).
+#   fp8 -> f64: exact; a NaN comes back quiet with its sign.
+# ---------------------------------------------------------------------------
+
+# f64 bits -> E4M3 bits (low 8 bits of the result).
+fn tula_f64_to_e4m3(x): i64 {
+    var sign = ((x >> 63) & 1) << 7;
+    var ex = (x >> 52) & 0x7FF;
+    if (ex == 0x7FF) { return sign | 0x7F; }   # inf and NaN -> NaN
+    if (ex == 0) { return sign; }               # f64 zeros and subnormals -> a signed zero
+    var e = ex - 1023 + 7;                      # the E4M3 biased exponent
+    var full = (x & 0xFFFFFFFFFFFFF) | (1 << 52);
+    if (e >= 1) {
+        var r = _tula_rne_shift(full, 49);      # 1.mmm, as 8..16
+        if ((r >> 4) != 0) {
+            r = r >> 1;
+            e = e + 1;
+        }
+        if (e > 15) { return sign | 0x7F; }     # past 448: NaN, not saturated
+        return sign | (e << 3) | (r & 7);       # 1.111 x 2^8 (480) is 0x7F, NaN too
+    }
+    # Subnormal: units of 2^-9. Rounding up to 8 gives the smallest normal, 0x08.
+    return sign | _tula_rne_shift(full, 50 - e);
+}
+
+# E4M3 bits (low 8 bits used) -> f64 bits, exactly.
+fn tula_e4m3_to_f64(h): i64 {
+    var b = h & 0xFF;
+    var sign = ((b >> 7) & 1) << 63;
+    if ((b & 0x7F) == 0x7F) { return sign | 0x7FFE000000000000; }   # NaN: mantissa 111, quiet
+    var e = (b >> 3) & 15;
+    if (e == 0) { return _tula_narrow_widen(b, 4, 3); }              # zero or subnormal
+    return sign | ((e + 1016) << 52) | ((b & 7) << 49);              # normal, the top exponent too
+}
+
+# f64 bits -> E5M2 bits (low 8 bits of the result).
+fn tula_f64_to_e5m2(x): i64 { return _tula_f64_narrow(x, 5, 2); }
+# E5M2 bits (low 8 bits used) -> f64 bits, exactly.
+fn tula_e5m2_to_f64(h): i64 { return _tula_narrow_widen(h & 0xFF, 5, 2); }
+
+# Pack f64[n] `src` as E4M3 into `dst`, one byte each. Returns n.
+fn tula_e4m3_pack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, tula_f64_to_e4m3(load64(src + i * 8)));
+        i = i + 1;
+    }
+    return n;
+}
+
+# Unpack n E4M3 values from `src` into f64[n] `dst`. Returns n.
+fn tula_e4m3_unpack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, tula_e4m3_to_f64(load8(src + i)));
+        i = i + 1;
+    }
+    return n;
+}
+
+# Pack f64[n] `src` as E5M2 into `dst`, one byte each. Returns n.
+fn tula_e5m2_pack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        store8(dst + i, _tula_f64_narrow(load64(src + i * 8), 5, 2));
+        i = i + 1;
+    }
+    return n;
+}
+
+# Unpack n E5M2 values from `src` into f64[n] `dst`. Returns n.
+fn tula_e5m2_unpack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, _tula_narrow_widen(load8(src + i), 5, 2));
+        i = i + 1;
+    }
+    return n;
+}
+
+# ---------------------------------------------------------------------------
+# INT4 (1.8.0, ADR 0011): signed 4-bit codes, -8..7 in two's complement, two
+# per byte: element 2k in the low nibble of byte k, 2k+1 in the high nibble (an
+# odd count leaves the last high nibble zero). Blockwise and symmetric: each
+# block of `block` elements has one f64 scale, stored in the "<name>.scale"
+# sidecar (ADR 0002), and value = code x scale.
+# ---------------------------------------------------------------------------
+
+# Packed byte length for n INT4 codes.
+fn tula_int4_bytes(n): i64 {
+    return (n + 1) / 2;
+}
+
+# Number of blocks (scales) for n elements at `block` per block; 0 for block <= 0.
+fn tula_int4_blocks(n, block): i64 {
+    if (block <= 0) { return 0; }
+    return (n + block - 1) / block;
+}
+
+# Code i (-8..7) of a packed INT4 buffer.
+fn tula_int4_get(codes, i): i64 {
+    var b = load8(codes + (i >> 1));
+    var c = b & 0xF;
+    if ((i & 1) == 1) { c = (b >> 4) & 0xF; }
+    return c - ((c & 8) << 1);
+}
+
+# Quantize f64[n] `src` into INT4 `codes` (tula_int4_bytes(n) bytes) with one
+# f64 scale per block in `scales` (tula_int4_blocks(n, block) of them). The rule
+# is llama.cpp's Q4_0 reference quantizer, in f64: m is the block's value of
+# largest magnitude (the first, on a tie), d = m / -8, and each code is
+# x / d rounded half up, clamped to -8..7. So m itself gets -8 and d can be
+# negative. An all-zero block gets d = 0 and codes 0. Returns the block count
+# (0, writing nothing, for block <= 0).
+fn tula_int4_pack(src, n, block, scales, codes): i64 {
+    if (block <= 0) { return 0; }
+    var nbytes = (n + 1) / 2;
+    var z = 0;
+    while (z < nbytes) {
+        store8(codes + z, 0);
+        z = z + 1;
+    }
+    var half = f64_div(f64_from(1), f64_from(2));
+    var nblocks = (n + block - 1) / block;
+    var bi = 0;
+    while (bi < nblocks) {
+        var start = bi * block;
+        var end = start + block;
+        if (end > n) { end = n; }
+        var amax = f64_from(0);
+        var m = f64_from(0);
+        var i = start;
+        while (i < end) {
+            var v = load64(src + i * 8);
+            var a = f64_abs(v);
+            if (f64_gt(a, amax) == 1) {
+                amax = a;
+                m = v;
+            }
+            i = i + 1;
+        }
+        var d = f64_from(0);
+        if (f64_gt(amax, f64_from(0)) == 1) { d = f64_div(m, f64_from(0 - 8)); }
+        store64(scales + bi * 8, d);
+        if (f64_gt(amax, f64_from(0)) == 1) {
+            i = start;
+            while (i < end) {
+                var t = f64_add(f64_div(load64(src + i * 8), d), half);
+                var q = f64_to(t);                        # toward zero ...
+                if (f64_lt(t, f64_from(q)) == 1) { q = q - 1; }   # ... then down: floor
+                if (q > 7) { q = 7; }
+                if (q < (0 - 8)) { q = 0 - 8; }
+                var byi = i >> 1;
+                if ((i & 1) == 0) {
+                    store8(codes + byi, load8(codes + byi) | (q & 0xF));
+                } else {
+                    store8(codes + byi, load8(codes + byi) | ((q & 0xF) << 4));
+                }
+                i = i + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    return nblocks;
+}
+
+# Dequantize n INT4 codes into f64[n] `dst`: value = code x the scale of its
+# block (tula_int4_blocks(n, block) scales read). Returns n (0, writing
+# nothing, for block <= 0).
+fn tula_int4_unpack(codes, scales, n, block, dst): i64 {
+    if (block <= 0) { return 0; }
+    var i = 0;
+    var bi = 0;
+    while (i < n) {
+        var d = load64(scales + bi * 8);
+        var end = i + block;
+        if (end > n) { end = n; }
+        while (i < end) {
+            store64(dst + i * 8, f64_mul(f64_from(tula_int4_get(codes, i)), d));
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    return n;
+}
 
 # --- names.cyr ---
 
@@ -2751,6 +2959,12 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
             k = k + 8;
         }
     }
+    # INT4 (1.8.0, ADR 0011): an odd count leaves the last byte's high nibble zero.
+    if (dt == TULA_DT_INT4) {
+        if ((n & 1) == 1) {
+            if ((load8(payload + doff + dlen - 1) >> 4) != 0) { return TULA_ERR_VALUE; }
+        }
+    }
     return TULA_OK;
 }
 
@@ -2908,7 +3122,8 @@ fn _tula_strict_unique(buf, count): i64 {
 #                       NUL, not packed in record order, or past the caps
 #                       (ADR 0008);
 #   TULA_ERR_VALUE    — (1.7.0) a payload value its dtype doesn't allow: a BOOL
-#                       byte other than 0 or 1 (ADR 0009);
+#                       byte other than 0 or 1 (ADR 0009); (1.8.0) an odd-length
+#                       INT4 tensor whose last high nibble isn't zero (ADR 0011);
 #   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
 #   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To

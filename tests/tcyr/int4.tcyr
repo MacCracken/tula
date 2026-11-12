@@ -1,0 +1,267 @@
+# tests/tcyr/int4.tcyr — the 1.8.0 INT4 dtype (ADR 0011): signed 4-bit codes,
+# two per byte, low nibble first, blockwise symmetric with one f64 scale per
+# block in a "<name>.scale" sidecar (ADR 0002). Sizes; every byte through
+# tula_int4_get; llama.cpp's Q4_0 rule (m -> -8, round half up, clamp); zero
+# and partial blocks; the error bound; strict (an odd count's last high nibble
+# is zero, TULA_ERR_VALUE); payload_ok; the sidecar lookup; a file round trip.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn fv(n, d): i64 {
+    return f64_div(f64_from(n), f64_from(d));
+}
+
+# f64 bits of n, as a plain i64 (in cyrius, comparing an f64_from(...) call
+# directly with an integer mixes the two).
+fn fi(n): i64 {
+    return f64_from(n);
+}
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn test_sizes() {
+    assert_eq(TULA_DT_INT4, 14, "INT4 is code 14");
+    assert_eq(TULA_INT4_BLOCK, 32, "the default block is 32 (Q4_0's)");
+    assert_eq(tula_int4_bytes(0), 0, "0 codes: 0 bytes");
+    assert_eq(tula_int4_bytes(1), 1, "1 code: 1 byte");
+    assert_eq(tula_int4_bytes(7), 4, "7 codes: 4 bytes");
+    assert_eq(tula_packed_len(TULA_DT_INT4, 64), 32, "packed_len int4 [64] = 32");
+    assert_eq(tula_int4_blocks(32, 32), 1, "32 elements: 1 block");
+    assert_eq(tula_int4_blocks(33, 32), 2, "33 elements: 2 blocks");
+    assert_eq(tula_int4_blocks(10, 0), 0, "block 0: no blocks");
+    return 0;
+}
+
+# Every byte: the even element is its low nibble, the odd one its high nibble,
+# each read as -8..7.
+fn test_get() {
+    var p = alloc(256);
+    var b = 0;
+    while (b < 256) { store8(p + b, b); b = b + 1; }
+    var ok = 1;
+    b = 0;
+    while (b < 256) {
+        var lo = b & 0xF;
+        var hi = b >> 4;
+        if (lo >= 8) { lo = lo - 16; }
+        if (hi >= 8) { hi = hi - 16; }
+        if (tula_int4_get(p, b * 2) != lo) { ok = 0; }
+        if (tula_int4_get(p, b * 2 + 1) != hi) { ok = 0; }
+        b = b + 1;
+    }
+    assert_eq(ok, 1, "all 256 bytes: low nibble first, both read as two's complement -8..7");
+    return 0;
+}
+
+fn test_q4_0_rule() {
+    var src = alloc(16 * 8);
+    var i = 0;
+    while (i < 16) { store64(src + i * 8, f64_from(i - 8)); i = i + 1; }   # -8 .. 7
+    var codes = alloc(16);
+    var sc = alloc(8);
+    assert_eq(tula_int4_pack(src, 16, 32, sc, codes), 1, "16 values: one block");
+    assert_eq(load64(sc), f64_from(1), "m = -8 (the first of largest magnitude): d = -8 / -8 = 1");
+    var ok = 1;
+    i = 0;
+    while (i < 16) {
+        if (tula_int4_get(codes, i) != i - 8) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "-8..7 with d = 1: the codes are the values");
+    var out = alloc(16 * 8);
+    assert_eq(tula_int4_unpack(codes, sc, 16, 32, out), 16, "unpack returns n");
+    ok = 1;
+    i = 0;
+    while (i < 16) {
+        if (load64(out + i * 8) != fi(i - 8)) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "... and dequantize exactly");
+
+    # a positive largest value gives a negative scale: m itself maps to -8
+    i = 0;
+    while (i < 8) { store64(src + i * 8, f64_from(i + 1)); i = i + 1; }    # 1 .. 8
+    tula_int4_pack(src, 8, 32, sc, codes);
+    assert_eq(load64(sc), f64_from(0 - 1), "m = 8: d = -1");
+    assert_eq(tula_int4_get(codes, 7), 0 - 8, "... 8 is code -8");
+    assert_eq(tula_int4_get(codes, 0), 0 - 1, "... 1 is code -1");
+    tula_int4_unpack(codes, sc, 8, 32, out);
+    assert_eq(load64(out + 7 * 8), f64_from(8), "... and dequantizes back to 8");
+
+    # rounding is half up (Q4_0's (int)(x/d + 8.5) - 8), then clamped to -8..7
+    store64(src, f64_from(0 - 8));     # m: d = 1
+    store64(src + 8, fv(5, 2));        #  2.5 -> 3
+    store64(src + 16, fv(0 - 5, 2));   # -2.5 -> -2 (up, not away from zero)
+    store64(src + 24, fv(15, 2));      #  7.5 -> 8 -> clamped to 7
+    store64(src + 32, f64_from(8));    #  8 (= -m) -> 7
+    store64(src + 40, fv(0 - 1, 2));   # -0.5 -> 0
+    tula_int4_pack(src, 6, 32, sc, codes);
+    assert_eq(tula_int4_get(codes, 1), 3, "2.5 rounds up to 3");
+    assert_eq(tula_int4_get(codes, 2), 0 - 2, "-2.5 rounds up to -2");
+    assert_eq(tula_int4_get(codes, 3), 7, "7.5 rounds to 8, clamped to 7");
+    assert_eq(tula_int4_get(codes, 4), 7, "-m (8) clamps to 7");
+    assert_eq(tula_int4_get(codes, 5), 0, "-0.5 rounds up to 0");
+    return 0;
+}
+
+fn test_blocks() {
+    # 70 elements in blocks of 32: 32 + 32 + 6. Block 1 is all zero.
+    var n = 70;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        var v = fv((i * 7919) % 201 - 100, 13);
+        if (i >= 32) {
+            if (i < 64) { v = f64_from(0); }
+        }
+        store64(src + i * 8, v);
+        i = i + 1;
+    }
+    var codes = alloc(tula_int4_bytes(n) + 8);
+    var sc = alloc(3 * 8);
+    store8(codes + 34, 0xFF);   # a stale byte: pack clears every byte it writes
+    assert_eq(tula_int4_pack(src, n, 32, sc, codes), 3, "70 elements in blocks of 32: 3 blocks");
+    assert_eq(load64(sc + 8), 0, "an all-zero block gets scale +0");
+    var zero = 1;
+    i = 32;
+    while (i < 64) {
+        if (tula_int4_get(codes, i) != 0) { zero = 0; }
+        i = i + 1;
+    }
+    assert_eq(zero, 1, "... and codes 0");
+    var out = alloc(n * 8);
+    tula_int4_unpack(codes, sc, n, 32, out);
+    # Each dequantized value is within half a step (|d|/2) of its input, except
+    # one clamped to 7 (x / d > 7.5: opposite m, nearly as large), within a step.
+    var bound_ok = 0;
+    var clamped = 0;
+    i = 0;
+    while (i < n) {
+        var d = load64(sc + (i / 32) * 8);
+        var ad = f64_abs(d);
+        var err = f64_abs(f64_sub(load64(out + i * 8), load64(src + i * 8)));
+        var lim = f64_div(ad, f64_from(2));
+        if (f64_gt(ad, f64_from(0)) == 1) {
+            if (f64_gt(f64_div(load64(src + i * 8), d), fv(15, 2)) == 1) {
+                lim = ad;
+                clamped = clamped + 1;
+            }
+        }
+        if (f64_gt(err, lim) == 0) { bound_ok = bound_ok + 1; }
+        i = i + 1;
+    }
+    assert_eq(bound_ok, n, "every value within half a step of its input, a clamped one within a step");
+    assert(clamped > 0, "... (this data has clamped values)");
+    assert_eq(tula_int4_pack(src, n, 0, sc, codes), 0, "pack with block 0 writes nothing, returns 0");
+    assert_eq(tula_int4_unpack(codes, sc, n, 0, out), 0, "unpack with block 0 returns 0");
+    return 0;
+}
+
+fn test_strict_and_sidecar() {
+    var n = 7;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, f64_from(i - 3)); i = i + 1; }
+    var codes = alloc(8);
+    var sc = alloc(8);
+    tula_int4_pack(src, n, 32, sc, codes);
+    assert_eq(load8(codes + 3) >> 4, 0, "pack leaves an odd count's last high nibble zero");
+    var name = "model.layers.0.mlp.down_proj.weight";
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, name, TULA_DT_INT4, shape1(n), 1, codes, 4);
+    var scale_name = "model.layers.0.mlp.down_proj.weight.scale";
+    tula_builder_add_checked(b, scale_name, TULA_DT_F64, shape1(1), 1, sc, 8);
+    tula_builder_add_checked(b, "even", TULA_DT_INT4, shape1(8), 1, codes, 4);
+    var one = alloc(8);
+    store8(one, 0x07);
+    tula_builder_add_checked(b, "one", TULA_DT_INT4, shape1(0), 0, one, 1);   # 0-dim: one code
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "a canonical int4 file is strict-accepted");
+    var e = tula_find(buf, name);
+    var s = tula_find_scale(buf, e, tula_int4_blocks(n, 32));
+    assert(s != 0, "its .scale sidecar is found for tula_int4_blocks(7, 32) = 1 scale");
+    var p = tula_entry_data(buf, e);
+    store8(p + 3, load8(p + 3) | 0x50);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "an odd count with a non-zero last high nibble -> VALUE");
+    assert_eq(tula_validate(buf, len), TULA_OK, "... which plain validate allows");
+    assert_eq(tula_entry_payload_ok(e), 1, "... and payload_ok (sizes only)");
+    store8(p + 3, load8(p + 3) & 0x0F);
+    var pe = tula_entry_data(buf, tula_find(buf, "even"));
+    store8(pe + 3, 0xF7);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "an even count uses every nibble: any byte");
+    var po = tula_entry_data(buf, tula_find(buf, "one"));
+    store8(po, 0x17);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "a 0-dim int4 is one code: its high nibble must be zero");
+    store8(po, 0x07);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "... restored");
+    b = tula_builder_new();
+    tula_builder_add(b, "w", TULA_DT_INT4, shape1(7), 1, codes, 3);
+    var bad = tula_builder_finish(b);
+    assert_eq(tula_validate_strict(bad, tula_total_len(bad)), TULA_ERR_SHAPE, "int4 [7] in 3 bytes -> SHAPE");
+    assert_eq(tula_entry_payload_ok(tula_find(bad, "w")), 0, "... and payload_ok refuses it");
+    return 0;
+}
+
+fn test_streamed() {
+    var n = 1000;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, fv(i * 31 % 97 - 48, 7)); i = i + 1; }
+    var codes = alloc(tula_int4_bytes(n) + 8);
+    var nb = tula_int4_blocks(n, TULA_INT4_BLOCK);
+    var sc = alloc(nb * 8);
+    tula_int4_pack(src, n, TULA_INT4_BLOCK, sc, codes);
+    var b = tula_builder_new();
+    var lname = "base_model.model.model.layers.31.mlp.gate_proj.weight";
+    tula_builder_add_long(b, lname, TULA_DT_INT4, shape1(n), 1, codes, tula_int4_bytes(n));
+    var sname = "base_model.model.model.layers.31.mlp.gate_proj.weight.scale";
+    tula_builder_add_long(b, sname, TULA_DT_F64, shape1(nb), 1, sc, nb * 8);
+    var mem = tula_builder_finish(b);
+    var mlen = tula_total_len(mem);
+    var path = "build/test_int4.tula";
+    assert_eq(tula_builder_write_file(b, path), mlen, "streamed int4: the same length as finish");
+    var r = tula_read_file(path);
+    assert(r != 0, "... it reads");
+    var same = 1;
+    i = 0;
+    while (i < mlen) {
+        if (load8(r + i) != load8(mem + i)) { same = 0; }
+        i = i + 1;
+    }
+    assert_eq(same, 1, "... byte for byte finish");
+    assert_eq(tula_validate_strict(r, tula_total_len(r)), TULA_OK, "... strict-canonical");
+    var e = tula_find_name(r, lname);
+    var s = tula_find_scale(r, e, nb);
+    assert(s != 0, "the long-named sidecar is found (32 scales)");
+    var out = alloc(n * 8);
+    tula_int4_unpack(tula_entry_data(r, e), tula_entry_data(r, s), n, TULA_INT4_BLOCK, out);
+    var out2 = alloc(n * 8);
+    tula_int4_unpack(codes, sc, n, TULA_INT4_BLOCK, out2);
+    same = 1;
+    i = 0;
+    while (i < n) {
+        if (load64(out + i * 8) != load64(out2 + i * 8)) { same = 0; }
+        i = i + 1;
+    }
+    assert_eq(same, 1, "... and dequantizes from the file exactly as from memory");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_sizes();
+    test_get();
+    test_q4_0_rule();
+    test_blocks();
+    test_strict_and_sidecar();
+    test_streamed();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

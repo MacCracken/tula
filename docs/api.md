@@ -49,6 +49,9 @@ SIGNATURE (Ed25519, 64 B) at sig_off = payload_off + payload_len, covering [0, s
 | `TULA_DT_I64`     | 9 | signed 64-bit, two's complement, LE, `data_len = nelems*8` *(1.7.0)* |
 | `TULA_DT_U8`      | 10 | unsigned 8-bit, `data_len = nelems` *(1.7.0)* |
 | `TULA_DT_BOOL`    | 11 | one byte each, 0 or 1 only, `data_len = nelems` *(1.7.0)* |
+| `TULA_DT_F8_E4M3` | 12 | OCP FP8 E4M3 (no inf; NaN `S.1111.111`), `data_len = nelems` *(1.8.0)* |
+| `TULA_DT_F8_E5M2` | 13 | OCP FP8 E5M2 (IEEE-like), `data_len = nelems` *(1.8.0)* |
+| `TULA_DT_INT4`    | 14 | signed 4-bit codes, 2/byte, low nibble first, `data_len = ceil(nelems/2)` *(1.8.0)* |
 
 Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 `"<name>.scale"` (ADR 0002) — the codec never interprets it.
@@ -72,6 +75,13 @@ var u = load8(p + i);                        # U8, or BOOL (0 / 1 once strict pa
 the plain reader and `tula_entry_payload_ok` check sizes only. A 1.2–1.6 strict
 validator returns `TULA_ERR_DTYPE` for these dtypes; its plain reader opens,
 verifies and resolves the file as before.
+
+**FP8 and INT4** *(1.8.0, ADRs 0010 and 0011)* have conversion helpers (see the
+dtype helpers below). Every FP8 byte is a value. An INT4 tensor with an odd
+count leaves the last byte's high nibble zero, and strict rejects a nonzero one
+(`TULA_ERR_VALUE`). INT4's per-block scales are an f64 `"<name>.scale"`
+sidecar, like NF4's. A 1.2–1.7 strict validator returns `TULA_ERR_DTYPE` for
+codes 12–14.
 
 ### Long names (1.3.0, ADR 0004)
 
@@ -124,7 +134,8 @@ validator. 17 is new in 1.3.0 (a malformed names table, from the strict
 validator). 18 is new in 1.6.0 (a bad metadata key or value from the writer, or
 a malformed metadata table from the strict validator). 19 is new in 1.7.0 (a
 payload value its dtype doesn't allow, from the strict validator: a BOOL byte
-other than 0 or 1).
+other than 0 or 1, and from 1.8.0 an odd-length INT4 tensor's last high nibble
+that isn't zero).
 
 ---
 
@@ -152,9 +163,10 @@ other than 0 or 1).
   (`TULA_ERR_NAME_LONG`, instead of truncating it) and a name the builder already
   holds, from either kind of add (`TULA_ERR_DUP_NAME`). The check is O(1) per
   add, through a name index. A builder fed only through this, with each
-  `data_len` equal to `tula_packed_len(dtype, nelems)` and *(1.7.0)* each BOOL
-  payload holding only 0 and 1 bytes, writes files `tula_validate_strict`
-  accepts. Payloads are never read at add.
+  `data_len` equal to `tula_packed_len(dtype, nelems)`, *(1.7.0)* each BOOL
+  payload holding only 0 and 1 bytes and *(1.8.0)* each odd-length INT4 tensor's
+  last high nibble zero, writes files `tula_validate_strict` accepts. Payloads
+  are never read at add.
 - `fn tula_builder_add_long(b, name, dtype, shape, ndim, data, data_len) -> 0 |
   TULA_ERR_*` *(1.3.0)* — names of **any length**. A name of 47 chars or fewer
   is added exactly as `tula_builder_add_checked` adds it. A longer name is
@@ -308,8 +320,10 @@ its total opens, and the readers take exactly the declared bytes.
   - `TULA_ERR_META` *(1.6.0)*: a metadata table is present but not canonical.
     That means keys out of order or repeated, a bad key, a value that isn't UTF-8
     or holds a NUL, not packed in order, or past the caps.
-  - `TULA_ERR_VALUE` *(1.7.0)*: a BOOL byte other than 0 or 1 (ADR 0009). The
-    only rule that reads tensor values: a word compare per 8 elements, ~4 GB/s.
+  - `TULA_ERR_VALUE` *(1.7.0)*: a BOOL byte other than 0 or 1 (ADR 0009), a
+    word compare per 8 elements, ~4 GB/s; *(1.8.0)* an odd-length INT4
+    tensor whose last high nibble isn't zero (ADR 0011), one byte read. These
+    are the only rules that read tensor values.
   - `TULA_ERR_DUP_NAME`: two tensors share a name (for long names, a key).
   - `TULA_ERR_OOM`: no memory for the duplicate check (over 512 tensors).
 
@@ -400,9 +414,44 @@ done in integer arithmetic, so the bytes never depend on the process's FP mode.
 - Arrays: `tula_f32_pack(src_f64, n, dst) -> n*4` · `tula_f32_unpack(src, n,
   dst_f64) -> n`, and the same for `f16` / `bf16` (`-> n*2`). Little-endian.
 
+**FP8 E4M3 / E5M2** *(1.8.0, ADR 0010)*: the OCP 8-bit floats, to and from f64
+in integer arithmetic.
+- f64 → FP8 rounds to nearest, ties to even, directly from the f64, keeping
+  subnormals and the sign of zero. **No saturation:** a value that rounds past
+  the largest finite becomes NaN in E4M3 (over 464; the largest is 448) and ±inf
+  in E5M2 (from 61,440; the largest is 57,344), and so does ±inf. A quantizer
+  that wants clipping clamps first. NaN stays NaN with its sign (E5M2 keeps the
+  top payload bit, quiet).
+- FP8 → f64 is exact; NaN comes back quiet with its sign.
+- Checked exhaustively: all 256 codes of each, every midpoint, and an oracle.
+- Scalars: `tula_f64_to_e4m3(x)` / `tula_e4m3_to_f64(h)`, `tula_f64_to_e5m2` /
+  `tula_e5m2_to_f64` (the FP8 side in the low 8 bits).
+- Arrays: `tula_e4m3_pack(src_f64, n, dst) -> n` · `tula_e4m3_unpack(src, n,
+  dst_f64) -> n`, and the same for `e5m2`. One byte each.
+
+**INT4** *(1.8.0, ADR 0011)*: signed 4-bit codes (−8..7), two per byte, element
+2k in the low nibble; blockwise symmetric, one f64 scale per block in the
+`"<name>.scale"` sidecar, `value = code × scale`.
+- `fn tula_int4_bytes(n) -> ceil(n/2)` · `fn tula_int4_blocks(n, block) ->
+  ceil(n/block)` (0 for `block <= 0`) · `TULA_INT4_BLOCK = 32` (GGUF Q4_0's).
+- `fn tula_int4_get(codes, i) -> -8..7`.
+- `fn tula_int4_pack(src_f64, n, block, scales_f64, codes) -> n_blocks` — llama.cpp's
+  Q4_0 reference rule in f64: `m` is the block's value of largest magnitude, `d
+  = m / −8`, and each code is `x / d` rounded half up, clamped to −8..7. So `d`
+  can be negative, and an all-zero block gets `d = +0` and codes 0. An odd
+  count's last high nibble is left zero.
+- `fn tula_int4_unpack(codes, scales, n, block, dst_f64) -> n` — reads
+  `tula_int4_blocks(n, block)` scales. Both return 0 and write nothing for
+  `block <= 0`.
+- Find the sidecar with `tula_find_scale(r, e, tula_int4_blocks(nelems, block))`.
+  To import GGUF Q4_0 losslessly, store `q − 8` per code (`q XOR 8`), move the
+  elements from Q4_0's block layout (byte `j` holds elements `j` and `j + 16`)
+  into element order, and widen each f16 `d` to f64.
+
 **Payload-length guard** (untrusted-input discipline):
 - `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length
-  (`nelems × width` for the raw dtypes, including 1.7.0's integers and BOOL).
+  (`nelems × width` for the raw dtypes, including 1.7.0's integers and BOOL and
+  1.8.0's FP8; `ceil(nelems/2)` for INT4).
 - `fn tula_entry_payload_ok(e) -> 1 | 0` — overflow-safe check that an entry's
   `data_len` is large enough for its dtype+shape. **Run it before any unpack on a
   foreign entry** (a lying `shape` could otherwise drive an over-read), and on

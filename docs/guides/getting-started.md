@@ -106,7 +106,7 @@ process may truncate or rewrite, use `tula_read_file`, which takes a private cop
 
 ## Quantized tensors
 
-The dtype helpers pack/unpack ternary / int8 / NF4; scales ride in a
+The dtype helpers pack/unpack ternary / int8 / NF4 / INT4 (and convert FP8); scales ride in a
 `"<name>.scale"` sidecar tensor ([ADR 0002](../adr/0002-quant-scales-as-sidecar-tensors.md)).
 Before unpacking a foreign quantized tensor, call `tula_entry_payload_ok(e)`.
 Integer and boolean tensors (`TULA_DT_I16/I32/I64/U8/BOOL`, 1.7.0) need no

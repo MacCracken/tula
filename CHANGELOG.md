@@ -7,6 +7,97 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+**Compact formats: FP8 and INT4** (1.8.0). An additive MINOR with no format
+change (ADRs 0010 and 0011). FP8 checkpoints and 4-bit imports are stored at
+their own size, under their own dtypes. A file that doesn't use them is byte for
+byte what 1.7.0 writes. Diffed against 1.7.0 on 400 random builders (dtypes
+0–11 and an unknown one) and 10,000 mutations of them:
+- the same bytes from `finish` and `finish_signed`, and the same return code
+  from every add, metadata set and verify;
+- the same verdicts, `payload_ok`, `nelems`, find-name and index answers, and
+  metadata;
+- the only differences are the expected ones, for mutations that set a dtype
+  field to 12–14.
+
+**1.7.0 reads 1.8 files**: it opens them, verifies them, and resolves their long
+names, metadata and INT4 sidecars (`tula_find_scale`); its strict validator
+returns `TULA_ERR_DTYPE` for the new codes.
+
+### Added
+
+- **`TULA_DT_F8_E4M3` (12) and `TULA_DT_F8_E5M2` (13)** (ADR 0010): the OCP
+  8-bit floats (PyTorch's `float8_e4m3fn` / `float8_e5m2`, safetensors'
+  `F8_E4M3` / `F8_E5M2`), one byte each.
+  - Conversions to and from f64 in integer arithmetic, as ADR 0005's:
+    `tula_f64_to_e4m3` / `tula_e4m3_to_f64`, `tula_f64_to_e5m2` /
+    `tula_e5m2_to_f64`, and the `tula_e4m3_pack` / `_unpack`,
+    `tula_e5m2_pack` / `_unpack` array helpers.
+  - Round to nearest, ties to even, straight from the f64. Subnormals and the
+    sign of zero are kept.
+  - **No saturation**: a value that rounds past 448 is NaN in E4M3 (E4M3 has no
+    infinities), and one past 57,344 is ±inf in E5M2. A quantizer that wants
+    clipping clamps first.
+  - FP8 → f64 is exact; NaN comes back quiet with its sign.
+- **`TULA_DT_INT4` (14)** (ADR 0011): signed 4-bit codes, −8..7, two per byte,
+  low nibble first. Its blockwise scales go in an f64 `"<name>.scale"` sidecar
+  (ADR 0002), as NF4's do.
+  - `tula_int4_bytes`, `tula_int4_blocks`, `tula_int4_get`, and
+    `TULA_INT4_BLOCK = 32` (GGUF Q4_0's block).
+  - `tula_int4_pack` is llama.cpp's Q4_0 reference rule in f64: `d = m / −8`
+    for the block's value `m` of largest magnitude, each code `x / d` rounded
+    half up and clamped. `tula_int4_unpack` gives `code × d`.
+  - `api.md` shows how to import a GGUF Q4_0 tensor losslessly.
+- **Strict's value rule** (`TULA_ERR_VALUE`) covers INT4 too: an odd-length
+  tensor's unused last high nibble must be zero. Every FP8 byte is a value.
+- **ADRs 0010 and 0011**. The int4 ADR settles the roadmap's open question with
+  codes plus a sidecar (tula's convention, and what the Type-3 importer asked
+  for) over GGUF-compatible blocks with an inline scale. It records what's left
+  for later: Q4_1-style asymmetric 4-bit, K-quants, saturating and FNUZ FP8.
+
+### Changed
+
+- **`tula_builder_add_checked`'s promise** also needs an odd-length INT4
+  tensor's last high nibble to be zero.
+- **`tests/tcyr/fp8.tcyr`** (new, 81 assertions), as thorough as `floats`:
+  - known values;
+  - all 256 codes of each format round-tripped, with the NaN codes staying NaN
+    and the finite ones strictly ordered;
+  - every midpoint between neighbours tied to the even code, and one f64 ulp
+    either side rounding to its own side;
+  - the overflow edges (464 and 61,440) and underflow, signed zero and NaN;
+  - 40,000 random values against a brute-force nearest-code oracle;
+  - the array helpers, and a file round trip.
+
+  Outside the repo, an exact-rational reference written from the OCP spec
+  (Python `fractions`) agreed with tula on all 512 decodes and 400,000 encodes.
+- **`tests/tcyr/int4.tcyr`** (new, 48 assertions):
+  - sizes, and every byte through `tula_int4_get`;
+  - Q4_0's rule: `m` → −8, a negative scale, rounding half up (−2.5 → −2), the
+    clamp;
+  - zero and partial blocks, and the error bound (half a step, a step where a
+    value clamps);
+  - strict's nibble rule, a 0-dim code included;
+  - `payload_ok` and the sidecar lookup;
+  - the streaming writer equal to `finish`.
+- **`floats.tcyr`'s "next code is unknown"** check moves from 12 to 15.
+- **The fuzzer** unpacks FP8 and INT4 entries with their helpers. It holds them
+  to its own size table, and its brute-force strict check requires an odd
+  INT4's last high nibble to be zero.
+  - Phase I's file gains E4M3, E5M2 and an odd and an even INT4 tensor. Phase
+    H's builders draw all fifteen dtypes, plus an unknown one.
+  - 3,204,500 iterations, 0 faults, 92,821 strict accepts confirmed by brute
+    force.
+  - Its raw-integer branch is now limited to codes 7–11. Otherwise an INT4
+    entry would have been read a byte per code.
+  - Two seeded bugs are each caught: the nibble rule removed (1,018 breaches),
+    and an INT4 size of `n / 2` (3,039).
+- **`make realmodels`** gains two inventories: Llama-2-7B as an FP8 E4M3 import
+  (291 tensors), and as a Q4_0-style INT4 import, each 2-D weight with its
+  per-32 `.scale` sidecar found by index and by `tula_find_scale` (517).
+- **Bench** (`docs/benchmarks.md`): E4M3 pack / unpack ~63 / ~119 Melem/s, E5M2
+  ~49 / ~81, INT4 ~56 / ~130.
+- **Roadmap**: 1.8.0 is done; new dtype codes start at 15.
+
 ## [1.7.0] - 2026-11-12
 
 **Integer and boolean dtypes.** An additive MINOR with no format change

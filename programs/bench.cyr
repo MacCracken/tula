@@ -459,6 +459,47 @@ fn main(): i64 {
         fmt = fmt + 1;
     }
 
+    # ---- FP8 E4M3 / E5M2 and INT4 (1.8.0): per-element conversions ----
+    var nb8 = alloc(n);
+    var f8 = 0;
+    while (f8 < 2) {
+        var pk8 = 0;
+        var up8 = 0;
+        round = 0;
+        while (round < BN_ROUNDS) {
+            var tp8 = now_ns();
+            if (f8 == 0) { tula_e4m3_pack(sig, n, nb8); }
+            if (f8 == 1) { tula_e5m2_pack(sig, n, nb8); }
+            pk8 = min_of(pk8, round, now_ns() - tp8);
+            var tu8 = now_ns();
+            if (f8 == 0) { tula_e4m3_unpack(nb8, n, out); }
+            if (f8 == 1) { tula_e5m2_unpack(nb8, n, out); }
+            up8 = min_of(up8, round, now_ns() - tu8);
+            round = round + 1;
+        }
+        chk = chk + load64(out + 8 * 999);
+        if (f8 == 0) { report_el("e4m3 pack    : ", n, pk8); report_el("e4m3 unpack  : ", n, up8); }
+        if (f8 == 1) { report_el("e5m2 pack    : ", n, pk8); report_el("e5m2 unpack  : ", n, up8); }
+        f8 = f8 + 1;
+    }
+    var q4 = alloc(tula_int4_bytes(n));
+    var q4s = alloc(tula_int4_blocks(n, TULA_INT4_BLOCK) * 8);
+    var q4p = 0;
+    var q4u = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var tq = now_ns();
+        tula_int4_pack(sig, n, TULA_INT4_BLOCK, q4s, q4);
+        q4p = min_of(q4p, round, now_ns() - tq);
+        var tq2 = now_ns();
+        tula_int4_unpack(q4, q4s, n, TULA_INT4_BLOCK, out);
+        q4u = min_of(q4u, round, now_ns() - tq2);
+        round = round + 1;
+    }
+    chk = chk + load64(out + 8 * 31337);
+    report_el("int4 pack    : ", n, q4p);
+    report_el("int4 unpack  : ", n, q4u);
+
     # ---- long names (1.3.0): 256 LoRA-style names over 47 chars ----
     var lnames = alloc(BN_FIND_N * 8);
     var lb = tula_builder_new();

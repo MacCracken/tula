@@ -32,3 +32,5 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 | [0007](0007-sorted-name-index.md) | Accepted | The name index is a sorted array, not a hash table |
 | [0008](0008-file-metadata-table.md) | Accepted | File metadata lives in a sorted key/value table tensor (no format-version bump) |
 | [0009](0009-integer-and-boolean-dtypes.md) | Accepted | Integer and boolean dtypes: I16, I32, I64, U8 and BOOL, stored raw |
+| [0010](0010-fp8-e4m3-e5m2-dtypes.md) | Accepted | FP8 dtypes: OCP E4M3 and E5M2, converted from f64 without saturation |
+| [0011](0011-int4-blockwise-codes-with-scale-sidecar.md) | Accepted | INT4: signed 4-bit codes, with blockwise scales in an ADR 0002 sidecar |

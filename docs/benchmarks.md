@@ -126,6 +126,22 @@ the first strict rule that reads tensor values. Measured with `make bench` on a
 | `tula_validate_strict`, the same bytes as U8 | 1 µs | no value rule: sizes and padding only |
 | `tula_validate_strict`, 200 tensors | 54.8–62.2 µs | 1.6.2 on the same machine and run: 54.7–63.4 µs (unchanged; this machine reads ~30% slower than 1.2.0's numbers above) |
 
+### 1.8.0: FP8 and INT4
+
+2²⁰ elements, `make bench`, three runs (the range). FP8 converts one element per
+call in integer arithmetic (ADR 0010); the shared F16 path's inline fast path
+isn't used for E5M2 yet, which 1.9.x's throughput work can change.
+
+| Op | 1.8.0 | Notes |
+|---|---:|---|
+| `tula_e4m3_pack` | 16.3–16.7 ms · 62–64 Melem/s | f64 → E4M3, round to nearest even, no saturation |
+| `tula_e4m3_unpack` | 8.7–9.2 ms · 113–119 Melem/s | exact |
+| `tula_e5m2_pack` | 21.3–22.6 ms · 46–49 Melem/s | the shared narrow, (E, M) = (5, 2) |
+| `tula_e5m2_unpack` | 12.7–13.4 ms · 78–82 Melem/s | |
+| `tula_int4_pack` | 18.4–20.5 ms · 51–56 Melem/s | Q4_0's rule in f64, blocks of 32 |
+| `tula_int4_unpack` | 8.0–8.8 ms · 118–130 Melem/s | code × the block's scale |
+| strict, the 16 MiB BOOL tensor | 4.0–4.1 ms | unchanged by INT4's rule (one byte per odd-length INT4 tensor); one first run read 8.2 ms |
+
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
 adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is

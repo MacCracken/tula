@@ -60,7 +60,9 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   - the F32/F16/BF16 encodings and their rounding (ADR 0005);
   - file metadata through the `__tula.meta__` table, before the names table
     (ADR 0008);
-  - the raw integer encodings and BOOL's 0/1 rule (ADR 0009).
+  - the raw integer encodings and BOOL's 0/1 rule (ADR 0009);
+  - the FP8 encodings and conversion semantics (ADR 0010), and INT4's nibble
+    order, unused-nibble rule and quantization rule (ADR 0011).
 
   A new convention (a reserved tensor, a naming rule) is a MINOR with its own
   ADR, and must stay readable by every older 1.x reader.
@@ -97,18 +99,14 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ## 1.8.x — compact formats: FP8 and int4
 
-**Goal:** the compact formats real checkpoints and quantized imports use. New
-`TULA_DT_*` values are MINOR-only, so both land in **1.8.0**, each with its own
-ADR and conversion tests as thorough as ADR 0005's.
+**Goal:** the compact formats real checkpoints and quantized imports use. 1.8.0
+adds OCP FP8 `F8_E4M3` / `F8_E5M2` (ADR 0010, codes 12–13) and `INT4`, signed
+codes with an ADR 0002 `.scale` sidecar (ADR 0011, code 14).
 
-- **FP8** (`E4M3`, `E5M2`), following the OCP 8-bit float spec. New codes start
-  at 12 (1.7.0 took 7–11). E4M3 has no
-  infinities and a single NaN pattern; E5M2 is IEEE-like. With 256 codes per
-  format, every code and every midpoint can be tested, as F16/BF16 are.
-- **int4 blockwise** (GGUF Q4-style). To decide in its ADR: blocks with an inline
-  f16 scale (one tensor, GGUF-compatible bytes) or codes plus an ADR 0002
-  `.scale` sidecar (tula's existing convention). NF4 already uses the sidecar.
-- **1.8.x patches** — fixes; no new surface.
+- **1.8.x patches** — fixes; no new surface. Left for a MINOR when an importer
+  needs them (the ADRs say why): saturating FP8 conversions, the FNUZ FP8
+  variants, an unsigned 4-bit dtype for asymmetric schemes (Q4_1, AWQ/GPTQ zero
+  points) and its `.min` / zero-point sidecar convention. New codes start at 15.
 
 ## 1.9.x — throughput
 

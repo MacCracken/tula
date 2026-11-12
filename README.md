@@ -84,8 +84,13 @@ The full march M0→M5:
   Strict rejects a BOOL byte other than 0 or 1 (`TULA_ERR_VALUE`). The
   real-model gate gains a GPTQ inventory.
 
-**628/628** assertions across 13 suites (meta · names · stream · builder · strict ·
-ints · dtype · floats · file-io · hardening · round-trip · index · sign) + a
+- **1.8.0** — compact formats: OCP FP8 (`TULA_DT_F8_E4M3` / `F8_E5M2`, exact,
+  non-saturating conversions, checked on every code and midpoint) and `TULA_DT_INT4`
+  (signed 4-bit codes with a `.scale` sidecar, quantized by Q4_0's rule).
+
+**757/757** assertions across 15 suites (meta · fp8 · names · stream · builder ·
+strict · ints · dtype · int4 · floats · file-io · hardening · round-trip · index ·
+sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on
@@ -99,7 +104,7 @@ place. Post-1.0 changes are additive-only (SemVer). See
 
 ```sh
 make build    # link-check the library via programs/smoke.cyr
-make test     # run tests/tcyr/*.tcyr (13 suites)
+make test     # run tests/tcyr/*.tcyr (15 suites)
 make dist     # regenerate dist/tula.cyr for consumers
 make example  # build + run the end-to-end consumer (examples/consumer.cyr)
 make fuzz     # reader + streaming-writer fuzz harness (>10^6 iters)

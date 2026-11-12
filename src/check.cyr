@@ -73,6 +73,12 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
             k = k + 8;
         }
     }
+    # INT4 (1.8.0, ADR 0011): an odd count leaves the last byte's high nibble zero.
+    if (dt == TULA_DT_INT4) {
+        if ((n & 1) == 1) {
+            if ((load8(payload + doff + dlen - 1) >> 4) != 0) { return TULA_ERR_VALUE; }
+        }
+    }
     return TULA_OK;
 }
 
@@ -230,7 +236,8 @@ fn _tula_strict_unique(buf, count): i64 {
 #                       NUL, not packed in record order, or past the caps
 #                       (ADR 0008);
 #   TULA_ERR_VALUE    — (1.7.0) a payload value its dtype doesn't allow: a BOOL
-#                       byte other than 0 or 1 (ADR 0009);
+#                       byte other than 0 or 1 (ADR 0009); (1.8.0) an odd-length
+#                       INT4 tensor whose last high nibble isn't zero (ADR 0011);
 #   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
 #   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To
