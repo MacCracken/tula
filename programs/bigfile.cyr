@@ -7,7 +7,9 @@
 #   3. tula_file_len agrees; tula_open_mmap + tula_validate_strict accept it (and,
 #      signed, tula_verify_required); every tensor is spot-checked by full name;
 #   4. tula_read_file refuses it (one heap allocation can't hold it), and
-#      tula_read_file_into reads it into a caller-provided mapping.
+#      tula_read_file_into reads it into a caller-provided mapping;
+#   5. tula_write_file_atomic, then tula_write_file, write that buffer back out
+#      (1.6.2): more than INT_MAX bytes from one buffer, compared word for word.
 #
 # 36 tensors: 35 of 4 MiB (f64 [512 Ki]) and, in the middle, one of 2 GiB +
 # 64 MiB (f64 [264 Mi], 2,214,592,512 bytes) — more than INT_MAX, the most macOS
@@ -16,7 +18,8 @@
 # The tensors are views into one buffer at 8-byte steps, so each one's first
 # word is its index; only the words checked are written, and the buffer is
 # unmapped once the file is, so the program holds little beyond the read buffer.
-# Writes the file under build/ and removes it.
+# Writes the file under build/, and its copy once the file is gone (one on disk at
+# a time), and removes them.
 #
 #   make bigfile          # unsigned: seconds (the CI gate)
 #   make bigfile-signed   # signed: minutes — bound by sigil's SHA-512 (~18 MB/s
@@ -54,6 +57,26 @@ fn fail(msg): i64 {
     sput(msg);
     sput("\n");
     return 1;
+}
+
+# 1 if the n bytes (a multiple of 8) at a and b are equal.
+fn words_eq(a, b, n): i64 {
+    var k = 0;
+    while (k < n) {
+        if (load64(a + k) != load64(b + k)) { return 0; }
+        k = k + 8;
+    }
+    return 1;
+}
+
+# The file at `copy` holds exactly the `total` bytes at buf, and opens.
+fn copy_ok(copy, buf, total): i64 {
+    if (tula_file_len(copy) != total) { return 0; }
+    var r = tula_open_mmap(copy);
+    if (r == 0) { return 0; }
+    var same = words_eq(r, buf, total);
+    tula_close_mmap(r);
+    return same;
 }
 
 # Name of tensor t: short "layer.<t>.w" for most, a 62-char LoRA name for every 6th.
@@ -170,11 +193,29 @@ fn main(): i64 {
         return fail("read_into: the big tensor's last word");
     }
     kv("  read_into ms         : ", (t6 - t5) / 1000000);
+
+    # 5. write the buffer back out (1.6.2). Through the stdlib's loops both calls
+    #    asked for it in one request, which macOS refuses over INT_MAX bytes.
+    xunlink(path);   # one copy on disk at a time
+    var copy = "build/tula_bigfile_copy.tula";
+    var t7 = now_ns();
+    if (tula_write_file_atomic(copy, into, total) != total) {
+        return fail("tula_write_file_atomic of the whole buffer");
+    }
+    var t8 = now_ns();
+    if (copy_ok(copy, into, total) != 1) { return fail("tula_write_file_atomic: the copy differs"); }
+    var t9 = now_ns();
+    if (tula_write_file(copy, into, total) != total) { return fail("tula_write_file of the whole buffer"); }
+    var t10 = now_ns();
+    if (copy_ok(copy, into, total) != 1) { return fail("tula_write_file: the copy differs"); }
+    kv("  write_file_atomic ms : ", (t8 - t7) / 1000000);
+    kv("  write_file ms        : ", (t10 - t9) / 1000000);
+    sput("  write back           : both copies equal the buffer, word for word\n");
     cyr_munmap(into, total);
 
-    xunlink(path);
-    sput("RESULT: PASS — a 2.36 GB checkpoint (one tensor > INT_MAX bytes) streamed, validated and read\n");
-    sput("        without a whole-file allocation\n");
+    xunlink(copy);
+    sput("RESULT: PASS — a 2.36 GB checkpoint (one tensor > INT_MAX bytes) streamed, validated, read\n");
+    sput("        and written back without a whole-file allocation\n");
     return 0;
 }
 

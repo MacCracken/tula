@@ -30,8 +30,9 @@ typed tensor manifest + payload with a `sigil`-signable header. It loads
   leaves the old file intact. A named temp is created with `O_CREAT|O_EXCL` (a
   planted file or symlink at its name is never opened or followed; a new random
   name is tried) under a 64-bit random name, with the existing target's mode, so
-  it is never more readable than the result. A symlink at the target is
-  replaced, not written through. `tula_write_file` keeps its frozen
+  it is never more readable than the result (`tula_write_file_atomic` restores
+  bits the umask stripped only once the bytes are written, 1.6.2). A symlink at
+  the target is replaced, not written through. `tula_write_file` keeps its frozen
   truncate-and-write behaviour.
 - **The signed streaming writer signs what it wrote.** It maps the temp file's
   content and signs the mapping. On Linux (1.6.1) that temp is a nameless

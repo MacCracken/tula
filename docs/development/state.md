@@ -1,6 +1,6 @@
 # tula — Current State
 
-> **Last refresh**: 2026-11-05 | **Cadence**: every release.
+> **Last refresh**: 2026-11-12 | **Cadence**: every release.
 > `CLAUDE.md` is preferences / process (durable); this file is **state**
 > (volatile) — version, sizes, counts.
 
@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.6.1** (`tula_version_int()` returns `10601`). 1.0.1–1.1.1 are
+VERSION is **1.6.2** (`tula_version_int()` returns `10602`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -45,29 +45,30 @@ metadata** (ADR 0008): sorted key/value text pairs in the `__tula.meta__` table
 `O_TMPFILE` inode and name it only once it is signed, closing ADR 0006's
 write-to-sign window (the named `O_EXCL` temp is the fallback); fuzz phase H
 checks the writers against `finish`; CI gains native aarch64 Linux and macOS
-runners.
+runners. **1.6.2** (patch): the macOS leg is a hard gate, and `tula_write_file` /
+`tula_write_file_atomic` write through tula's own loop (at most 1 GiB per
+request), so buffers over INT_MAX bytes work on macOS too.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.6.1)
+## Tests, fuzz, gates (1.6.2)
 
-**550 assertions** across 12 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
-`builder.tcyr` 67, `strict.tcyr` 67, `stream.tcyr` 51, `dtype.tcyr` 50,
+**567 assertions** across 12 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
+`stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67, `dtype.tcyr` 50,
 `floats.tcyr` 37, `fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22,
 `index.tcyr` 13, `sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
-  same on native `ubuntu-26.04-arm` (a hard gate) and `macos-14` (informational
-  until its first green run). macOS's first run passed the suites, the consumer
-  and realmodels, then failed `make bigfile`: reads and writes over INT_MAX
-  bytes, fixed in 1.6.1 and not yet re-run there.
+  same on native `ubuntu-26.04-arm` and `macos-14`, both hard gates (macOS since
+  1.6.2, after 1.6.1's run went green end to end). x86_64 macOS isn't covered.
 - `make realmodels` (CI): GPT-2, Llama-2-7B, Mixtral-8x7B, a LoRA adapter and a
   QLoRA NF4 import (real names, ranks, counts and dtypes; dims ÷ 64), each
   written signed, read, strict-validated, verified and resolved by index.
 - `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
-  mapped, strict-validated and read
-  into a caller buffer.
+  mapped, strict-validated, read into a caller buffer, and (1.6.2) written back
+  out from it by `tula_write_file_atomic` and `tula_write_file`, each copy
+  compared word for word.
 - `make bigfile-signed` (local; minutes, bound by sigil's ~18 MB/s SHA-512): the
   same, signed and verified.
 - `floats` checks F16/BF16 exhaustively (every code, every midpoint) and F32
@@ -123,8 +124,8 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: the macOS CI leg becomes a hard gate once it runs green (a 1.6.x patch
-if it needs fixes), then 1.7.0 integer/boolean dtypes. Later: 1.8.0 FP8 and int4;
+Next: 1.7.0 integer/boolean dtypes (1.6.x patches only for fixes the CI legs
+or consumers turn up). Later: 1.8.0 FP8 and int4;
 1.9.x throughput; the 1.x.x research list; and v2 candidates
 ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

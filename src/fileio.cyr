@@ -26,6 +26,24 @@ fn _tula_read_full(fd, buf, len): i64 {
     return got;
 }
 
+# Write all n bytes at p to fd, looping over short writes. 0 or a negative errno;
+# a write that makes no progress is -EIO. Each request is at most 1 GiB (1.6.1),
+# as in _tula_read_full: macOS refuses a write of more than INT_MAX bytes, so a
+# single tensor over 2 GiB would otherwise fail there. Every write tula makes goes
+# through here (1.6.2: tula_write_file and tula_write_file_atomic too).
+fn _tula_write_full(fd, p, n): i64 {
+    var off = 0;
+    while (off < n) {
+        var want = n - off;
+        if (want > 1073741824) { want = 1073741824; }
+        var w = file_write(fd, p + off, want);
+        if (w < 0) { return w; }
+        if (w == 0) { return 0 - 5; }
+        off = off + w;
+    }
+    return 0;
+}
+
 # The shared front half of both readers. Reads the header of an open fd and
 # returns the total length it declares, or -1 to reject: short header, bad magic,
 # a size field negative or over the cap, or a total larger than the file (or a
@@ -43,20 +61,42 @@ fn _tula_fd_total(fd): i64 {
     return total;
 }
 
-# Write a serialized tula buffer to `path` (create/truncate). Returns bytes
-# written (== len on success) or a negative io error. Not crash-safe: a failure
-# part-way leaves a truncated file, which both readers then reject. For a write
-# that never destroys the previous file, use tula_write_file_atomic.
+# Write a serialized tula buffer to `path` (create/truncate; a new file is 0644
+# before the umask). Returns bytes written (== len on success) or a negative io
+# error. Not crash-safe: a failure part-way leaves a truncated file, which both
+# readers then reject. For a write that never destroys the previous file, use
+# tula_write_file_atomic. 1.6.2: through tula's own write loop, so a buffer over
+# INT_MAX bytes works on macOS too (the stdlib's file_write_all asks for it in one
+# request, which macOS refuses).
 fn tula_write_file(path, buf, len): i64 {
-    return file_write_all(path, buf, len);
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
+    if (fd < 0) { return fd; }
+    var rc = _tula_write_full(fd, buf, len);
+    var cr = file_close(fd);
+    if (rc < 0) { return rc; }
+    if (cr < 0) { return cr; }
+    return len;
 }
 
 # Crash-safe write of a serialized buffer (1.4.0, ADR 0006): the bytes go to a
-# unique sibling temp file, which is fsync'd and renamed over `path` (the
-# stdlib's file_write_atomic). On any failure `path` is untouched. Returns len,
-# or a negative errno. A symlink at `path` is replaced, not written through.
+# unique sibling temp file, which is fsync'd and renamed over `path`, and the
+# directory is fsync'd. On any failure `path` is untouched and no temp is left.
+# Returns len, or a negative errno. A symlink at `path` is replaced, not written
+# through; an existing file's permission bits are kept exactly. 1.6.2: tula's own
+# temp and write loop (the stdlib's file_write_atomic before), so a buffer over
+# INT_MAX bytes works on macOS too.
 fn tula_write_file_atomic(path, buf, len): i64 {
-    var rc = file_write_atomic(path, buf, len);
+    var plen = strlen(path);
+    if (plen + 32 > TULA_PATH_MAX) { return 0 - 36; }   # ENAMETOOLONG
+    var tmp[4160];
+    var fd = _tula_tmp_open(&tmp, path, plen, _tula_target_mode(path));
+    if (fd < 0) { return fd; }
+    var rc = _tula_write_full(fd, buf, len);
+    if (rc >= 0) {
+        _tula_keep_mode(fd, path);
+        rc = xfsync(fd);
+    }
+    rc = _tula_tmp_commit(&tmp, fd, rc, path, plen);
     if (rc < 0) { return rc; }
     return len;
 }
@@ -160,23 +200,6 @@ fn tula_close_mmap(r): i64 {
 enum TulaStreamCfg {
     TULA_STAGE_SIZE = 65536;
     TULA_PATH_MAX   = 4096;
-}
-
-# Write all n bytes at p to fd, looping over short writes. 0 or a negative errno;
-# a write that makes no progress is -EIO. Each request is at most 1 GiB (1.6.1),
-# as in _tula_read_full: macOS refuses a write of more than INT_MAX bytes, so a
-# single tensor over 2 GiB would otherwise fail there.
-fn _tula_write_full(fd, p, n): i64 {
-    var off = 0;
-    while (off < n) {
-        var want = n - off;
-        if (want > 1073741824) { want = 1073741824; }
-        var w = file_write(fd, p + off, want);
-        if (w < 0) { return w; }
-        if (w == 0) { return 0 - 5; }
-        off = off + w;
-    }
-    return 0;
 }
 
 # A staged writer (5 words): +0 fd, +8 staging buffer, +16 bytes staged, +24 the
@@ -414,6 +437,60 @@ fn _tula_dir_fsync(path, plen): i64 {
     return 0;
 }
 
+# Create a fresh sibling temp of `path` (1.6.2, shared by every atomic writer):
+# the name goes into tmp (4160 bytes), and the file is opened read-write with
+# O_EXCL and `mode`, so an existing name, a file or a planted symlink, is never
+# opened or followed; another name is tried. The fd, or a negative errno.
+fn _tula_tmp_open(tmp, path, plen, mode): i64 {
+    var fd = 0 - 17;
+    var tries = 0;
+    while (tries < 8) {
+        var nr = _tula_tmp_name(tmp, path, plen);
+        if (nr < 0) { return nr; }
+        fd = file_open(tmp, O_RDWR | O_CREAT | O_EXCL, mode);
+        if (fd != 0 - 17) { break; }
+        tries = tries + 1;
+    }
+    return fd;
+}
+
+# Give the temp at fd the exact permission bits `path` has now, if it exists:
+# the create applied the umask to them (1.6.2; what the stdlib's
+# file_write_atomic did for tula_write_file_atomic before). Called once the bytes
+# are written and before the fsync, so while they are written the temp is never
+# wider than the create allowed (the stdlib widened it first).
+fn _tula_keep_mode(fd, path): i64 {
+    #ifndef CYRIUS_TARGET_WIN
+    #ifndef CYRIUS_TARGET_AGNOS
+    var st[144];
+    if (xstat(path, &st) == 0) { sys_fchmod(fd, load32(&st + STAT_MODE) & 0x1FF); }
+    #endif
+    #endif
+    return 0;
+}
+
+# Finish a temp opened by _tula_tmp_open (1.6.2): close fd, rename the temp over
+# `path` and fsync the directory. rc is the result of writing it (negative: it
+# failed). On any failure the temp is removed and `path` is untouched. Returns
+# rc, or a negative errno.
+fn _tula_tmp_commit(tmp, fd, rc, path, plen): i64 {
+    var cr = file_close(fd);
+    if (rc >= 0) {
+        if (cr < 0) { rc = cr; }
+    }
+    if (rc < 0) {
+        xunlink(tmp);
+        return rc;
+    }
+    var rr = file_rename(tmp, path);
+    if (rr < 0) {
+        xunlink(tmp);
+        return rr;
+    }
+    _tula_dir_fsync(path, plen);
+    return rc;
+}
+
 # Fill an open, empty, read-write fd with the builder's file: stream it through a
 # staging mapping, sign it (signed = 1) by mapping what was written, fsync.
 # Returns the file's length, or a negative errno. The caller owns fd.
@@ -557,34 +634,10 @@ fn _tula_write_stream(b, path, sk, signed): i64 {
     var nrc = _tula_write_nameless(b, path, plen, mode, sk, signed);
     if (nrc != 0) { return nrc; }
     var tmp[4160];
-    var fd = 0 - 17;
-    var tries = 0;
-    while (tries < 8) {
-        var nr = _tula_tmp_name(&tmp, path, plen);
-        if (nr < 0) { return nr; }
-        # O_EXCL: an existing name — a file or a planted symlink — is never
-        # opened or followed; another name is tried.
-        fd = file_open(&tmp, O_RDWR | O_CREAT | O_EXCL, mode);
-        if (fd != 0 - 17) { break; }
-        tries = tries + 1;
-    }
+    var fd = _tula_tmp_open(&tmp, path, plen, mode);
     if (fd < 0) { return fd; }
     var rc = _tula_fill_fd(b, fd, sk, signed);
-    var cr = file_close(fd);
-    if (rc >= 0) {
-        if (cr < 0) { rc = cr; }
-    }
-    if (rc < 0) {
-        xunlink(&tmp);
-        return rc;
-    }
-    var rr = file_rename(&tmp, path);
-    if (rr < 0) {
-        xunlink(&tmp);
-        return rr;
-    }
-    _tula_dir_fsync(path, plen);
-    return rc;
+    return _tula_tmp_commit(&tmp, fd, rc, path, plen);
 }
 
 # Stream the builder's file to `path`, unsigned (1.4.0, ADR 0006): exactly the

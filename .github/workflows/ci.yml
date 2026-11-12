@@ -109,7 +109,7 @@ jobs:
           CYRIUS_DCE=1 cyrius build programs/realmodels.cyr build/tula_realmodels
           ./build/tula_realmodels
 
-      - name: Big file (1.4.0 gate — 2.36 GB, one tensor over INT_MAX, past the 2 GiB allocation cap)
+      - name: Big file (1.4.0 gate — 2.36 GB, one tensor over INT_MAX, past the 2 GiB allocation cap; 1.6.2 writes it back)
         # Unsigned: seconds. The signed variant (make bigfile-signed) takes minutes,
         # bound by sigil's SHA-512, and runs locally; signed streaming is checked
         # byte-for-byte against the in-memory writer in tests/tcyr/stream.tcyr.
@@ -131,6 +131,8 @@ jobs:
     # fsync differ in the details between kernels, and qemu-user can't show
     # that (it runs on the host kernel), so these are native runners. The
     # host-independent gates (lint, fmt, vet, the dist bundle) stay in `build`.
+    # Both legs are hard gates. `experimental: true` makes a new leg
+    # informational until its first green run.
     name: Cross-target (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
@@ -143,9 +145,9 @@ jobs:
             experimental: false
           - name: arm64 macOS
             os: macos-14
-            # Informational until its first green run (tula has not yet run on
-            # macOS), then a hard gate: set this to false.
-            experimental: true
+            # A hard gate since 1.6.2: informational until its first green run,
+            # which was 1.6.1's (every step, the fuzzer included).
+            experimental: false
     steps:
       - uses: actions/checkout@v4
 
@@ -187,7 +189,7 @@ jobs:
           CYRIUS_DCE=1 cyrius build programs/realmodels.cyr build/tula_realmodels
           ./build/tula_realmodels
 
-      - name: Big file (2.36 GB, one tensor over INT_MAX; streamed, mapped, validated, read)
+      - name: Big file (2.36 GB, one tensor over INT_MAX; streamed, mapped, validated, read, written back)
         run: |
           CYRIUS_DCE=1 cyrius build programs/bigfile.cyr build/tula_bigfile
           ./build/tula_bigfile

@@ -71,13 +71,9 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 **Goal:** the write path's remaining loose ends, and the real-weights gate.
 
 - **1.6.x patches** (no new surface — a patch never adds a function, dtype or
-  convention):
-  - **macOS as a hard gate.** The `cross-target` CI job's arm64 macOS leg
-    (`macos-14`) is informational (`experimental: true`) until it first runs
-    green. Its first run passed the suites, the consumer and realmodels, and
-    found the over-INT_MAX reads and writes 1.6.1 fixes. It has not yet reached
-    the fuzzer. Fix what else it turns up, then make it blocking. x86_64 macOS
-    isn't covered: GitHub's hosted Intel runners are scarce.
+  convention): fixes as the cross-target legs and consumers turn them up. CI's
+  aarch64 Linux and arm64 macOS legs are both hard gates (macOS since 1.6.2).
+  x86_64 macOS isn't covered: GitHub's hosted Intel runners are scarce.
 - **Cross-repo** (not tula code):
   - **anukulana's migration**, which makes its `gpt2-tula` demo the
     real-weights gate. That demo already imports the real GPT-2 checkpoint,

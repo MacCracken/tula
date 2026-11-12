@@ -102,6 +102,18 @@ and bit-identical (tested on every 16-bit code and midpoint, and 300k F32 cases)
 | `make bigfile` (1.6.1): stream 2.36 GB, one 2.2 GB tensor | — | 6.3 s | requests of at most 1 GiB; `tula_read_file_into` 377 ms |
 | `make bigfile-signed` (1.6.1): write + sign 2.36 GB | — | 244 s | verify 121 s; still bound by sigil's SHA-512 |
 
+### 1.6.2: whole-buffer writes on tula's own loop
+
+`make bigfile`'s write-back step: the 2.36 GB buffer `tula_read_file_into` filled,
+written out again. The same program was built against 1.6.1's `src/fileio.cyr`
+(the stdlib's loops) and 1.6.2's, and run alternately, two runs each, on x86_64
+Linux (where the stdlib's single request still works).
+
+| Op, 2.36 GB | 1.6.1 (stdlib) | 1.6.2 (requests ≤ 1 GiB) | Notes |
+|---|---:|---:|---|
+| `tula_write_file_atomic` | 5.2–5.5 s | 5.4–5.7 s | temp, write, fsync, rename; 1.6.2 also fsyncs the directory |
+| `tula_write_file`, over that copy | 5.3–5.5 s | 5.3 s | truncate and write, no fsync |
+
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
 adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is

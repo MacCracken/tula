@@ -7,6 +7,75 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-11-12
+
+**macOS is a hard gate.** A patch: no new function, dtype or convention, and no
+format change. Every call writes the same bytes as in 1.6.1: diffed for
+`tula_write_file` and `tula_write_file_atomic` against the stdlib calls 1.6.1
+made, and the streaming writers still equal `tula_builder_finish(_signed)` in
+the fuzzer's phase H.
+
+### Fixed
+
+- **`tula_write_file` and `tula_write_file_atomic` over 2 GiB on macOS**, 1.6.1's
+  known limit. Both handed their buffer to the stdlib (`file_write_all`,
+  `file_write_atomic`), whose loop asks for the whole remainder in one request.
+  macOS refuses a request over INT_MAX bytes with EINVAL, so a buffer over
+  2 GiB − 1 failed there (with `path` untouched, for the atomic one). Both now
+  write through tula's own loop, at most 1 GiB per request, as the readers and
+  the streaming writers have since 1.6.1. The stdlib's loops are unchanged
+  (cyrius issue `2026-11-05-tula-io-loops-one-request-over-int-max-fails-on-macos.md`
+  is open); tula no longer goes through them.
+  - Reproduced on Linux with 1.6.1's probe (a read or write over INT_MAX bytes
+    returns -EINVAL, as on Darwin). There 1.6.1 fails the new `make bigfile` at
+    `tula_write_file_atomic`, and a fix to the atomic writer alone fails it at
+    `tula_write_file`. 1.6.2 passes.
+  - `tula_write_file_atomic` now uses the streaming writers' named temp: a
+    random `<path>.tula-<16 hex>.tmp` created `O_CREAT|O_EXCL`, written,
+    fsync'd and renamed. Its guarantees are unchanged: `path` is untouched on
+    any failure, no temp is left behind, a symlink at `path` is replaced, and an
+    existing file keeps its exact permission bits. Three details change, each
+    toward those guarantees:
+    - a failed `fsync` is an error, and `path` is left as it was (the stdlib
+      ignored it and renamed a file that might not be on disk);
+    - the directory is fsync'd after the rename (best effort), as the streaming
+      writers do, so the rename survives a crash;
+    - the exact mode is set once the bytes are written, not at create, so the
+      temp is never more permissive than its create allowed while it is
+      written (the stdlib widened it first).
+
+    As for the streaming writers, a path within 32 bytes of `PATH_MAX` is
+    `-ENAMETOOLONG`.
+  - `tula_write_file` returns a failed `close` as an error (the stdlib ignored
+    it). It still creates or truncates the file, mode 0644 under the umask.
+
+### Changed
+
+- **macOS is a hard gate.** The `cross-target` job's arm64 macOS leg
+  (`macos-14`) ran green on 1.6.1's final commit: the suites, the consumer,
+  realmodels, bigfile and the fuzzer. It is no longer `experimental`, so a
+  failure there fails CI and the release. x86_64 macOS is still not covered.
+- **`make bigfile` writes the file back out.** After `tula_read_file_into`, the
+  2.36 GB buffer goes through `tula_write_file_atomic`, then `tula_write_file`
+  over the copy, and each copy is compared with the buffer word for word. One
+  copy is on disk at a time. It adds ~11 s (5.4 s and 5.6 s here), which makes
+  the macOS leg the check that both calls handle over INT_MAX bytes.
+- **`stream.tcyr`** (+17 assertions): `tula_write_file` and
+  `tula_write_file_atomic` against `file_write_all` and `file_write_atomic`.
+  - Six sizes from 300,001 bytes down to 0, each replacing a longer file: the
+    same bytes and return values.
+  - Modes: a new file gets the same mode from both; an existing 0600 file and
+    an existing 0666 one keep theirs exactly.
+  - A symlinked target is replaced and its target untouched.
+  - Writing over a directory fails and leaves nothing behind; so does a missing
+    directory, and an over-long path is `-ENAMETOOLONG`.
+
+  Checked by mutation: dropping the mode fix, the `O_TRUNC` or the temp's
+  cleanup each fails the suite.
+- **The streaming writers' named temp** goes through the same two helpers as
+  `tula_write_file_atomic` (create the temp; close, rename and fsync the
+  directory). Their behaviour is unchanged.
+
 ## [1.6.1] - 2026-11-05
 
 **The write path follow-through.** A patch: no new function, dtype or

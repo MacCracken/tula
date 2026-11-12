@@ -3,7 +3,9 @@
 # randomized builders with long names, empty and 0-dim tensors, and payloads
 # bigger than the 64 KiB staging buffer); the atomic replace keeps the old file
 # on failure, leaves no temp behind, keeps the target's mode and replaces a
-# symlink rather than writing through it; tula_file_len and tula_read_file_into.
+# symlink rather than writing through it; tula_file_len and tula_read_file_into;
+# (1.6.2) tula_write_file and tula_write_file_atomic against the stdlib calls
+# they replaced.
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -170,6 +172,137 @@ fn test_write_file_atomic() {
     return 0;
 }
 
+fn mode_of(path): i64 {
+    var st = alloc(144);
+    if (xstat(path, st) != 0) { return 0 - 1; }
+    return load32(st + STAT_MODE) & 0x1FF;
+}
+
+# 1.6.2: tula_write_file and tula_write_file_atomic write through tula's own loop
+# (requests of at most 1 GiB) and temp, no longer the stdlib's file_write_all and
+# file_write_atomic. Differential against those: the same bytes, return values and
+# modes. Sizes shrink, so every write replaces a longer file.
+fn test_write_file_vs_stdlib() {
+    xmkdir("build/test_stream_wf", 0x1ED);
+    var s = alloc(8);
+    store64(s, 4242);
+    var big = 300001;
+    var buf = alloc(big + 8);
+    var k = 0;
+    while (k < big + 8) {
+        store8(buf + k, lcg(s) & 0xFF);
+        k = k + 1;
+    }
+    var sizes = alloc(48);
+    store64(sizes, big);
+    store64(sizes + 8, 65537);
+    store64(sizes + 16, 65536);
+    store64(sizes + 24, 63);
+    store64(sizes + 32, 1);
+    store64(sizes + 40, 0);
+    var pa = "build/test_stream_wf/tula.bin";
+    var pb = "build/test_stream_wf/std.bin";
+    var out = alloc(16);
+    var rets = 0;
+    var same_plain = 0;
+    var same_atomic = 0;
+    var j = 0;
+    while (j < 6) {
+        var n = load64(sizes + j * 8);
+        var src = buf + lcg(s) % 8;
+        if (tula_write_file(pa, src, n) == n) {
+            if (file_write_all(pb, src, n) == n) { rets = rets + 1; }
+        }
+        slurp(pa, n, out);
+        var la = load64(out);
+        var ba = load64(out + 8);
+        slurp(pb, n, out);
+        if (la == n) {
+            if (load64(out) == n) {
+                if (bytes_eq(ba, load64(out + 8), n) == 1) {
+                    if (bytes_eq(ba, src, n) == 1) { same_plain = same_plain + 1; }
+                }
+            }
+        }
+        if (tula_write_file_atomic(pa, src, n) == n) {
+            if (file_write_atomic(pb, src, n) == 0) { rets = rets + 1; }
+        }
+        slurp(pa, n, out);
+        la = load64(out);
+        ba = load64(out + 8);
+        slurp(pb, n, out);
+        if (la == n) {
+            if (load64(out) == n) {
+                if (bytes_eq(ba, load64(out + 8), n) == 1) {
+                    if (bytes_eq(ba, src, n) == 1) { same_atomic = same_atomic + 1; }
+                }
+            }
+        }
+        j = j + 1;
+    }
+    assert_eq(rets, 12, "both return len, as the stdlib calls they replace did (6 sizes, 300,001 to 0 bytes)");
+    assert_eq(same_plain, 6, "tula_write_file == file_write_all, byte for byte, each replacing a longer file");
+    assert_eq(same_atomic, 6, "tula_write_file_atomic == file_write_atomic, byte for byte");
+
+    # modes: a new file, an existing 0600 one, and an existing 0666 one (bits the
+    # umask would strip from a plain create)
+    xunlink(pa);
+    xunlink(pb);
+    tula_write_file(pa, buf, 10);
+    file_write_all(pb, buf, 10);
+    assert_eq(mode_of(pa), mode_of(pb), "tula_write_file creates a file with file_write_all's mode");
+    xunlink(pa);
+    xunlink(pb);
+    tula_write_file_atomic(pa, buf, 10);
+    file_write_atomic(pb, buf, 10);
+    assert_eq(mode_of(pa), mode_of(pb), "tula_write_file_atomic creates a file with file_write_atomic's mode");
+    sys_chmod(pa, 0x180);
+    tula_write_file_atomic(pa, buf, 10);
+    assert_eq(mode_of(pa), 0x180, "an existing 0600 file stays 0600");
+    sys_chmod(pa, 0x1B6);
+    sys_chmod(pb, 0x1B6);
+    tula_write_file_atomic(pa, buf, 10);
+    file_write_atomic(pb, buf, 10);
+    assert_eq(mode_of(pa), 0x1B6, "an existing 0666 file stays 0666, whatever the umask");
+    assert_eq(mode_of(pb), 0x1B6, "... as with file_write_atomic");
+
+    # a symlink at the target is replaced, not written through
+    var victim = "build/test_stream_wf/victim.bin";
+    file_write_all(victim, "untouched", 9);
+    var link = "build/test_stream_wf/link.bin";
+    xunlink(link);
+    xsymlink("victim.bin", link);
+    assert_eq(tula_write_file_atomic(link, buf, 10), 10, "an atomic write to a symlinked path succeeds");
+    var vb = alloc(32);
+    assert_eq(file_read_all(victim, vb, 32), 9, "the link's target keeps its 9 bytes");
+    assert(bytes_eq(vb, "untouched", 9), "... unchanged");
+    assert_eq(file_read_all(link, vb, 32), 10, "the path is now the 10-byte file");
+
+    # failures: a negative errno, the target untouched, no temp left behind
+    xmkdir("build/test_stream_wf_fail", 0x1ED);
+    xmkdir("build/test_stream_wf_fail/adir", 0x1ED);
+    assert(tula_write_file_atomic("build/test_stream_wf_fail/adir", buf, 10) < 0,
+      "an atomic write over a directory fails");
+    assert(tula_write_file("build/test_stream_wf_fail/adir", buf, 10) < 0, "a plain write over a directory fails");
+    assert_eq(count_entries("build/test_stream_wf_fail"), 1, "... and neither leaves anything behind");
+    assert(tula_write_file("build/no_such_dir/z.bin", buf, 10) < 0, "a plain write into a missing directory fails");
+    var lp = alloc(4096);
+    var pre = "build/";
+    k = 0;
+    while (k < 6) {
+        store8(lp + k, load8(pre + k));
+        k = k + 1;
+    }
+    while (k < 4080) {
+        store8(lp + k, 97);
+        k = k + 1;
+    }
+    store8(lp + 4080, 0);
+    assert_eq(tula_write_file_atomic(lp, buf, 10), 0 - 36, "a path too long for its temp name -> -ENAMETOOLONG");
+    xrmdir("build/test_stream_wf_fail/adir");
+    return 0;
+}
+
 fn test_read_into_and_len() {
     var p1 = "build/test_stream_into1.tula";
     var p2 = "build/test_stream_into2.tula";
@@ -284,6 +417,7 @@ fn main(): i64 {
     test_atomic_replace();
     test_mode_and_symlink();
     test_write_file_atomic();
+    test_write_file_vs_stdlib();
     test_read_into_and_len();
     test_empty_builder_streams();
     test_nameless_and_fallback();

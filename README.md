@@ -76,12 +76,16 @@ The full march M0→M5:
   (`O_TMPFILE`) and name it only once it is signed; the writers are fuzzed
   against the in-memory writer; CI runs on aarch64 Linux and macOS too.
 
-**550/550** assertions across 12 suites (meta · names · builder · strict · dtype ·
+- **1.6.2** — macOS is a hard gate; `tula_write_file(_atomic)` handle buffers
+  over 2 GiB there too.
+
+**567/567** assertions across 12 suites (meta · names · builder · strict · dtype ·
 floats · stream · file-io · hardening · round-trip · index · sign) + a
 >2·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on
-aarch64 Linux under qemu. CI adds native aarch64 Linux and macOS runners. Deps: stdlib + **sigil**
+aarch64 Linux under qemu. CI adds native aarch64 Linux and macOS runners, both
+hard gates. Deps: stdlib + **sigil**
 (Ed25519); the cyrius pin lives in `cyrius.cyml`. CI + release workflows in
 place. Post-1.0 changes are additive-only (SemVer). See
 [`docs/api.md`](docs/api.md) and [`docs/development/roadmap.md`](docs/development/roadmap.md).

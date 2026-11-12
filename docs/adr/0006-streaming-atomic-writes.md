@@ -1,6 +1,6 @@
 # 0006 — Big files: stream from caller memory, sign the written file, replace atomically
 
-**Status**: Accepted (amended 1.6.1: nameless temp files on Linux)
+**Status**: Accepted (amended 1.6.1: nameless temp files on Linux; 1.6.2: `tula_write_file_atomic` on tula's own temp)
 **Date**: 2026-11-04
 
 ## Context
@@ -69,9 +69,14 @@ change.
 - **Requests of at most 1 GiB (1.6.1).** Every read and write tula makes asks for
   at most 1 GiB at a time. macOS refuses a read or write over INT_MAX bytes
   outright (EINVAL), where Linux returns a short count, so a single big tensor
-  or a whole-file read failed there.
+  or a whole-file read failed there. Since 1.6.2 that includes `tula_write_file`
+  and `tula_write_file_atomic`, which went through the stdlib's loops before:
+  those ask for everything in one request (an open cyrius issue).
 - **`tula_write_file_atomic(path, buf, len)`** is the same guarantee for an
-  in-memory buffer, delegating to the stdlib's `file_write_atomic`.
+  in-memory buffer, through the same named temp, `fsync`, rename and directory
+  `fsync` (1.6.2; it delegated to the stdlib's `file_write_atomic` before). Like
+  that call, it gives a replaced file the target's exact permission bits, set
+  once the bytes are written, so the temp is never wider while they are.
 - **Reading big files on the heap.** `tula_file_len(path)` returns the total a
   file's header declares, after checking the file really holds it.
   `tula_read_file_into(path, buf, cap)` reads into the caller's buffer. A caller

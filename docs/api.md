@@ -216,7 +216,12 @@ Crypto is `sigil`'s; keys are the caller's (tula owns no key management).
   which the readers then reject.
 - `fn tula_write_file_atomic(path, buf, len) -> len | <0` *(1.4.0)* — crash-safe:
   the bytes go to a unique sibling temp file, which is fsync'd and renamed over
-  `path` (the stdlib's `file_write_atomic`). On failure `path` is untouched.
+  `path`, then the directory is fsync'd. On failure `path` is untouched and no
+  temp is left. An existing file keeps its exact permission bits; a symlink at
+  `path` is replaced, not written through.
+
+Both write in requests of at most 1 GiB (1.6.2; through the stdlib before), so a
+buffer over INT_MAX bytes works on macOS, which refuses a bigger request.
 - `fn tula_builder_write_file(b, path) -> file_len | <0` *(1.4.0, ADR 0006)* —
   **stream** the builder's file to disk: exactly the bytes `tula_builder_finish(b)`
   returns, never held in memory, so there is no 2 GiB cap. The header, manifest
