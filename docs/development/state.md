@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.6.2** (`tula_version_int()` returns `10602`). 1.0.1–1.1.1 are
+VERSION is **1.7.0** (`tula_version_int()` returns `10700`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -48,16 +48,15 @@ checks the writers against `finish`; CI gains native aarch64 Linux and macOS
 runners. **1.6.2** (patch): the macOS leg is a hard gate, and `tula_write_file` /
 `tula_write_file_atomic` write through tula's own loop (at most 1 GiB per
 request), so buffers over INT_MAX bytes work on macOS too.
-**1.7.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.6.2):
-integer and boolean dtypes (ADR 0009), `TULA_DT_I16/I32/I64/U8/BOOL` = codes
-7–11, stored raw; strict rejects a BOOL byte other than 0 or 1 with
+**1.7.0 — integer and boolean dtypes** (ADR 0009):
+`TULA_DT_I16/I32/I64/U8/BOOL` = codes 7–11, stored raw; strict rejects a BOOL byte other than 0 or 1 with
 `TULA_ERR_VALUE` (19). 1.6.2 reads such files (open, verify, names, metadata);
 its strict says `TULA_ERR_DTYPE`.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.7.0, unreleased)
+## Tests, fuzz, gates (1.7.0)
 
 **628 assertions** across 13 suites, all green: `meta.tcyr` 98, `names.tcyr` 77,
 `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67, `ints.tcyr` 61 (1.7.0),
@@ -136,7 +135,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: cut 1.7.0 (integer/boolean dtypes, in `[Unreleased]`), then 1.8.0 FP8
-and int4 (codes from 12). Later: 1.9.x throughput; the 1.x.x research list; and v2 candidates
+Next: 1.8.0 FP8 and int4 (codes from 12); 1.7.x patches only for fixes
+importers turn up. Later: 1.9.x throughput; the 1.x.x research list; and v2 candidates
 ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

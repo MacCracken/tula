@@ -7,7 +7,9 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
-**Integer and boolean dtypes** (1.7.0). An additive MINOR with no format change
+## [1.7.0] - 2026-11-12
+
+**Integer and boolean dtypes.** An additive MINOR with no format change
 (ADR 0009). A checkpoint's ids, masks, buffers and packed integer codes can be
 stored losslessly and under their own types. A file that doesn't use them is
 byte for byte what 1.6.2 writes. Diffed against 1.6.2 on 400 random builders
