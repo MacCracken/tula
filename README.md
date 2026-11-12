@@ -79,9 +79,14 @@ The full march M0→M5:
 - **1.6.2** — macOS is a hard gate; `tula_write_file(_atomic)` handle buffers
   over 2 GiB there too.
 
-**567/567** assertions across 12 suites (meta · names · builder · strict · dtype ·
-floats · stream · file-io · hardening · round-trip · index · sign) + a
->2·10⁶-iteration guard-page fuzz harness (which also checks the streaming
+- **1.7.0** — integer and boolean dtypes: `TULA_DT_I16/I32/I64/U8/BOOL`, stored
+  raw, so ids, masks, buffers and GPTQ's packed int32 tensors keep their types.
+  Strict rejects a BOOL byte other than 0 or 1 (`TULA_ERR_VALUE`). The
+  real-model gate gains a GPTQ inventory.
+
+**628/628** assertions across 13 suites (meta · names · stream · builder · strict ·
+ints · dtype · floats · file-io · hardening · round-trip · index · sign) + a
+>3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on
 aarch64 Linux under qemu. CI adds native aarch64 Linux and macOS runners, both
@@ -94,7 +99,7 @@ place. Post-1.0 changes are additive-only (SemVer). See
 
 ```sh
 make build    # link-check the library via programs/smoke.cyr
-make test     # run tests/tcyr/*.tcyr (12 suites)
+make test     # run tests/tcyr/*.tcyr (13 suites)
 make dist     # regenerate dist/tula.cyr for consumers
 make example  # build + run the end-to-end consumer (examples/consumer.cyr)
 make fuzz     # reader + streaming-writer fuzz harness (>10^6 iters)

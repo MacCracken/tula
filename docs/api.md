@@ -44,9 +44,34 @@ SIGNATURE (Ed25519, 64 B) at sig_off = payload_off + payload_len, covering [0, s
 | `TULA_DT_F32`     | 4 | IEEE binary32, LE, `data_len = nelems*4` *(1.3.0)* |
 | `TULA_DT_F16`     | 5 | IEEE binary16, LE, `data_len = nelems*2` *(1.3.0)* |
 | `TULA_DT_BF16`    | 6 | bfloat16 (binary32's top half), LE, `data_len = nelems*2` *(1.3.0)* |
+| `TULA_DT_I16`     | 7 | signed 16-bit, two's complement, LE, `data_len = nelems*2` *(1.7.0)* |
+| `TULA_DT_I32`     | 8 | signed 32-bit, two's complement, LE, `data_len = nelems*4` *(1.7.0)* |
+| `TULA_DT_I64`     | 9 | signed 64-bit, two's complement, LE, `data_len = nelems*8` *(1.7.0)* |
+| `TULA_DT_U8`      | 10 | unsigned 8-bit, `data_len = nelems` *(1.7.0)* |
+| `TULA_DT_BOOL`    | 11 | one byte each, 0 or 1 only, `data_len = nelems` *(1.7.0)* |
 
 Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 `"<name>.scale"` (ADR 0002) — the codec never interprets it.
+
+**Integer and boolean tensors** *(1.7.0, ADR 0009)* are raw values with no
+helpers: element `i` is one load at `p + i × width` (`p` =
+`tula_entry_data(r, e)`). Signed 8-bit is `TULA_DT_INT8`. In cyrius, `load8` /
+`load16` / `load32` zero-extend and `>>` is a logical shift, so an I16 or I32 is
+sign-extended by subtraction:
+
+```cyrius
+var v16 = load16(p + i * 2);
+v16 = v16 - ((v16 & 0x8000) << 1);          # I16
+var v32 = load32(p + i * 4);
+v32 = v32 - ((v32 & 0x80000000) << 1);      # I32
+var v64 = load64(p + i * 8);                 # I64: already signed
+var u = load8(p + i);                        # U8, or BOOL (0 / 1 once strict passed)
+```
+
+`tula_validate_strict` rejects a BOOL byte other than 0 or 1 (`TULA_ERR_VALUE`);
+the plain reader and `tula_entry_payload_ok` check sizes only. A 1.2–1.6 strict
+validator returns `TULA_ERR_DTYPE` for these dtypes; its plain reader opens,
+verifies and resolves the file as before.
 
 ### Long names (1.3.0, ADR 0004)
 
@@ -91,12 +116,15 @@ are well-formed UTF-8 text, no NUL, ≤ 16 MiB. A table holds ≤ 4,096 pairs an
 | | | | `TULA_ERR_DTYPE` | 16 |
 | | | | `TULA_ERR_NAMES` | 17 |
 | | | | `TULA_ERR_META` | 18 |
+| | | | `TULA_ERR_VALUE` | 19 |
 | | | | `TULA_ERR_OTHER` | 99 |
 
 Codes 13–16 are new in 1.2.0, returned by the checked add and the strict
 validator. 17 is new in 1.3.0 (a malformed names table, from the strict
 validator). 18 is new in 1.6.0 (a bad metadata key or value from the writer, or
-a malformed metadata table from the strict validator).
+a malformed metadata table from the strict validator). 19 is new in 1.7.0 (a
+payload value its dtype doesn't allow, from the strict validator: a BOOL byte
+other than 0 or 1).
 
 ---
 
@@ -124,8 +152,9 @@ a malformed metadata table from the strict validator).
   (`TULA_ERR_NAME_LONG`, instead of truncating it) and a name the builder already
   holds, from either kind of add (`TULA_ERR_DUP_NAME`). The check is O(1) per
   add, through a name index. A builder fed only through this, with each
-  `data_len` equal to `tula_packed_len(dtype, nelems)`, writes files
-  `tula_validate_strict` accepts.
+  `data_len` equal to `tula_packed_len(dtype, nelems)` and *(1.7.0)* each BOOL
+  payload holding only 0 and 1 bytes, writes files `tula_validate_strict`
+  accepts. Payloads are never read at add.
 - `fn tula_builder_add_long(b, name, dtype, shape, ndim, data, data_len) -> 0 |
   TULA_ERR_*` *(1.3.0)* — names of **any length**. A name of 47 chars or fewer
   is added exactly as `tula_builder_add_checked` adds it. A longer name is
@@ -279,6 +308,8 @@ its total opens, and the readers take exactly the declared bytes.
   - `TULA_ERR_META` *(1.6.0)*: a metadata table is present but not canonical.
     That means keys out of order or repeated, a bad key, a value that isn't UTF-8
     or holds a NUL, not packed in order, or past the caps.
+  - `TULA_ERR_VALUE` *(1.7.0)*: a BOOL byte other than 0 or 1 (ADR 0009). The
+    only rule that reads tensor values: a word compare per 8 elements, ~4 GB/s.
   - `TULA_ERR_DUP_NAME`: two tensors share a name (for long names, a key).
   - `TULA_ERR_OOM`: no memory for the duplicate check (over 512 tensors).
 
@@ -370,7 +401,8 @@ done in integer arithmetic, so the bytes never depend on the process's FP mode.
   dst_f64) -> n`, and the same for `f16` / `bf16` (`-> n*2`). Little-endian.
 
 **Payload-length guard** (untrusted-input discipline):
-- `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length.
+- `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length
+  (`nelems × width` for the raw dtypes, including 1.7.0's integers and BOOL).
 - `fn tula_entry_payload_ok(e) -> 1 | 0` — overflow-safe check that an entry's
   `data_len` is large enough for its dtype+shape. **Run it before any unpack on a
   foreign entry** (a lying `shape` could otherwise drive an over-read), and on

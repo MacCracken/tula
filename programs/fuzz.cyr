@@ -36,6 +36,13 @@
 #      the named temp at random. The file must equal tula_builder_finish(_signed)
 #      byte for byte, and a builder fed only canonical adds must give a file
 #      tula_validate_strict accepts. No temp file may be left behind.
+#   9. (1.7.0) the integer and boolean dtypes (ADR 0009): the consumer discipline
+#      reads every element of each I16/I32/I64/U8/BOOL entry payload_ok passes,
+#      and on a strict accept brute force must find every BOOL byte 0 or 1.
+#      Phase I mutates a canonical file holding all five, aiming at the BOOL
+#      payloads, the dtype fields and the shapes. Phase H's builders use them
+#      too: a BOOL payload comes from a pool of 0/1 bytes, or now and then from
+#      random bytes (then the builder doesn't count as canonical).
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -58,6 +65,7 @@ enum FuzzCfg {
     FZ_LONG_ITERS   = 300000;    # phase F: a long-name file, mutations aimed at its table
     FZ_META_ITERS   = 300000;    # phase G: a metadata + names file, mutations aimed at the metadata
     FZ_WRITE_ITERS  = 1500;      # phase H: random builders through the streaming writers
+    FZ_INT_ITERS    = 300000;    # phase I: the 1.7.0 dtypes, mutations aimed at BOOL bytes, dtypes, shapes
     FZ_POOL         = 135168;    # phase H: random payload bytes (> the 64 KiB stage + 60000)
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
@@ -154,10 +162,30 @@ fn place(guard, src, len): i64 {
     return p;
 }
 
+# The bytes n elements of dtype dt take, from the fuzzer's own table (1.7.0), so
+# a wrong width in tula_packed_len can't hide behind itself: payload_ok and the
+# brute-force strict check are both held to it. -1 for an unknown dtype.
+fn oracle_len(dt, n): i64 {
+    if (dt == 0) { return n * 8; }          # f64
+    if (dt == 1) { return n; }              # int8
+    if (dt == 2) { return (n + 3) / 4; }    # ternary, 4 per byte
+    if (dt == 3) { return (n + 1) / 2; }    # nf4, 2 per byte
+    if (dt == 4) { return n * 4; }          # f32
+    if (dt == 5) { return n * 2; }          # f16
+    if (dt == 6) { return n * 2; }          # bf16
+    if (dt == 7) { return n * 2; }          # i16
+    if (dt == 8) { return n * 4; }          # i32
+    if (dt == 9) { return n * 8; }          # i64
+    if (dt == 10) { return n; }             # u8
+    if (dt == 11) { return n; }             # bool
+    return 0 - 1;
+}
+
 # The consumer discipline on an opened buffer: every entry tula_entry_payload_ok
 # passes is unpacked with its dtype's helper (f64 is read word by word). Returns
 # the number of entries unpacked; an element count the guard said was safe but
-# that exceeds what the buffer can hold is an invariant breach (st + 16).
+# that exceeds what the buffer can hold, or (1.7.0) a data_len shorter than the
+# oracle's size for the shape, is an invariant breach (st + 16).
 fn consume(r, st, out, scl): i64 {
     var done = 0;
     var c = tula_count(r);
@@ -167,13 +195,14 @@ fn consume(r, st, out, scl): i64 {
         var dt = tula_entry_dtype(e);
         var nd = tula_entry_ndim(e);
         var known = 0;
-        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_BF16) { known = 1; } }
+        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_BOOL) { known = 1; } }
         if (known == 1) {
             if (nd > 0) {
                 if (tula_entry_payload_ok(e) == 1) {
                     var n = 1;
                     var k = 0;
                     while (k < nd) { n = n * tula_entry_dim(e, k); k = k + 1; }
+                    if (tula_entry_data_len(e) < oracle_len(dt, n)) { store64(st + 16, load64(st + 16) + 1); }
                     if (n > FZ_OUT_ELEMS) {
                         store64(st + 16, load64(st + 16) + 1);
                     } else {
@@ -190,6 +219,20 @@ fn consume(r, st, out, scl): i64 {
                         if (dt == TULA_DT_F32)     { tula_f32_unpack(p, n, out); }
                         if (dt == TULA_DT_F16)     { tula_f16_unpack(p, n, out); }
                         if (dt == TULA_DT_BF16)    { tula_bf16_unpack(p, n, out); }
+                        if (dt >= TULA_DT_I16) {
+                            # 1.7.0: raw integers and bools; every element is read
+                            var wd = tula_packed_len(dt, 1);
+                            var acc = 0;
+                            var x = 0;
+                            while (x < n) {
+                                if (wd == 1) { acc = acc + load8(p + x); }
+                                if (wd == 2) { acc = acc + load16(p + x * 2); }
+                                if (wd == 4) { acc = acc + load32(p + x * 4); }
+                                if (wd == 8) { acc = acc + load64(p + x * 8); }
+                                x = x + 1;
+                            }
+                            store64(out, acc);
+                        }
                         done = done + 1;
                     }
                 }
@@ -275,6 +318,41 @@ fn build_meta_base(): i64 {
     return tula_builder_finish(b);
 }
 
+# A canonical file with the 1.7.0 dtypes (ADR 0009): i64 [6], i32 [2,4], i16 [5],
+# u8 [7], bool [3,5], a 0-dim bool, and an f16 [3] beside them.
+fn build_int_base(): i64 {
+    var b = tula_builder_new();
+    var sh = alloc(16);
+    var d = alloc(128);
+    var k = 0;
+    while (k < 128) {
+        store8(d + k, (k * 37 + 11) & 0xFF);
+        k = k + 1;
+    }
+    var bl = alloc(16);
+    k = 0;
+    while (k < 16) {
+        store8(bl + k, k & 1);
+        k = k + 1;
+    }
+    store64(sh, 6);
+    tula_builder_add_checked(b, "ids", TULA_DT_I64, sh, 1, d, 48);
+    store64(sh, 2);
+    store64(sh + 8, 4);
+    tula_builder_add_checked(b, "qweight", TULA_DT_I32, sh, 2, d, 32);
+    store64(sh, 5);
+    tula_builder_add_checked(b, "codes", TULA_DT_I16, sh, 1, d, 10);
+    store64(sh, 7);
+    tula_builder_add_checked(b, "bytes", TULA_DT_U8, sh, 1, d, 7);
+    store64(sh, 3);
+    store64(sh + 8, 5);
+    tula_builder_add_checked(b, "mask", TULA_DT_BOOL, sh, 2, bl, 15);
+    tula_builder_add_checked(b, "flag", TULA_DT_BOOL, sh, 0, bl + 1, 1);
+    store64(sh, 3);
+    tula_builder_add_checked(b, "w", TULA_DT_F16, sh, 1, d, 6);
+    return tula_builder_finish(b);
+}
+
 # FZ_STRICT_N int8 [1] tensors "t00".."t39", through the checked add: canonical.
 fn build_strict_base(): i64 {
     var b = tula_builder_new();
@@ -297,10 +375,11 @@ fn build_strict_base(): i64 {
 
 # Invariant 4: run the strict validator on an opened buffer; when it accepts,
 # check by brute force that it was right. st+56 counts strict accepts, st+64
-# strict DUP_NAME verdicts, st+16 breaches.
+# strict DUP_NAME verdicts, st+96 strict VALUE verdicts (1.7.0), st+16 breaches.
 fn strict_check(r, len, st): i64 {
     var rc = tula_validate_strict(r, len);
     if (rc == TULA_ERR_DUP_NAME) { store64(st + 64, load64(st + 64) + 1); }
+    if (rc == TULA_ERR_VALUE) { store64(st + 96, load64(st + 96) + 1); }
     if (rc != TULA_OK) { return 0; }
     store64(st + 56, load64(st + 56) + 1);
     var ok = 1;
@@ -313,6 +392,16 @@ fn strict_check(r, len, st): i64 {
         var n = tula_entry_nelems(e);
         if (n < 0) { ok = 0; }
         if (tula_entry_data_len(e) != tula_packed_len(tula_entry_dtype(e), n)) { ok = 0; }
+        if (tula_entry_data_len(e) != oracle_len(tula_entry_dtype(e), n)) { ok = 0; }
+        if (tula_entry_dtype(e) == TULA_DT_BOOL) {
+            var bp = tula_entry_data(r, e);
+            var bl = tula_entry_data_len(e);
+            var bz = 0;
+            while (bz < bl) {
+                if (load8(bp + bz) > 1) { ok = 0; }
+                bz = bz + 1;
+            }
+        }
         var j = i + 1;
         while (j < c) {
             if (streq(tula_entry_name(e), tula_entry_name(tula_entry(r, j)))) { ok = 0; }
@@ -502,8 +591,9 @@ fn rand_value(s, vb): i64 {
 # A random builder: up to 10 steps, each an add (plain, checked or long, in
 # random proportion) or a metadata set, then, one builder in 24, an int8 tensor
 # of 65536..125535 bytes. *canon = 1 when every add that succeeded was a checked
-# or long add of a known dtype with its packed length, so the file is canonical.
-fn rand_builder(s, pool, nm, vb, shape, ne, canon): i64 {
+# or long add of a known dtype with its packed length (and, for BOOL, a payload
+# from bpool's 0/1 bytes), so the file is canonical.
+fn rand_builder(s, pool, bpool, nm, vb, shape, ne, canon): i64 {
     var b = tula_builder_new();
     if (rng_below(s, 10) == 0) { b = tula_builder_new_cap(1 + rng_below(s, 4)); }
     store64(canon, 1);
@@ -525,7 +615,7 @@ fn rand_builder(s, pool, nm, vb, shape, ne, canon): i64 {
         } else {
             rand_name(s, nm);
             var nd = rand_shape(s, shape, ne);
-            var dt = rng_below(s, 8);                     # 7: no such dtype
+            var dt = rng_below(s, 13);                    # 12: no such dtype (1.7.0 took 7..11)
             var dl = tula_packed_len(dt, load64(ne));
             var exact = 1;
             if (dl < 0) { dl = rng_below(s, 64); exact = 0; }
@@ -534,6 +624,10 @@ fn rand_builder(s, pool, nm, vb, shape, ne, canon): i64 {
                 if (rng_below(s, 2) == 0) { dl = rng_below(s, 300); exact = 0; }
             }
             var data = pool + rng_below(s, FZ_POOL - dl);
+            if (dt == TULA_DT_BOOL) {
+                if (rng_below(s, 8) == 0) { exact = 0; }   # random bytes: not canonical
+                else { data = bpool + rng_below(s, FZ_POOL - dl); }
+            }
             var rc = 0;
             if (kind == 0) { rc = tula_builder_add(b, nm, dt, shape, nd, data, dl); }
             if (kind == 1) { rc = tula_builder_add_checked(b, nm, dt, shape, nd, data, dl); }
@@ -576,7 +670,7 @@ fn main(): i64 {
     while (z < 16) { store64(st + z * 8, 0); z = z + 1; }
     # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
     # +56 strict accepted  +64 strict DUP_NAME  +72 stream writes  +80 nameless
-    # +88 canonical builders
+    # +88 canonical builders  +96 strict VALUE (1.7.0)
 
     var guard = guard_region();
     if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
@@ -786,6 +880,9 @@ fn main(): i64 {
     var pool = alloc(FZ_POOL);
     z = 0;
     while (z < FZ_POOL / 8) { store64(pool + z * 8, rng_next(s)); z = z + 1; }
+    var bpool = alloc(FZ_POOL);   # 0/1 bytes: canonical BOOL payloads (1.7.0)
+    z = 0;
+    while (z < FZ_POOL / 8) { store64(bpool + z * 8, rng_next(s) & 0x0101010101010101); z = z + 1; }
     var wcap = FZ_POOL + 65536;
     var wbuf = alloc(wcap);
     var nm = alloc(160);
@@ -795,7 +892,7 @@ fn main(): i64 {
     var canon = alloc(8);
     var h = 0;
     while (h < FZ_WRITE_ITERS) {
-        var bw = rand_builder(s, pool, nm, vb, wshape, ne, canon);
+        var bw = rand_builder(s, pool, bpool, nm, vb, wshape, ne, canon);
         var signed = 0;
         if (rng_below(s, 6) == 0) { signed = 1; }
         var want = 0;
@@ -826,6 +923,48 @@ fn main(): i64 {
     # every temp was renamed into place or removed: the directory holds the target only
     if (vec_len(dir_list(str_from("build/fuzz_write"))) != 1) { store64(st + 16, load64(st + 16) + 1); }
 
+    # ---- phase I (1.7.0): the integer and boolean dtypes; mutations aimed at
+    #      the BOOL payloads, the dtype fields and the shapes ----
+    var bufi = build_int_base();
+    var ilen = tula_total_len(bufi);
+    var icount = tula_count(bufi);
+    var ipay = load64(bufi + 32);
+    var ii = 0;
+    while (ii < FZ_INT_ITERS) {
+        memcpy_n(scratch, bufi, ilen);
+        var nmi = 1 + rng_below(s, 3);
+        var mi = 0;
+        while (mi < nmi) {
+            var ek = rng_below(s, icount);
+            var ei = scratch + 64 + ek * 144;
+            var eo = bufi + 64 + ek * 144;                # offsets from the pristine entry
+            var how = rng_below(s, 6);
+            if (how == 0) { mutate(s, scratch, ilen); }
+            if (how == 1) { store64(ei + 48, rng_below(s, 14)); }                         # any code; 12, 13 unknown
+            if (how == 2) { store64(ei + 64 + rng_below(s, 2) * 8, rng_below(s, 9)); }    # a dim
+            if (how == 3) { store64(ei + 136, load64(eo + 136) + rng_below(s, 3) - 1); }  # data_len -1 / 0 / +1
+            if (how >= 4) {
+                # a payload byte (a BOOL's, mostly): 0 or 1 half the time
+                var pdl = load64(eo + 136);
+                if (pdl > 0) {
+                    var pv = rng_below(s, 2);
+                    if (rng_below(s, 2) == 0) { pv = rng_below(s, 256); }
+                    store8(scratch + ipay + load64(eo + 128) + rng_below(s, pdl), pv);
+                }
+            }
+            mi = mi + 1;
+        }
+        var ri = tula_open(place(guard, scratch, ilen), ilen);
+        if (ri != 0) {
+            store64(st + 8, load64(st + 8) + 1);
+            if (check_opened(ri, ilen) == 0) { store64(st + 16, load64(st + 16) + 1); }
+            store64(st + 48, load64(st + 48) + consume(ri, st, out, scl));
+            strict_check(ri, ilen, st);
+        }
+        store64(st + 0, load64(st + 0) + 1);
+        ii = ii + 1;
+    }
+
     var t1 = now_ns();
 
     sput("tula fuzz — reader hardening (M3) under hostile input\n");
@@ -837,6 +976,7 @@ fn main(): i64 {
     kv("  unpacked entries   : ", load64(st + 48));
     kv("  strict accepted    : ", load64(st + 56));
     kv("  strict DUP_NAME    : ", load64(st + 64));
+    kv("  strict VALUE       : ", load64(st + 96));
     kv("  stream writes      : ", load64(st + 72));
     kv("    nameless         : ", load64(st + 80));
     kv("    canonical        : ", load64(st + 88));

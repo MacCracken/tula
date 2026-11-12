@@ -7,6 +7,86 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+**Integer and boolean dtypes** (1.7.0). An additive MINOR with no format change
+(ADR 0009). A checkpoint's ids, masks, buffers and packed integer codes can be
+stored losslessly and under their own types. A file that doesn't use them is
+byte for byte what 1.6.2 writes. Diffed against 1.6.2 on 400 random builders
+(dtypes 0–6 and an unknown one) and 10,000 mutations of them:
+- the same bytes from `finish` and `finish_signed`, and the same return code
+  from every add, metadata set and verify;
+- the same verdicts, `payload_ok`, `nelems`, find-name and index answers, and
+  metadata;
+- the only differences are the expected ones, for mutations that set a dtype
+  field to 7–11.
+
+**1.6.2 reads 1.7 files**: it opens them, verifies them, and resolves their long
+names and metadata; its strict validator returns `TULA_ERR_DTYPE` for the new
+codes, as 1.2 did for ADR 0005's floats.
+
+### Added
+
+- **`TULA_DT_I16` (7), `TULA_DT_I32` (8), `TULA_DT_I64` (9), `TULA_DT_U8` (10),
+  `TULA_DT_BOOL` (11)** (ADR 0009). Raw little-endian, `data_len = nelems ×
+  width`; I16/I32/I64 are two's complement, BOOL is one byte, 0 or 1.
+  - Signed 8-bit stays `TULA_DT_INT8`: its bytes are already an int8 tensor.
+  - No conversion helpers: each element is one load. `docs/api.md` shows the
+    sign extension for I16 and I32 (cyrius's loads zero-extend, and `>>` is
+    logical, so `(v << 48) >> 48` doesn't sign-extend).
+  - `tula_packed_len`, `tula_entry_payload_ok` and `tula_validate_strict` know
+    the widths.
+- **`TULA_ERR_VALUE` (19)**: a payload value its dtype doesn't allow.
+  `tula_validate_strict` returns it for a BOOL byte other than 0 or 1. It is the
+  first strict rule that reads tensor values: one 64-bit compare per 8 elements,
+  ~4 GB/s (`docs/benchmarks.md`). Padding is checked first, so a bad pad byte
+  after a mask is still `TULA_ERR_LAYOUT`.
+- **ADR 0009** records the codes, the encodings, the BOOL rule, and what was left
+  out: bit-packed BOOL, a lenient "nonzero is true", U16/U32/U64, a second
+  int8 code, element-read helpers, and converting integers to f64.
+
+### Changed
+
+- **`tula_builder_add_checked`'s promise** now also needs each BOOL payload to
+  hold only 0 and 1 bytes (it never reads payloads), as it already needed each
+  `data_len` to be the packed length.
+- **`tests/tcyr/ints.tcyr`** (new, 61 assertions):
+  - the codes and widths;
+  - a round trip at each dtype's extremes (INT16/32/64 min and max, 2⁵³ + 1,
+    255), read back with the documented sign extension;
+  - the exact-size rule, where a short or long payload is `TULA_ERR_SHAPE`;
+  - each of a 13-byte mask's bytes set to all 256 values: strict accepts
+    exactly 0 and 1;
+  - a 0-dim and an empty BOOL;
+  - a 1 MiB mask with a bad first and a bad last byte;
+  - `payload_ok`;
+  - the streaming writer equal to `finish`, with a long name.
+- **Two tests used 7 and 9 as "unknown" dtypes** (`floats.tcyr`,
+  `strict.tcyr`); they now use 12 (the next free code) and 99.
+- **The fuzzer** (3,204,500 iterations, 0 faults):
+  - its consumer discipline reads every element of the new dtypes;
+  - its brute-force strict check requires BOOL bytes of 0 or 1;
+  - phase H's builders draw from all twelve dtypes, with 12 as the unknown
+    one, and BOOL payloads from a 0/1 pool;
+  - a new phase I makes 300,000 mutations of a file holding all five, aimed at
+    BOOL bytes, dtype fields and shapes;
+  - it now holds `data_len` to its own size table, so a wrong width in
+    `tula_packed_len` can't hide behind itself. Before this, a seeded I64 width
+    bug passed the fuzzer: the over-read stayed inside the buffer.
+
+  89,657 strict accepts, all confirmed by brute force (1.6.2: 26,968), and
+  13,694 BOOL rejections. Three seeded bugs are each caught: strict's BOOL check
+  removed (11,454 breaches), its mask widened to allow 2 and 3 (82), and an I64
+  width of 4 (6,400).
+- **`make realmodels`** gains a sixth inventory: Llama-2-7B in AutoGPTQ's 4-bit,
+  group-128 layout. Each linear layer is `qweight` I32 [in/8, out], `qzeros` I32
+  [in/128, out/8], `scales` F16 [in/128, out] and `g_idx` I32 [in]; with the
+  F16 embeddings, norms and `lm_head` that's 963 tensors, written signed,
+  strict-validated, verified and resolved by name.
+- **The reference consumer** stores a BERT-style `position_ids` (I64), an
+  attention mask (BOOL) and signed I32 offsets, and reads them back.
+- **Bench**: strict over a 16 MiB BOOL tensor, 4.0 ms; the same bytes as U8,
+  1 µs. Strict over 200 tensors is unchanged from 1.6.2 on the same machine.
+- **Roadmap**: 1.7.0 is done. FP8 and int4 (1.8.0) take codes from 12.
+
 ## [1.6.2] - 2026-11-12
 
 **macOS is a hard gate.** A patch: no new function, dtype or convention, and no

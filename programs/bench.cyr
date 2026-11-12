@@ -308,6 +308,37 @@ fn main(): i64 {
     }
     report_op("strict (256) : ", BN_VAL_REP, fsmin);
 
+    # ---- strict over a 16 MiB mask (1.7.0): BOOL's 0/1 rule vs U8, which has none ----
+    var mn = 16777216;
+    var md = alloc(mn + 8);
+    var mz = 0;
+    while (mz < mn / 8) {
+        store64(md + mz * 8, 0x0100010001000101);
+        mz = mz + 1;
+    }
+    var mshape = alloc(8);
+    store64(mshape, mn);
+    var mbb = tula_builder_new();
+    tula_builder_add_checked(mbb, "mask", TULA_DT_BOOL, mshape, 1, md, mn);
+    var bbuf = tula_builder_finish(mbb);
+    var mbu = tula_builder_new();
+    tula_builder_add_checked(mbu, "bytes", TULA_DT_U8, mshape, 1, md, mn);
+    var ubuf = tula_builder_finish(mbu);
+    var mbmin = 0;
+    var mumin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var mtb = now_ns();
+        chk = chk + tula_validate_strict(bbuf, tula_total_len(bbuf));
+        mbmin = min_of(mbmin, round, now_ns() - mtb);
+        var mtu = now_ns();
+        chk = chk + tula_validate_strict(ubuf, tula_total_len(ubuf));
+        mumin = min_of(mumin, round, now_ns() - mtu);
+        round = round + 1;
+    }
+    report_mb("strict BOOL 16M : ", mn, mbmin);
+    report_mb("strict U8 16M   : ", mn, mumin);
+
     # ---- builder add: plain vs checked (1.2.0; name index lookup), 256 adds ----
     var shape1 = alloc(8);
     store64(shape1, 1);

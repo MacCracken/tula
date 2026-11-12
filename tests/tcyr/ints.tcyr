@@ -1,0 +1,305 @@
+# tests/tcyr/ints.tcyr — the 1.7.0 integer and boolean dtypes (ADR 0009): I16,
+# I32, I64, U8 and BOOL, stored raw little-endian. Codes and widths; a round trip
+# through the builder, the file and the streaming writers at each dtype's extreme
+# values, read back with the sign extension docs/api.md shows; the strict rules
+# (exact sizes, BOOL bytes 0/1 only, TULA_ERR_VALUE) with a bad byte at every
+# position; tula_entry_payload_ok; and the 0-dim and empty cases.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn shape2(a, b): i64 {
+    var s = alloc(16);
+    store64(s, a);
+    store64(s + 8, b);
+    return s;
+}
+
+fn strict(buf): i64 {
+    return tula_validate_strict(buf, tula_total_len(buf));
+}
+
+# Sign-extend a zero-extended 16- or 32-bit load (cyrius's >> is logical).
+fn sx16(v): i64 {
+    return v - ((v & 0x8000) << 1);
+}
+
+fn sx32(v): i64 {
+    return v - ((v & 0x80000000) << 1);
+}
+
+fn test_codes_and_widths() {
+    assert_eq(TULA_DT_I16, 7, "I16 is code 7");
+    assert_eq(TULA_DT_I32, 8, "I32 is code 8");
+    assert_eq(TULA_DT_I64, 9, "I64 is code 9");
+    assert_eq(TULA_DT_U8, 10, "U8 is code 10");
+    assert_eq(TULA_DT_BOOL, 11, "BOOL is code 11");
+    assert_eq(tula_packed_len(TULA_DT_I16, 10), 20, "i16: 2 bytes each");
+    assert_eq(tula_packed_len(TULA_DT_I32, 10), 40, "i32: 4 bytes each");
+    assert_eq(tula_packed_len(TULA_DT_I64, 10), 80, "i64: 8 bytes each");
+    assert_eq(tula_packed_len(TULA_DT_U8, 10), 10, "u8: 1 byte each");
+    assert_eq(tula_packed_len(TULA_DT_BOOL, 10), 10, "bool: 1 byte each");
+    assert_eq(tula_packed_len(TULA_DT_BOOL, 0), 0, "... and 0 elements take 0 bytes");
+    assert_eq(TULA_ERR_VALUE, 19, "TULA_ERR_VALUE is 19");
+    assert(streq(tula_err_name(TULA_ERR_VALUE), "payload value invalid for its dtype"), "... and has a name");
+    return 0;
+}
+
+# Payloads at each dtype's extremes: i16 [5], i32 [2,3], i64 [4], u8 [3],
+# bool [13] (odd lengths: every padding width).
+fn i16_data(): i64 {
+    var p = alloc(16);
+    store16(p, 0x8000);        # -32768
+    store16(p + 2, 0x7FFF);    # 32767
+    store16(p + 4, 0xFFFF);    # -1
+    store16(p + 6, 0);
+    store16(p + 8, 1234);
+    return p;
+}
+
+fn i32_data(): i64 {
+    var p = alloc(24);
+    store32(p, 0x80000000);       # INT32_MIN
+    store32(p + 4, 0x7FFFFFFF);   # INT32_MAX
+    store32(p + 8, 0xFFFFFFFE);   # -2
+    store32(p + 12, 0);
+    store32(p + 16, 1);
+    store32(p + 20, 0x00010000);  # 65536
+    return p;
+}
+
+fn i64_data(): i64 {
+    var p = alloc(32);
+    store64(p, 0x8000000000000000);       # INT64_MIN
+    store64(p + 8, 0x7FFFFFFFFFFFFFFF);   # INT64_MAX
+    store64(p + 16, 9007199254740993);    # 2^53 + 1: not exact as an f64
+    store64(p + 24, 0 - 1);
+    return p;
+}
+
+fn u8_data(): i64 {
+    var p = alloc(8);
+    store8(p, 0);
+    store8(p + 1, 255);
+    store8(p + 2, 128);
+    return p;
+}
+
+fn bool_data(n): i64 {
+    var p = alloc(n + 8);
+    var i = 0;
+    while (i < n) {
+        store8(p + i, (i * 7 + 3) % 3 % 2);   # a mix of 0 and 1
+        i = i + 1;
+    }
+    return p;
+}
+
+fn int_builder(): i64 {
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "i16", TULA_DT_I16, shape1(5), 1, i16_data(), 10);
+    tula_builder_add_checked(b, "i32", TULA_DT_I32, shape2(2, 3), 2, i32_data(), 24);
+    tula_builder_add_checked(b, "i64", TULA_DT_I64, shape1(4), 1, i64_data(), 32);
+    tula_builder_add_checked(b, "u8", TULA_DT_U8, shape1(3), 1, u8_data(), 3);
+    tula_builder_add_checked(b, "mask", TULA_DT_BOOL, shape1(13), 1, bool_data(13), 13);
+    tula_builder_add_checked(b, "flag", TULA_DT_BOOL, shape1(0), 0, bool_data(1), 1);     # 0-dim: one element
+    tula_builder_add_checked(b, "none", TULA_DT_BOOL, shape2(0, 4), 2, bool_data(0), 0);  # empty
+    return b;
+}
+
+fn test_round_trip() {
+    var buf = tula_builder_finish(int_builder());
+    var len = tula_total_len(buf);
+    var r = tula_open(buf, len);
+    assert(r != 0, "a file with all five dtypes opens");
+    assert_eq(strict(buf), TULA_OK, "... and is strict-canonical");
+    var e = tula_find(r, "i16");
+    assert_eq(tula_entry_dtype(e), TULA_DT_I16, "i16: dtype");
+    var p = tula_entry_data(r, e);
+    assert_eq(sx16(load16(p)), 0 - 32768, "i16: -32768");
+    assert_eq(sx16(load16(p + 2)), 32767, "i16: 32767");
+    assert_eq(sx16(load16(p + 4)), 0 - 1, "i16: -1");
+    assert_eq(sx16(load16(p + 8)), 1234, "i16: 1234");
+    e = tula_find(r, "i32");
+    assert_eq(tula_entry_nelems(e), 6, "i32 [2,3]: 6 elements");
+    p = tula_entry_data(r, e);
+    assert_eq(sx32(load32(p)), 0 - 2147483648, "i32: INT32_MIN");
+    assert_eq(sx32(load32(p + 4)), 2147483647, "i32: INT32_MAX");
+    assert_eq(sx32(load32(p + 8)), 0 - 2, "i32: -2");
+    assert_eq(sx32(load32(p + 20)), 65536, "i32: 65536");
+    e = tula_find(r, "i64");
+    p = tula_entry_data(r, e);
+    assert_eq(load64(p), 0x8000000000000000, "i64: INT64_MIN");
+    assert_eq(load64(p + 8), 0x7FFFFFFFFFFFFFFF, "i64: INT64_MAX");
+    assert_eq(load64(p + 16), 9007199254740993, "i64: 2^53 + 1, exact");
+    assert_eq(load64(p + 24), 0 - 1, "i64: -1");
+    e = tula_find(r, "u8");
+    p = tula_entry_data(r, e);
+    assert_eq(load8(p + 1), 255, "u8: 255, unsigned");
+    assert_eq(load8(p + 2), 128, "u8: 128");
+    e = tula_find(r, "mask");
+    assert_eq(tula_entry_data_len(e), 13, "bool [13]: 13 bytes");
+    var ok = 1;
+    var want = bool_data(13);
+    var i = 0;
+    while (i < 13) {
+        if (load8(tula_entry_data(r, e) + i) != load8(want + i)) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "bool: every byte as written");
+    assert_eq(tula_entry_nelems(tula_find(r, "flag")), 1, "a 0-dim bool is one element");
+    assert_eq(tula_entry_nelems(tula_find(r, "none")), 0, "an empty bool has none");
+    return 0;
+}
+
+fn test_sizes_strict() {
+    var b = tula_builder_new();
+    tula_builder_add(b, "short", TULA_DT_I32, shape1(3), 1, i32_data(), 11);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "i32 [3] in 11 bytes -> SHAPE");
+    b = tula_builder_new();
+    tula_builder_add(b, "long", TULA_DT_I16, shape1(3), 1, i16_data(), 8);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "i16 [3] in 8 bytes -> SHAPE (exact, not at-least)");
+    b = tula_builder_new();
+    tula_builder_add(b, "b", TULA_DT_BOOL, shape1(4), 1, bool_data(5), 5);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "bool [4] in 5 bytes -> SHAPE");
+    b = tula_builder_new();
+    tula_builder_add(b, "u", TULA_DT_U8, shape1(4), 1, u8_data(), 3);
+    assert_eq(strict(tula_builder_finish(b)), TULA_ERR_SHAPE, "u8 [4] in 3 bytes -> SHAPE");
+    return 0;
+}
+
+# Every byte of a 13-element mask (two words, the second partly padding), set
+# to each value 0..255 in turn: strict accepts exactly 0 and 1.
+fn test_bool_values() {
+    var buf = tula_builder_finish(int_builder());
+    var len = tula_total_len(buf);
+    var e = tula_find(buf, "mask");
+    var p = tula_entry_data(buf, e);
+    var accepted = 0;
+    var value_err = 0;
+    var other = 0;
+    var pos = 0;
+    while (pos < 13) {
+        var old = load8(p + pos);
+        var v = 0;
+        while (v < 256) {
+            store8(p + pos, v);
+            var rc = tula_validate_strict(buf, len);
+            if (rc == TULA_OK) { accepted = accepted + 1; }
+            if (rc == TULA_ERR_VALUE) { value_err = value_err + 1; }
+            if (rc != TULA_OK) {
+                if (rc != TULA_ERR_VALUE) { other = other + 1; }
+            }
+            v = v + 1;
+        }
+        store8(p + pos, old);
+        pos = pos + 1;
+    }
+    assert_eq(accepted, 26, "each of the 13 bytes is accepted as 0 or 1, and only then");
+    assert_eq(value_err, 13 * 254, "every other byte value -> TULA_ERR_VALUE");
+    assert_eq(other, 0, "... and nothing else");
+    assert_eq(tula_validate(buf, len), TULA_OK, "plain validate never reads values");
+    store8(p + 3, 2);
+    assert_eq(tula_validate(buf, len), TULA_OK, "... a bool byte of 2 passes it");
+    assert_eq(tula_entry_payload_ok(e), 1, "... and payload_ok (a size check)");
+    store8(p + 3, 1);
+    # the padding rule runs first: a non-zero pad byte is LAYOUT, not VALUE
+    store8(p + 13, 1);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_LAYOUT, "a bool's non-zero padding -> LAYOUT");
+    store8(p + 13, 0);
+    # the 0-dim flag
+    var f = tula_entry_data(buf, tula_find(buf, "flag"));
+    store8(f, 0xFF);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "a 0-dim bool of 0xFF -> VALUE");
+    store8(f, 1);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "restored, the file is canonical again");
+    # U8 and the signed dtypes have no value rule: every byte pattern is a value
+    var u = tula_entry_data(buf, tula_find(buf, "u8"));
+    store8(u, 0xFE);
+    var q = tula_entry_data(buf, tula_find(buf, "i64"));
+    store64(q, 0x5555AAAA5555AAAA);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "u8 and i64 take any bytes");
+    return 0;
+}
+
+# A big mask: strict scans it a word at a time, to the last byte.
+fn test_big_bool() {
+    var n = 1048579;   # 1 MiB + 3: a tail past the last full word
+    var d = alloc(n + 8);
+    var i = 0;
+    while (i < n) {
+        store8(d + i, i & 1);
+        i = i + 1;
+    }
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, "attn.bias", TULA_DT_BOOL, shape2(1, n), 2, d, n);
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "a 1 MiB mask of 0/1 is canonical");
+    var p = tula_entry_data(buf, tula_find(buf, "attn.bias"));
+    store8(p + n - 1, 7);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "a bad last byte -> VALUE");
+    store8(p + n - 1, 0);
+    store8(p, 0x80);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "a bad first byte -> VALUE (its top bit)");
+    return 0;
+}
+
+fn test_payload_ok() {
+    var b = tula_builder_new();
+    tula_builder_add(b, "short", TULA_DT_I32, shape1(10), 1, alloc(48), 39);
+    tula_builder_add(b, "exact", TULA_DT_I32, shape1(10), 1, alloc(48), 40);
+    tula_builder_add(b, "i64s", TULA_DT_I64, shape1(3), 1, alloc(32), 23);
+    tula_builder_add(b, "bools", TULA_DT_BOOL, shape1(9), 1, bool_data(9), 9);
+    var buf = tula_builder_finish(b);
+    var r = tula_open(buf, tula_total_len(buf));
+    assert_eq(tula_entry_payload_ok(tula_find(r, "short")), 0, "i32 [10] in 39 bytes: payload_ok refuses");
+    assert_eq(tula_entry_payload_ok(tula_find(r, "exact")), 1, "i32 [10] in 40 bytes: ok");
+    assert_eq(tula_entry_payload_ok(tula_find(r, "i64s")), 0, "i64 [3] in 23 bytes: refused");
+    assert_eq(tula_entry_payload_ok(tula_find(r, "bools")), 1, "bool [9] in 9 bytes: ok");
+    return 0;
+}
+
+# The streaming writers lay out the new dtypes exactly as finish does.
+fn test_streamed() {
+    var b = int_builder();
+    tula_builder_add_long(b, "model.layers.0.self_attn.q_proj.qweight.with.a.long.name", TULA_DT_I32,
+      shape2(2, 3), 2, i32_data(), 24);
+    var mem = tula_builder_finish(b);
+    var mlen = tula_total_len(mem);
+    var path = "build/test_ints.tula";
+    assert_eq(tula_builder_write_file(b, path), mlen, "streamed: the same length");
+    var out = alloc(mlen + 16);
+    assert_eq(file_read_all(path, out, mlen + 16), mlen, "... read back whole");
+    var same = 1;
+    var i = 0;
+    while (i < mlen) {
+        if (load8(out + i) != load8(mem + i)) { same = 0; }
+        i = i + 1;
+    }
+    assert_eq(same, 1, "... byte for byte tula_builder_finish");
+    var r = tula_read_file(path);
+    assert(r != 0, "... and it reads");
+    assert_eq(tula_validate_strict(r, tula_total_len(r)), TULA_OK, "... strict-canonical, a long name included");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_codes_and_widths();
+    test_round_trip();
+    test_sizes_strict();
+    test_bool_values();
+    test_big_bool();
+    test_payload_ok();
+    test_streamed();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

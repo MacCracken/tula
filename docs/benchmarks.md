@@ -114,6 +114,18 @@ Linux (where the stdlib's single request still works).
 | `tula_write_file_atomic` | 5.2–5.5 s | 5.4–5.7 s | temp, write, fsync, rename; 1.6.2 also fsyncs the directory |
 | `tula_write_file`, over that copy | 5.3–5.5 s | 5.3 s | truncate and write, no fsync |
 
+### 1.7.0: integer and boolean dtypes
+
+The new dtypes are raw, so the only new cost is strict's BOOL rule (ADR 0009),
+the first strict rule that reads tensor values. Measured with `make bench` on a
+16 MiB tensor of the same bytes, stored as BOOL and as U8:
+
+| Op | 1.7.0 | Notes |
+|---|---:|---|
+| `tula_validate_strict`, a 16 MiB BOOL tensor | 4.0 ms · ~4.2 GB/s | one 64-bit compare per 8 elements |
+| `tula_validate_strict`, the same bytes as U8 | 1 µs | no value rule: sizes and padding only |
+| `tula_validate_strict`, 200 tensors | 54.8–62.2 µs | 1.6.2 on the same machine and run: 54.7–63.4 µs (unchanged; this machine reads ~30% slower than 1.2.0's numbers above) |
+
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
 adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is

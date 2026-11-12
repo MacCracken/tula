@@ -82,7 +82,11 @@ canonical buffer, exactly what a correct tula writer produces. Run it on any
 file you didn't write. Overlap matters for cost too: many entries pointing at the
 same bytes make a small file decode into a lot of work, and strict rejects that.
 Its duplicate check sorts names (worst case O(n log n)) rather than hashing them,
-so crafted names can't make it quadratic.
+so crafted names can't make it quadratic. Since 1.7.0 it also rejects a BOOL
+byte other than 0 or 1 (`TULA_ERR_VALUE`, ADR 0009), so readers that disagree
+about what a byte of 2 means (true in C and NumPy, undefined in Rust) never see
+one in a file strict accepted. `tula_validate` and `tula_entry_payload_ok` check
+sizes only, and a 1.2–1.6 strict validator rejects the 1.7 dtypes as unknown.
 
 **The name index (1.5.0) is built over untrusted names**, so it is a sorted array
 searched by bisection, never a hash table (ADR 0007). Crafted colliding names

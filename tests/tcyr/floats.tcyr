@@ -271,7 +271,7 @@ fn test_dtype_sizes_and_strict() {
     assert_eq(tula_packed_len(TULA_DT_F32, 10), 40, "f32: 4 bytes each");
     assert_eq(tula_packed_len(TULA_DT_F16, 10), 20, "f16: 2 bytes each");
     assert_eq(tula_packed_len(TULA_DT_BF16, 10), 20, "bf16: 2 bytes each");
-    assert_eq(tula_packed_len(7, 10), 0 - 1, "dtype 7 is still unknown");
+    assert_eq(tula_packed_len(12, 10), 0 - 1, "dtype 12, the next code, is still unknown (1.7.0 took 7..11)");
     var data = alloc(64);
     var b = tula_builder_new();
     tula_builder_add_checked(b, "a", TULA_DT_F32, shape1(10), 1, data, 40);

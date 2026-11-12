@@ -327,7 +327,8 @@ fn tula_nf4_unpack(nibbles, scales, n, block, dst): i64 {
 
 # Expected packed byte length for `nelems` elements of `dtype` (the payload the
 # unpack helper will read). NF4/ternary return the CODE bytes only — the per-block
-# / per-tensor scale rides in the "<name>.scale" sidecar (ADR 0002). Returns -1
+# / per-tensor scale rides in the "<name>.scale" sidecar (ADR 0002). The integer
+# and boolean dtypes (1.7.0, ADR 0009) are raw: nelems x their width. Returns -1
 # for an unknown dtype (no size contract to enforce).
 fn tula_packed_len(dtype, nelems): i64 {
     if (dtype == TULA_DT_F64)     { return nelems * 8; }
@@ -337,6 +338,11 @@ fn tula_packed_len(dtype, nelems): i64 {
     if (dtype == TULA_DT_F32)     { return nelems * 4; }   # 1.3.0
     if (dtype == TULA_DT_F16)     { return nelems * 2; }   # 1.3.0
     if (dtype == TULA_DT_BF16)    { return nelems * 2; }   # 1.3.0
+    if (dtype == TULA_DT_I16)     { return nelems * 2; }   # 1.7.0
+    if (dtype == TULA_DT_I32)     { return nelems * 4; }   # 1.7.0
+    if (dtype == TULA_DT_I64)     { return nelems * 8; }   # 1.7.0
+    if (dtype == TULA_DT_U8)      { return nelems; }       # 1.7.0
+    if (dtype == TULA_DT_BOOL)    { return nelems; }       # 1.7.0
     return 0 - 1;
 }
 

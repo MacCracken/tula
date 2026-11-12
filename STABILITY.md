@@ -9,8 +9,9 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
 
 - **On-disk format v1** — the 64-byte header and 144-byte manifest entry layout,
   field offsets, `TULA_MAGIC`, `TULA_VERSION`, the dtype codes
-  (`TULA_DT_F64/INT8/TERNARY/NF4`, and from 1.3.0 `F32/F16/BF16` with ADR 0005's
-  conversion semantics), the signed-header scheme (Ed25519 over `[0, sig_off)`,
+  (`TULA_DT_F64/INT8/TERNARY/NF4`, from 1.3.0 `F32/F16/BF16` with ADR 0005's
+  conversion semantics, and from 1.7.0 `I16/I32/I64/U8/BOOL` with ADR 0009's raw
+  encodings and BOOL's 0/1 rule), the signed-header scheme (Ed25519 over `[0, sig_off)`,
   `sig_len ∈ {0, 64}`), and from 1.3.0 the long-name convention (ADR 0004): the
   key formula, the `__tula.names__` table layout, and its magic. From 1.6.0 also
   the metadata convention (ADR 0008): the `__tula.meta__` table's position,

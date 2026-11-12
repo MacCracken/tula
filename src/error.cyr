@@ -24,6 +24,7 @@ enum TulaErrCode {
     TULA_ERR_DTYPE     = 16;   # dtype unknown to this tula (strict) (1.2.0)
     TULA_ERR_NAMES     = 17;   # the long-name table is malformed (strict) (1.3.0)
     TULA_ERR_META      = 18;   # a bad metadata key/value, or a malformed table (1.6.0)
+    TULA_ERR_VALUE     = 19;   # a payload value its dtype doesn't allow (strict) (1.7.0)
     TULA_ERR_OTHER     = 99;   # catch-all
 }
 
@@ -48,6 +49,7 @@ fn tula_err_name(code): i64 {
     if (code == TULA_ERR_DTYPE)     { return "unknown dtype"; }
     if (code == TULA_ERR_NAMES)     { return "malformed long-name table"; }
     if (code == TULA_ERR_META)      { return "invalid or malformed metadata"; }
+    if (code == TULA_ERR_VALUE)     { return "payload value invalid for its dtype"; }
     if (code == TULA_ERR_OTHER)     { return "other error"; }
     return "unknown error";
 }

@@ -166,7 +166,7 @@ fn test_shape_and_dtype_rules() {
     assert_eq(strict(buf), TULA_ERR_SHAPE, "a negative dim -> SHAPE");
 
     buf = canon();
-    store64(entry_named(buf, "q") + 48, 9);
+    store64(entry_named(buf, "q") + 48, 99);   # 9 was unknown until 1.7.0 (now I64)
     assert_eq(tula_validate(buf, len), TULA_OK, "an unknown dtype passes validate");
     assert_eq(strict(buf), TULA_ERR_DTYPE, "an unknown dtype -> DTYPE");
 

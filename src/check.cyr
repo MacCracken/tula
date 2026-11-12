@@ -64,6 +64,15 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
         if (load8(payload + doff + k) != 0) { return TULA_ERR_LAYOUT; }
         k = k + 1;
     }
+    # BOOL (1.7.0, ADR 0009): every byte is 0 or 1. The padding is zero by now,
+    # so whole words up to the padded end are checked, 8 elements per compare.
+    if (dt == TULA_DT_BOOL) {
+        k = 0;
+        while (k < padded) {
+            if ((load64(payload + doff + k) & 0xFEFEFEFEFEFEFEFE) != 0) { return TULA_ERR_VALUE; }
+            k = k + 8;
+        }
+    }
     return TULA_OK;
 }
 
@@ -220,6 +229,8 @@ fn _tula_strict_unique(buf, count): i64 {
 #                       length, a value that isn't well-formed UTF-8 or holds a
 #                       NUL, not packed in record order, or past the caps
 #                       (ADR 0008);
+#   TULA_ERR_VALUE    — (1.7.0) a payload value its dtype doesn't allow: a BOOL
+#                       byte other than 0 or 1 (ADR 0009);
 #   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
 #   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To

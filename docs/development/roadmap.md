@@ -59,7 +59,8 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
     (ADR 0004);
   - the F32/F16/BF16 encodings and their rounding (ADR 0005);
   - file metadata through the `__tula.meta__` table, before the names table
-    (ADR 0008).
+    (ADR 0008);
+  - the raw integer encodings and BOOL's 0/1 rule (ADR 0009).
 
   A new convention (a reserved tensor, a naming rule) is a MINOR with its own
   ADR, and must stay readable by every older 1.x reader.
@@ -88,14 +89,11 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 ## 1.7.x — integer and boolean dtypes
 
 **Goal:** an importer can store every tensor of a real checkpoint losslessly.
+1.7.0 adds `I16` / `I32` / `I64` / `U8` / `BOOL` (ADR 0009, codes 7–11).
 
-- **1.7.0** — `I16`, `I32`, `I64`, `U8`, `BOOL` (an ADR fixes the codes and
-  encodings). Checkpoints carry non-weight tensors — ids, masks, buffers — that
-  tula can't hold today without reinterpreting them. They are raw little-endian,
-  so they need no conversion helpers beyond sizes in `tula_packed_len` /
-  `payload_ok` / strict. `BOOL` is one byte per element (0/1), so strict can
-  reject other values.
 - **1.7.x patches** — fixes as importers store full checkpoints; no new surface.
+  U16/U32/U64 and element-read helpers wait for a consumer that needs them (a
+  MINOR; ADR 0009 says why they were left out).
 
 ## 1.8.x — compact formats: FP8 and int4
 
@@ -103,7 +101,8 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 `TULA_DT_*` values are MINOR-only, so both land in **1.8.0**, each with its own
 ADR and conversion tests as thorough as ADR 0005's.
 
-- **FP8** (`E4M3`, `E5M2`), following the OCP 8-bit float spec. E4M3 has no
+- **FP8** (`E4M3`, `E5M2`), following the OCP 8-bit float spec. New codes start
+  at 12 (1.7.0 took 7–11). E4M3 has no
   infinities and a single NaN pattern; E5M2 is IEEE-like. With 256 codes per
   format, every code and every midpoint can be tested, as F16/BF16 are.
 - **int4 blockwise** (GGUF Q4-style). To decide in its ADR: blocks with an inline

@@ -31,3 +31,4 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 | [0006](0006-streaming-atomic-writes.md) | Accepted | Big files: stream from caller memory, sign the written file, replace atomically |
 | [0007](0007-sorted-name-index.md) | Accepted | The name index is a sorted array, not a hash table |
 | [0008](0008-file-metadata-table.md) | Accepted | File metadata lives in a sorted key/value table tensor (no format-version bump) |
+| [0009](0009-integer-and-boolean-dtypes.md) | Accepted | Integer and boolean dtypes: I16, I32, I64, U8 and BOOL, stored raw |
