@@ -7,6 +7,8 @@
 # thresholds and leave tails; NF4 and INT4 run at even, odd, small and large
 # blocks. tula_unpack_par must give the serial helper's output, bit for bit, at
 # every thread count, write exactly n outputs, and refuse what it can't do.
+# 1.9.1: the F16 / BF16 table path for large tensors against the scalar
+# conversions, and NF4's thresholds against the codebook scan.
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -213,6 +215,221 @@ fn test_nibble_tables() {
     return 0;
 }
 
+# The 16-bit unpacks from 262,144 elements (1.9.1) read a per-call table: every
+# code, many times and at every position mod 4, against the scalar widen, on
+# both sides of the threshold.
+fn test_lut16() {
+    var s = alloc(8);
+    store64(s, 0x16);
+    var n = 65536 * 4 + 777;
+    var codes = alloc(n * 2);
+    var i = 0;
+    while (i < n) {
+        var h = (i * 40503) & 0xFFFF;                  # every code, permuted
+        if (i >= 65536 * 4) { h = lcg(s) & 0xFFFF; }
+        store16(codes + i * 2, h);
+        i = i + 1;
+    }
+    var out = alloc((n + 1) * 8);
+    var which = 0;
+    while (which < 2) {
+        var bad = 0;
+        var t = 0;
+        while (t < 3) {
+            var len = n;
+            if (t == 1) { len = 262144; }
+            if (t == 2) { len = 262143; }               # the loop, just below
+            store64(out + len * 8, 0x5A5A5A5A5A5A5A5A);
+            var r = 0;
+            if (which == 0) { r = tula_f16_unpack(codes, len, out); }
+            else            { r = tula_bf16_unpack(codes, len, out); }
+            if (r != len) { bad = bad + 1; }
+            if (load64(out + len * 8) != 0x5A5A5A5A5A5A5A5A) { bad = bad + 1; }
+            i = 0;
+            while (i < len) {
+                var hc = load16(codes + i * 2);
+                var want = 0;
+                if (which == 0) { want = tula_f16_to_f64(hc); }
+                else            { want = tula_bf16_to_f64(hc); }
+                if (load64(out + i * 8) != want) { bad = bad + 1; }
+                i = i + 1;
+            }
+            t = t + 1;
+        }
+        if (which == 0) { assert_eq(bad, 0, "f16 unpack table path == scalar widen, every code, around 2^18"); }
+        else            { assert_eq(bad, 0, "bf16 unpack table path == scalar widen, every code, around 2^18"); }
+        which = which + 1;
+    }
+    return 0;
+}
+
+# An f64's key in the f64 order, and back (the tests' own copies).
+fn key(x): i64 {
+    if ((x >> 63) != 0) { return 0 - (x & 0x7FFFFFFFFFFFFFFF); }
+    return x;
+}
+
+fn unkey(k): i64 {
+    if (k < 0) { return (0 - k) | (1 << 63); }
+    return k;
+}
+
+# NF4's thresholds (1.9.1). The scan is monotone on [-1, 1], so checking it
+# gives k just below t_k and k + 1 at t_k proves the threshold code equal to it
+# everywhere there; dense neighbourhoods, random values and the specials check
+# _tula_nf4_code against tula_nf4_nearest directly.
+fn test_nf4_thresholds() {
+    var lv[128];
+    _tula_nf4_table(&lv);
+    var tk[120];
+    _tula_nf4_tkeys(&tk);
+    var edges = 0;
+    var k = 0;
+    while (k < 15) {
+        var t = _tula_nf4_threshold(k);
+        if (tula_nf4_nearest(unkey(key(t) - 1)) != k) { edges = edges + 1; }
+        if (tula_nf4_nearest(t) != k + 1) { edges = edges + 1; }
+        if (key(t) <= key(tula_nf4_level(k))) { edges = edges + 1; }
+        if (key(t) > key(tula_nf4_level(k + 1))) { edges = edges + 1; }
+        k = k + 1;
+    }
+    assert_eq(edges, 0, "each threshold: the scan gives k just below it and k+1 at it, between levels k and k+1");
+    var bad = 0;
+    k = 0;
+    while (k < 16) {
+        var j = 0 - 3000;
+        while (j <= 3000) {
+            if (k < 15) {
+                var xa = unkey(key(_tula_nf4_threshold(k)) + j);
+                if (_tula_nf4_code(xa, &tk, &lv) != tula_nf4_nearest(xa)) { bad = bad + 1; }
+            }
+            var xb = unkey(key(tula_nf4_level(k)) + j);
+            if (_tula_nf4_code(xb, &tk, &lv) != tula_nf4_nearest(xb)) { bad = bad + 1; }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    assert_eq(bad, 0, "_tula_nf4_code == the scan, 3,000 keys either side of every threshold and level");
+    var s = alloc(8);
+    store64(s, 0x4F4);
+    var lo = key(0xBFF0000000000000);
+    var span = 0x3FF0000000000000 - lo + 1;
+    bad = 0;
+    var i = 0;
+    while (i < 1000000) {
+        var r = lcg(s) & 0x7FFFFFFFFFFFFFFF;
+        var xr = unkey(lo + r % span);
+        if (_tula_nf4_code(xr, &tk, &lv) != tula_nf4_nearest(xr)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "_tula_nf4_code == the scan on 1,000,000 random keys in [-1, 1]");
+    var sp[128];
+    store64(&sp, 0); store64(&sp + 8, 0x8000000000000000);
+    store64(&sp + 16, 0x3FF0000000000000); store64(&sp + 24, 0xBFF0000000000000);
+    store64(&sp + 32, 0x7FF8000000000000); store64(&sp + 40, 0xFFF8000000000001);
+    store64(&sp + 48, 0x7FF0000000000000); store64(&sp + 56, 0xFFF0000000000000);
+    store64(&sp + 64, 0x3FF0000000000001); store64(&sp + 72, 0xC000000000000000);
+    store64(&sp + 80, 0x7FE0000000000000); store64(&sp + 88, 1);
+    store64(&sp + 96, 0x8000000000000001); store64(&sp + 104, 0x4330000000000000);
+    store64(&sp + 112, 0x7FF0000000000001); store64(&sp + 120, 0xC330000000000000);
+    bad = 0;
+    i = 0;
+    while (i < 16) {
+        var xs = load64(&sp + i * 8);
+        if (_tula_nf4_code(xs, &tk, &lv) != tula_nf4_nearest(xs)) { bad = bad + 1; }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, "_tula_nf4_code == the scan on zeros, +-1, NaNs, infs, past +-1, subnormals, 2^52");
+    return 0;
+}
+
+# tula_nf4_pack against its definition: per block, amax and the scan of
+# x / amax, with zero blocks, NaN, inf and signed zeros among the values.
+fn ref_nf4_pack(src, n, block, scales, nibbles): i64 {
+    var z = 0;
+    while (z < (n + 1) / 2) { store8(nibbles + z, 0); z = z + 1; }
+    var nb = (n + block - 1) / block;
+    var bi = 0;
+    while (bi < nb) {
+        var st = bi * block;
+        var en = st + block;
+        if (en > n) { en = n; }
+        var amax = 0;
+        var i = st;
+        while (i < en) {
+            var a = f64_abs(load64(src + i * 8));
+            if (f64_gt(a, amax) == 1) { amax = a; }
+            i = i + 1;
+        }
+        store64(scales + bi * 8, amax);
+        i = st;
+        while (i < en) {
+            var c = 7;
+            if (f64_gt(amax, 0) == 1) { c = tula_nf4_nearest(f64_div(load64(src + i * 8), amax)); }
+            if ((i & 1) == 0) { store8(nibbles + i / 2, load8(nibbles + i / 2) | c); }
+            else { store8(nibbles + i / 2, load8(nibbles + i / 2) | (c << 4)); }
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    return nb;
+}
+
+fn test_nf4_pack_reference() {
+    var s = alloc(8);
+    store64(s, 0x4F40);
+    var n = 20001;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        var v = rand_f64(s);
+        if ((i % 1000) < 64) { v = 0; }                              # a zero block, mostly
+        if ((i % 777) == 5) { v = 0x7FF8000000000000; }              # NaN
+        if ((i % 1999) == 11) { v = 0xFFF0000000000000; }            # -inf
+        if ((i % 333) == 7) { v = 0x8000000000000000; }              # -0
+        store64(src + i * 8, v);
+        i = i + 1;
+    }
+    var sa = alloc(n * 8);
+    var sb = alloc(n * 8);
+    var na = alloc(n);
+    var nbuf = alloc(n);
+    var bl[40];
+    store64(&bl, 64); store64(&bl + 8, 1); store64(&bl + 16, 7); store64(&bl + 24, 33); store64(&bl + 32, 4096);
+    var bad = 0;
+    var j = 0;
+    while (j < 5) {
+        var blk = load64(&bl + j * 8);
+        var len = n - j;
+        var ra = ref_nf4_pack(src, len, blk, sa, na);
+        var rb = tula_nf4_pack(src, len, blk, sb, nbuf);
+        if (ra != rb) { bad = bad + 1; }
+        if (memeq(na, nbuf, (len + 1) / 2) != 1) { bad = bad + 1; }
+        if (memeq(sa, sb, ra * 8) != 1) { bad = bad + 1; }
+        j = j + 1;
+    }
+    assert_eq(bad, 0, "nf4 pack == its definition (amax, then the scan): 5 block sizes, NaN/inf/zeros");
+    # Values exactly on the thresholds: a block whose largest value is 1.0, so
+    # x / amax is x itself, holding every threshold and level with 4 keys either side.
+    var m = 1 + 31 * 9;
+    var ex = alloc(m * 8);
+    store64(ex, 0x3FF0000000000000);
+    var q = 1;
+    var k = 0;
+    while (k < 31) {
+        var c = 0;
+        if (k < 15) { c = _tula_nf4_threshold(k); } else { c = tula_nf4_level(k - 15); }
+        var d = 0 - 4;
+        while (d <= 4) { store64(ex + q * 8, unkey(key(c) + d)); q = q + 1; d = d + 1; }
+        k = k + 1;
+    }
+    ref_nf4_pack(ex, m, m, sa, na);
+    tula_nf4_pack(ex, m, m, sb, nbuf);
+    var same = memeq(na, nbuf, (m + 1) / 2);
+    assert_eq(same, 1, "nf4 pack == its definition on values at and around every threshold");
+    return 0;
+}
+
 # ---------------------------------------------------------------------------
 # tula_unpack_par
 # ---------------------------------------------------------------------------
@@ -377,6 +594,9 @@ fn main(): i64 {
     test_int8_table();
     test_ternary_table();
     test_nibble_tables();
+    test_lut16();
+    test_nf4_thresholds();
+    test_nf4_pack_reference();
     test_par_matches_serial();
     test_par_refusals();
     test_par_from_file();

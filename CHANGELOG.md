@@ -7,6 +7,57 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-11-12
+
+**Faster NF4 packing and 16-bit unpacking.** A patch: no API or format
+change, and every output is 1.9.0's. A cross-version diff built against the
+1.9.0 tag matched 1.9.0 on every array helper, builder, strict verdict and
+lookup. It also ran 12 F16 and BF16 unpacks of 262,141–300,000 elements and
+300 NF4 packs (blocks 1–100 and 64, zero blocks, any bits) with the same
+output.
+
+### Changed
+
+- **`tula_nf4_pack`: 23–24 → 60–63 Melem/s** (2.6×). Each code comes from 15
+  exact decision thresholds, in four comparisons, instead of a scan of the
+  16-level codebook.
+  - On [−1, 1], which is every value pack divides by a block's absmax, the
+    scan's answer is monotone. Every other level is strictly farther than the
+    two neighbours, and between them the nearer one switches once. So the code
+    is the number of thresholds at or below the value.
+  - Each threshold was found by bisecting between two levels with the scan as
+    the oracle. NaN and anything past ±1 still take the scan.
+- **`tula_f16_unpack` and `tula_bf16_unpack` from 262,144 elements: ~200 →
+  ~350 Melem/s** (1.75×). The f64 of all 65,536 codes is made once per call by
+  the widening loop itself, so the bits are the loop's by construction. It goes
+  into a private 640 KiB mapping, unmapped before returning, and each element is
+  then a load.
+  - The table is per call, never shared, so parallel slices don't meet.
+  - If the mapping can't be made, the loop runs instead.
+  - Through `tula_unpack_par`, 2²⁴ BF16 elements now unpack at ~460 Melem/s on
+    one thread and ~1,500 on four, from ~200 and ~735.
+  - A 512 KiB array local would have been static storage shared by every
+    thread, as cyrius warns. That's why the table is a mapping.
+- **Measured and left alone:**
+  - INT4 pack: whole-byte writes gained ~15%, because its per-element f64
+    division and floor dominate.
+  - Unrolling the float unpacks by 2 or 4 gained nothing.
+  - F32 can't have a table (2³² codes).
+- **`tests/tcyr/kernels.tcyr`** (44 assertions, 8 new):
+  - the 16-bit table path against the scalar conversions, on every code and on
+    both sides of 262,144;
+  - each threshold checked against the scan, just below it and at it, plus
+    3,000 keys either side of every threshold and level, 1,000,000 random values
+    in [−1, 1], and the specials;
+  - `tula_nf4_pack` against its definition (amax, then the scan) at five block
+    sizes with NaN, inf, −0 and zero blocks, and on values lying exactly on
+    every threshold.
+
+  Four seeded bugs are each caught: a threshold one key off, the search's
+  index, the table's third lane, and `>` for `>=` in pack's inlined search.
+  The last one needed the on-threshold inputs; random values never land on a
+  threshold.
+
 ## [1.9.0] - 2026-11-12
 
 **Throughput.** An additive MINOR with no format change (ADR 0012).

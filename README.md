@@ -93,8 +93,12 @@ The full march M0→M5:
   at 8 threads); strict validation, adds and short-name lookups cost less per
   call.
 
-**793/793** assertions across 16 suites (meta · fp8 · names · stream · builder ·
-strict · ints · dtype · int4 · floats · kernels · file-io · hardening ·
+- **1.9.1** — NF4 packing 2.6× faster (exact thresholds instead of a codebook
+  scan) and F16 / BF16 unpacking 1.75× faster on large tensors, with the same
+  output.
+
+**801/801** assertions across 16 suites (meta · fp8 · names · stream · builder ·
+strict · ints · dtype · int4 · kernels · floats · file-io · hardening ·
 round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model

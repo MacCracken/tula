@@ -118,13 +118,13 @@ added `tula_unpack_par` (ADR 0012, `src/par.cyr`) and cut the per-call costs of
 validation, adds and index lookups.
 
 - **1.9.x patches** — faster kernels and smaller per-call costs change no API,
-  so they can ship as patches. Candidates:
-  - NF4 and INT4 **pack** are unchanged (~25 and ~58 Melem/s), bound by the
-    codebook search and the f64 division. NF4's nearest-level scan could become
-    a search over exact thresholds, if it gives the scan's answer on every
-    input, NaN and ties included.
-  - Below one core's memory bandwidth, the float unpacks (~210 Melem/s) still
-    branch per element.
+  so they can ship as patches. 1.9.1 made NF4 pack search 15 exact thresholds
+  instead of scanning the codebook, and gave the F16 / BF16 unpacks a per-call
+  table from 262,144 elements. What's left measured as not worth it:
+  - INT4 **pack** is bound by its per-element f64 division and floor; writing
+    whole bytes instead of nibbles gained ~15%.
+  - The F32 unpack (~218 Melem/s) has no table (2³² codes), and unrolling the
+    float loops by 2 or 4 gained nothing under cyrius's code generation.
 - **Left for a MINOR when a consumer needs it** (ADR 0012 says why):
   - a parallel pack (INT8's per-tensor absmax needs a reduction across
     threads);

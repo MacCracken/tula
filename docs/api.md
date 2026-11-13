@@ -466,8 +466,10 @@ Double-quant composes: int8-quantize a `"<name>.scale"` tensor and store its own
 bit, and no signature or contract changed. The FP8 unpacks and int8's
 dequant read a 256-entry table from 1,024 elements, and ternary's unpack from
 1,024 trits. NF4 and INT4 build each block's 16 products once, from a block of
-16. Each float format has its own loop. Numbers are in
-[`benchmarks.md`](benchmarks.md).
+16. Each float format has its own loop. In 1.9.1 the F16 and BF16 unpacks read
+a per-call table of all 65,536 codes from 262,144 elements, and NF4 pack finds
+each code through 15 exact thresholds instead of scanning the codebook (the
+scan's answer on every input). Numbers are in [`benchmarks.md`](benchmarks.md).
 
 ---
 

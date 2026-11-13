@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.9.0** (`tula_version_int()` returns `10900`). 1.0.1–1.1.1 are
+VERSION is **1.9.1** (`tula_version_int()` returns `10901`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -62,17 +62,21 @@ output (tables for the byte and nibble formats, one loop per float format), and
 `tula_unpack_par` (ADR 0012, `src/par.cyr`) splits an unpack across threads.
 Strict, adds and short-name lookups cost 12–35% less per call. A cross-version
 diff against the 1.8.0 tag matched every changed call's output.
+**1.9.1** (patch): faster kernels. NF4 pack finds each code through 15 exact thresholds instead of
+scanning the codebook, and the F16 / BF16 unpacks read a per-call table from
+262,144 elements. Every output matches 1.9.0 (cross-version diff).
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.9.0)
+## Tests, fuzz, gates (1.9.1)
 
-**793 assertions** across 16 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
+**801 assertions** across 16 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
-`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `floats.tcyr` 37,
-`kernels.tcyr` 36 (1.9.0: the table and inline paths, and `tula_unpack_par`
-against the serial helpers), `fileio.tcyr` 30, `hardening.tcyr` 30,
+`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
+and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
+16-bit tables and NF4 thresholds), `floats.tcyr` 37, `fileio.tcyr` 30,
+`hardening.tcyr` 30,
 `roundtrip.tcyr` 22, `index.tcyr` 13, `sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
@@ -156,7 +160,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: 1.9.x patches (NF4 and INT4 pack are unchanged), and fixes importers
-turn up. Later: the 1.x.x
+Next: 1.9.x has nothing left measured as worth doing (INT4 pack and F32
+unpack, see the roadmap), so 1.9.x patches only for fixes importers turn up. Later: the 1.x.x
 research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

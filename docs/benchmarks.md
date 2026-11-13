@@ -214,6 +214,22 @@ conversion, no shifts, masks or gathers, so the conversions can't use it; NF4
 and INT4 use `f64v_scale` for their block products, always over 16 elements
 (see ADR 0012 on the open cyrius issue for odd lengths).
 
+### 1.9.1: NF4 pack and the 16-bit unpacks
+
+1.9.0 and 1.9.1 `make bench` builds, alternately, three runs each (the range);
+the outputs are the same (cross-version diff and `kernels.tcyr`).
+
+| Op | 1.9.0 | 1.9.1 | How |
+|---|---:|---:|---|
+| `tula_nf4_pack` (2²⁰, block 64) | 23–24 Melem/s | 60–63 Melem/s | 15 exact thresholds, four comparisons per code |
+| `tula_f16_unpack` (2²⁰) | 195–205 | 336–351 | a per-call table of the 65,536 codes, from 262,144 elements |
+| `tula_bf16_unpack` (2²⁰) | 196–205 | 345–361 | the same |
+| `tula_unpack_par`, BF16 2²⁴, 1 / 2 / 4 / 8 threads | 195–204 / 375–401 / 716–754 / 805–953 | 445–471 / 815–871 / 1,468–1,509 / 1,373–1,585 | each slice of 262,144 or more builds its own table |
+
+Every other row was unchanged within the runs' spread. Below 262,144 elements
+the 16-bit unpacks run 1.9.0's loop: the table costs about 0.4 ms to build and
+map, which a smaller tensor wouldn't win back.
+
 ### Added in 1.5.0
 
 | Op | 1.5.0 | Notes |

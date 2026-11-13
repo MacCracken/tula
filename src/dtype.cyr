@@ -287,13 +287,76 @@ fn tula_nf4_get(nibbles, i): i64 {
     return (load8(nibbles + byi) >> 4) & 0xF;
 }
 
+# NF4's decision thresholds (1.9.1): t_k is the smallest f64 that
+# _tula_nf4_nearest_t sends to a code above k, for k = 0..14. On [-1, 1] the
+# scan's answer is monotone in xn: between levels k and k+1 every other level is
+# strictly farther (they are at least 0.07 away and |xn| <= 1, so rounding can't
+# tie them), and fl(xn - l_k) only grows while fl(l_{k+1} - xn) only shrinks, so
+# "k+1 is strictly nearer" switches once. The code of xn in [-1, 1] is therefore
+# the number of thresholds at or below it. Each t_k was found by bisecting
+# between the two levels with the scan as the oracle; tests/tcyr/kernels.tcyr
+# checks the scan gives k just below t_k and k+1 at it, and the code against
+# the scan on dense and random inputs.
+fn _tula_nf4_threshold(k): i64 {
+    if (k == 0)  { return 0xBFEB239B0FFFFFFF; }
+    if (k == 1)  { return 0xBFE38A4E0FFFFFFF; }
+    if (k == 2)  { return 0xBFDD708FFFFFFFFF; }
+    if (k == 3)  { return 0xBFD5BD4ECFFFFFFF; }
+    if (k == 4)  { return 0xBFCE079D8FFFFFFF; }
+    if (k == 5)  { return 0xBFC1A71777FFFFFF; }
+    if (k == 6)  { return 0xBFA74F0E1FFFFFFF; }
+    if (k == 7)  { return 0x3FA45F5FE0000001; }
+    if (k == 8)  { return 0x3FBEC90C50000001; }
+    if (k == 9)  { return 0x3FCA0CFC00000001; }
+    if (k == 10) { return 0x3FD2B05A88000001; }
+    if (k == 11) { return 0x3FD8EA7F20000001; }
+    if (k == 12) { return 0x3FE00DA070000001; }
+    if (k == 13) { return 0x3FE491B5E0000001; }
+    return 0x3FEB913B30000001;
+}
+
+# An f64's bits as an integer in the f64 order: x itself when the sign is clear,
+# -|x| when it is set (so -0 and +0 are both 0). Not meaningful for NaN.
+fn _tula_f64_key(x): i64 {
+    if ((x >> 63) != 0) { return 0 - (x & 0x7FFFFFFFFFFFFFFF); }
+    return x;
+}
+
+# Fill `tk` (15 words) with the thresholds' keys.
+fn _tula_nf4_tkeys(tk): i64 {
+    var k = 0;
+    while (k < 15) {
+        store64(tk + k * 8, _tula_f64_key(_tula_nf4_threshold(k)));
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The NF4 code of xn: _tula_nf4_nearest_t's answer, bit for bit. For |xn| <= 1
+# it is the count of thresholds at or below xn, found in four comparisons of
+# keys; NaN and anything outside [-1, 1] (which tula_nf4_pack never makes) take
+# the scan.
+fn _tula_nf4_code(xn, tk, lv): i64 {
+    if ((xn & 0x7FFFFFFFFFFFFFFF) > 0x3FF0000000000000) { return _tula_nf4_nearest_t(xn, lv); }
+    var x = _tula_f64_key(xn);
+    var c = 0;
+    if (x >= load64(tk + 56)) { c = 8; }
+    if (x >= load64(tk + (c + 3) * 8)) { c = c + 4; }
+    if (x >= load64(tk + (c + 1) * 8)) { c = c + 2; }
+    if (x >= load64(tk + c * 8)) { c = c + 1; }
+    return c;
+}
+
 # Pack f64[n] `src` into 4-bit NF4 codes (`nibbles`) + per-block absmax scales
 # (`scales`, f64[n_blocks]). Returns the block count; 0 for block <= 0, with
-# nothing written.
+# nothing written. (1.9.1) Each code is _tula_nf4_code's, inlined: the scan's
+# answer through the thresholds.
 fn tula_nf4_pack(src, n, block, scales, nibbles): i64 {
     if (block <= 0) { return 0; }
     var lv[128];
     _tula_nf4_table(&lv);
+    var tk[120];
+    _tula_nf4_tkeys(&tk);
     var nbytes = (n + 1) / 2;
     var z = 0;
     while (z < nbytes) {
@@ -319,7 +382,20 @@ fn tula_nf4_pack(src, n, block, scales, nibbles): i64 {
         while (i < end) {
             var code = 7;   # the exact 0.0 codebook entry (zero-block default)
             if (nz == 1) {
-                code = _tula_nf4_nearest_t(f64_div(load64(src + i * 8), amax), &lv);
+                # _tula_nf4_code, inline: the same four comparisons of keys
+                var xn = f64_div(load64(src + i * 8), amax);
+                if ((xn & 0x7FFFFFFFFFFFFFFF) > 0x3FF0000000000000) {
+                    code = _tula_nf4_nearest_t(xn, &lv);
+                } else {
+                    var x = xn;
+                    if ((x >> 63) != 0) { x = 0 - (x & 0x7FFFFFFFFFFFFFFF); }
+                    var c = 0;
+                    if (x >= load64(&tk + 56)) { c = 8; }
+                    if (x >= load64(&tk + (c + 3) * 8)) { c = c + 4; }
+                    if (x >= load64(&tk + (c + 1) * 8)) { c = c + 2; }
+                    if (x >= load64(&tk + c * 8)) { c = c + 1; }
+                    code = c;
+                }
             }
             var byi = i / 2;
             if ((i & 1) == 0) {
@@ -647,8 +723,17 @@ fn tula_f16_pack(src, n, dst): i64 {
     return n * 2;
 }
 
-# Unpack n binary16 values from `src` into f64[n] `dst`. Returns n.
+# Unpack n binary16 values from `src` into f64[n] `dst`. Returns n. From
+# 262,144 elements (1.9.1) through _tula_lut16's table.
 fn tula_f16_unpack(src, n, dst): i64 {
+    if (n >= 262144) {
+        if (_tula_lut16(src, n, dst, 0) == 1) { return n; }
+    }
+    return _tula_f16_widen(src, n, dst);
+}
+
+# The F16 widening loop.
+fn _tula_f16_widen(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
         var h = load16(src + i * 2);
@@ -681,8 +766,17 @@ fn tula_bf16_pack(src, n, dst): i64 {
     return n * 2;
 }
 
-# Unpack n bfloat16 values from `src` into f64[n] `dst`. Returns n.
+# Unpack n bfloat16 values from `src` into f64[n] `dst`. Returns n. From
+# 262,144 elements (1.9.1) through _tula_lut16's table.
 fn tula_bf16_unpack(src, n, dst): i64 {
+    if (n >= 262144) {
+        if (_tula_lut16(src, n, dst, 1) == 1) { return n; }
+    }
+    return _tula_bf16_widen(src, n, dst);
+}
+
+# The BF16 widening loop.
+fn _tula_bf16_widen(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
         var h = load16(src + i * 2);
@@ -694,6 +788,42 @@ fn tula_bf16_unpack(src, n, dst): i64 {
         i = i + 1;
     }
     return n;
+}
+
+# The 16-bit unpacks for large tensors (1.9.1): every one of the 65,536 codes'
+# f64 is made once per call, by the widening loop itself (F16 when `which` is
+# 0, BF16 when 1), into a private 640 KiB mapping, and each element is then one
+# load, four codes per read. The same bits as the loop, by construction. The
+# table is per call, never shared, so calls on several threads don't meet; it
+# is unmapped before returning. Returns 1, or 0 (nothing written) if the
+# mapping can't be made, and the caller runs the loop instead.
+fn _tula_lut16(src, n, dst, which): i64 {
+    var tab = mmap_anon(655360);         # 65,536 f64 entries, then the code ramp
+    if (tab == 0) { return 0; }
+    var ramp = tab + 524288;
+    var h = 0;
+    while (h < 65536) {
+        store16(ramp + h * 2, h);
+        h = h + 1;
+    }
+    if (which == 0) { _tula_f16_widen(ramp, 65536, tab); }
+    else            { _tula_bf16_widen(ramp, 65536, tab); }
+    var i = 0;
+    while (i + 4 <= n) {
+        var w = load64(src + i * 2);
+        var q = dst + i * 8;
+        store64(q, load64(tab + ((w & 0xFFFF) << 3)));
+        store64(q + 8, load64(tab + (((w >> 16) & 0xFFFF) << 3)));
+        store64(q + 16, load64(tab + (((w >> 32) & 0xFFFF) << 3)));
+        store64(q + 24, load64(tab + ((w >> 48) << 3)));
+        i = i + 4;
+    }
+    while (i < n) {
+        store64(dst + i * 8, load64(tab + (load16(src + i * 2) << 3)));
+        i = i + 1;
+    }
+    cyr_munmap(tab, 655360);
+    return 1;
 }
 
 # ---------------------------------------------------------------------------
