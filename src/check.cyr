@@ -75,7 +75,7 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
         }
     }
     # INT4 (1.8.0, ADR 0011): an odd count leaves the last byte's high nibble zero.
-    if (dt == TULA_DT_INT4) {
+    if (dt == TULA_DT_INT4 || dt == TULA_DT_UINT4) {   # (UINT4 1.12.0, ADR 0015)
         if ((n & 1) == 1) {
             if ((load8(payload + doff + dlen - 1) >> 4) != 0) { return TULA_ERR_VALUE; }
         }
@@ -392,9 +392,17 @@ fn _tula_strict_names(buf, count): i64 {
 # looked up through the names table (ADR 0004). A file without long names has
 # no such sidecar, so there — as in 1.2.0 — a name over 41 chars returns 0.
 fn tula_find_scale(r, e, need): i64 {
+    return tula_find_sidecar(r, e, ".scale", need);
+}
+
+# Entry e's sidecar "<full name><suffix>" (1.12.0, ADR 0015): `suffix` is
+# ".scale", ".min" or any other, and the sidecar must be an f64 tensor that
+# passes tula_entry_payload_ok with at least `need` elements, as for
+# tula_find_scale. Returns it, or 0 (also for need < 1).
+fn tula_find_sidecar(r, e, suffix, need): i64 {
     if (need < 1) { return 0; }
     var name = tula_entry_full_name(r, e);
-    return _tula_scale_ok(_tula_find_name2(r, name, strlen(name), ".scale", 6), need);
+    return _tula_scale_ok(_tula_find_name2(r, name, strlen(name), suffix, strlen(suffix)), need);
 }
 
 # Sidecar `s` (or 0) if it is fit for an unpack reading `need` scales: f64,

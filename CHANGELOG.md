@@ -7,6 +7,85 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-11-12
+
+**Asymmetric 4-bit: UINT4 with a `.min` sidecar.** An additive MINOR
+with no format change (ADR 0015). GGUF Q4_1 checkpoints (`q × d + m`) can now
+be stored losslessly at half a byte per weight, as anukulana asked
+(`2026-11-09-anukulana-per-block-int8-scale-sidecar.md`, in its repo). Before,
+it wrote them as F32. A file that doesn't use UINT4 is byte for byte what
+1.11.0 writes: a cross-version diff against the 1.11.0 tag matched on every
+array helper, builder, strict verdict and lookup.
+
+**1.11.0 reads a 1.12 file**: it opens and verifies it, finds its UINT4 tensors
+and their `.scale` (`tula_find_scale`) and `.min` (by name), and reads its
+metadata. Its strict validator returns `TULA_ERR_DTYPE` for code 15, as for any
+dtype new to it.
+
+### Added
+
+- **`TULA_DT_UINT4` (15)** (ADR 0015): unsigned 4-bit codes 0..15 in INT4's
+  layout, two per byte, with an f64 `"<name>.scale"` and `"<name>.min"` per
+  block: `value = code × scale + min`. Strict's rule is INT4's: an odd count's
+  last high nibble must be zero (`TULA_ERR_VALUE`).
+  - `tula_uint4_get`.
+  - `tula_uint4_pack` is llama.cpp's Q4_1 reference rule in f64: `m` is the
+    block's minimum and `d = (max − min) / 15`, and each code is `(x − m) / d`
+    rounded half up and clamped. NaNs take part in no comparison and get 0.
+  - `tula_uint4_unpack` computes `f64_mul` then `f64_add`, with no fused
+    multiply-add. From a block of 16, each block's 16 values come from one
+    `f64v_scale` and one `f64v_add`.
+  - `api.md` shows how to import a GGUF Q4_1 tensor losslessly.
+- **Sidecars by suffix:** `tula_find_sidecar(r, e, suffix, need)`,
+  `tula_index_find_sidecar` and `tula_set_find_sidecar`. They find
+  `"<full name><suffix>"`, checked as the `.scale` lookups are. Those three are
+  now this lookup with `".scale"`, with unchanged answers.
+- **ADR 0015** records the choices:
+  - a new unsigned dtype rather than INT4 plus an offset;
+  - one lookup by suffix rather than `.min`-specific calls;
+  - two sidecars rather than one `[n_blocks, 2]` tensor;
+  - division rather than llama.cpp's reciprocal, as INT4 does.
+
+  It records what's left: a `.zero` sidecar for AWQ/GPTQ zero points (which
+  `.min` can't express exactly), 5-bit codes, and a parallel UINT4 unpack.
+
+### Changed
+
+- **`tula_unpack_par` doesn't cover UINT4** (two sidecars), and returns −1 for
+  it, as for any dtype it doesn't cover. Documented.
+- **`tests/tcyr/uint4.tcyr`** (new, 51 assertions):
+  - sizes, and every byte through `tula_uint4_get`;
+  - Q4_1's rule: the minimum to 0, the maximum to 15, rounding half up, equal
+    values, NaNs, a block of only NaNs;
+  - unpack against `mul` then `add` at blocks 1–64 with inf, NaN and −0
+    sidecars;
+  - a GGUF Q4_1 block imported;
+  - strict's nibble rule and `payload_ok`;
+  - the sidecar lookups in a file, through the index and across a shard set;
+  - a streamed file, every value within half a step.
+
+  Three seeded bugs are each caught: the minimum added before scaling, a clamp
+  at 14, and strict without UINT4's nibble rule.
+- **`floats.tcyr`'s "next code is unknown"** check moves from 15 to 16.
+- **The fuzzer** unpacks UINT4 entries and checks an odd count's last high
+  nibble on a strict accept. Phase I's file holds two UINT4 tensors, and phase
+  H's builders draw it.
+  - The new random stream gives new baselines: 3,204,500 iterations, 93,454
+    strict accepts confirmed by brute force, 0 failures.
+  - A strict validator without UINT4's rule fails it 901 times.
+  - **A fuzzer fix:** its block-scale buffer held 1,024 scales, sized for NF4's
+    blocks of 64. An INT4 entry of the largest size reads 1,032, so it read a
+    few past the buffer (on the heap, not a guard page). It now holds 1,040.
+- **`make realmodels`** gains a tenth inventory: Llama-2-7B as a Q4_1-style
+  UINT4 import, each 2-D weight with its per-32 `.scale` and `.min` found by
+  index and by file (743 tensors).
+- **Bench**: UINT4 pack ~56 Melem/s and unpack ~257, against INT4's ~58 and
+  ~333. Adding the minimum costs the table build per block.
+- **Roadmap**: 1.12.x's asymmetric 4-bit item is done. The rest of the line
+  (zero points, 5-bit, the FP8 variants, unsigned integers) still waits on an
+  importer. A parallel UINT4 unpack joins 1.13.x, and new dtype codes start at
+  16.
+
 ## [1.11.0] - 2026-11-12
 
 **Sharded checkpoints.** An additive MINOR with no format change

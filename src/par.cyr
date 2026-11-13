@@ -76,7 +76,9 @@ fn _tula_par_src_off(dt, s): i64 {
 
 # Unpack n elements of dtype `dtype` from `src` into `dst` on up to `nthreads`
 # threads, the caller's included. Returns n, or -1 (writing nothing) for a
-# dtype with no unpack helper, n < 0, or block <= 0 for NF4 or INT4.
+# dtype it doesn't cover, n < 0, or block <= 0 for NF4 or INT4. It doesn't cover
+# the dtypes without an unpack helper, nor (1.12.0) UINT4, whose unpack needs
+# two sidecars.
 #
 # The dtypes and their arguments are the serial helpers': F32, F16, BF16,
 # F8_E4M3 and F8_E5M2 (`scales` and `block` unused), INT8 (the one f64 scale at

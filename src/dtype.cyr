@@ -503,6 +503,7 @@ fn tula_packed_len(dtype, nelems): i64 {
     if (dtype == TULA_DT_F8_E4M3) { return nelems; }       # 1.8.0
     if (dtype == TULA_DT_F8_E5M2) { return nelems; }       # 1.8.0
     if (dtype == TULA_DT_INT4)    { return tula_int4_bytes(nelems); }   # 1.8.0
+    if (dtype == TULA_DT_UINT4)   { return tula_int4_bytes(nelems); }   # 1.12.0
     return 0 - 1;
 }
 
@@ -1082,6 +1083,134 @@ fn tula_int4_unpack(codes, scales, n, block, dst): i64 {
         if (end > n) { end = n; }
         while (i < end) {
             store64(dst + i * 8, f64_mul(f64_from(tula_int4_get(codes, i)), d));
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    return n;
+}
+
+# ---------------------------------------------------------------------------
+# UINT4 (1.12.0, ADR 0015): unsigned 4-bit codes 0..15 in INT4's layout (two
+# per byte, element 2k in the low nibble of byte k, an odd count's last high
+# nibble zero; sizes are tula_int4_bytes / tula_int4_blocks). Each block of
+# `block` elements has one f64 scale d and one f64 minimum m, in the
+# "<name>.scale" and "<name>.min" sidecars (ADR 0002): value = code x d + m.
+# ---------------------------------------------------------------------------
+
+# Code i (0..15) of a packed UINT4 buffer.
+fn tula_uint4_get(codes, i): i64 {
+    var b = load8(codes + (i >> 1));
+    if ((i & 1) == 1) { return (b >> 4) & 0xF; }
+    return b & 0xF;
+}
+
+# Quantize f64[n] `src` into UINT4 `codes` (tula_int4_bytes(n) bytes) with one
+# f64 scale in `scales` and one f64 minimum in `mins` per block
+# (tula_int4_blocks(n, block) of each). The rule is llama.cpp's Q4_1 reference
+# quantizer, in f64: m is the block's smallest value and d = (max - min) / 15,
+# and each code is (x - m) / d rounded half up, clamped to 0..15, so m gets 0
+# and the largest value 15. A block of equal values gets d = +0 and codes 0.
+# NaNs take part in no comparison, so they don't move m or the maximum, and
+# their codes are 0; a block of only NaNs gets m = +0. Returns the block count
+# (0, writing nothing, for block <= 0).
+fn tula_uint4_pack(src, n, block, scales, mins, codes): i64 {
+    if (block <= 0) { return 0; }
+    var nbytes = (n + 1) / 2;
+    var z = 0;
+    while (z < nbytes) {
+        store8(codes + z, 0);
+        z = z + 1;
+    }
+    var half = f64_div(f64_from(1), f64_from(2));
+    var fifteen = f64_from(15);
+    var nblocks = (n + block - 1) / block;
+    var bi = 0;
+    while (bi < nblocks) {
+        var start = bi * block;
+        var end = start + block;
+        if (end > n) { end = n; }
+        var mn = 0x7FF0000000000000;    # +inf
+        var mx = 0xFFF0000000000000;    # -inf
+        var i = start;
+        while (i < end) {
+            var v = load64(src + i * 8);
+            if (f64_lt(v, mn) == 1) { mn = v; }
+            if (f64_gt(v, mx) == 1) { mx = v; }
+            i = i + 1;
+        }
+        if (f64_lt(mx, mn) == 1) {      # nothing comparable: only NaNs
+            mn = f64_from(0);
+            mx = mn;
+        }
+        var d = f64_div(f64_sub(mx, mn), fifteen);
+        store64(scales + bi * 8, d);
+        store64(mins + bi * 8, mn);
+        if (f64_gt(d, f64_from(0)) == 1) {
+            i = start;
+            while (i < end) {
+                var t = f64_add(f64_div(f64_sub(load64(src + i * 8), mn), d), half);
+                var q = f64_to(t);                                 # toward zero ...
+                if (f64_lt(t, f64_from(q)) == 1) { q = q - 1; }    # ... then down: floor
+                if (q > 15) { q = 15; }
+                if (q < 0) { q = 0; }
+                var byi = i >> 1;
+                if ((i & 1) == 0) {
+                    store8(codes + byi, load8(codes + byi) | q);
+                } else {
+                    store8(codes + byi, load8(codes + byi) | (q << 4));
+                }
+                i = i + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    return nblocks;
+}
+
+# Dequantize n UINT4 codes into f64[n] `dst`: value = f64_mul(code, d), then
+# f64_add of m, for its block's scale d and minimum m (tula_int4_blocks(n,
+# block) of each read). Returns n (0, writing nothing, for block <= 0). From a
+# block of 16, each block's 16 values are made once (one f64v_scale, then one
+# f64v_add: the same two IEEE operations per lane, no fused multiply-add), and
+# each code is a load.
+fn tula_uint4_unpack(codes, scales, mins, n, block, dst): i64 {
+    if (block <= 0) { return 0; }
+    var i = 0;
+    var bi = 0;
+    if (block >= 16) {
+        var cv[128];
+        var c = 0;
+        while (c < 16) {
+            store64(&cv + c * 8, f64_from(c));
+            c = c + 1;
+        }
+        var mv[128];
+        var tab[128];
+        while (i < n) {
+            var m = load64(mins + bi * 8);
+            var k = 0;
+            while (k < 16) {
+                store64(&mv + k * 8, m);
+                k = k + 1;
+            }
+            f64v_scale(&tab, &cv, load64(scales + bi * 8), 16);
+            f64v_add(&tab, &tab, &mv, 16);
+            var stop = i + block;
+            if (stop > n) { stop = n; }
+            _tula_lut4_span(codes, i, stop, dst, &tab);
+            i = stop;
+            bi = bi + 1;
+        }
+        return n;
+    }
+    while (i < n) {
+        var d = load64(scales + bi * 8);
+        var mn = load64(mins + bi * 8);
+        var end = i + block;
+        if (end > n) { end = n; }
+        while (i < end) {
+            store64(dst + i * 8, f64_add(f64_mul(f64_from(tula_uint4_get(codes, i)), d), mn));
             i = i + 1;
         }
         bi = bi + 1;

@@ -516,6 +516,26 @@ fn main(): i64 {
     report_el("int4 pack    : ", n, q4p);
     report_el("int4 unpack  : ", n, q4u);
 
+    # ---- UINT4 (1.12.0, ADR 0015): Q4_1's rule, .scale + .min per 32 ----
+    var u4 = alloc(tula_int4_bytes(n));
+    var u4s = alloc(tula_int4_blocks(n, TULA_INT4_BLOCK) * 8);
+    var u4m = alloc(tula_int4_blocks(n, TULA_INT4_BLOCK) * 8);
+    var u4p = 0;
+    var u4u = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var tu = now_ns();
+        tula_uint4_pack(sig, n, TULA_INT4_BLOCK, u4s, u4m, u4);
+        u4p = min_of(u4p, round, now_ns() - tu);
+        var tu2 = now_ns();
+        tula_uint4_unpack(u4, u4s, u4m, n, TULA_INT4_BLOCK, out);
+        u4u = min_of(u4u, round, now_ns() - tu2);
+        round = round + 1;
+    }
+    chk = chk + load64(out + 8 * 31337);
+    report_el("uint4 pack   : ", n, u4p);
+    report_el("uint4 unpack : ", n, u4u);
+
     # ---- long names (1.3.0): 256 LoRA-style names over 47 chars ----
     var lnames = alloc(BN_FIND_N * 8);
     var lb = tula_builder_new();

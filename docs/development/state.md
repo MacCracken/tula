@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.11.0** (`tula_version_int()` returns `11100`). 1.0.1–1.1.1 are
+VERSION is **1.12.0** (`tula_version_int()` returns `11200`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -73,17 +73,21 @@ signed, tensor-less manifest whose `tula.shards` key lists each shard's
 SHA-256, size and name. `tula_builder_set_shards` writes one; `tula_set_open`
 verifies one (one signature, then the shards' SHA-256 in parallel, ~1.2 GB/s at
 8 threads) and `tula_set_find` resolves names across it. `TULA_ERR_SHARDS` = 20.
+**1.12.0 — asymmetric 4-bit** (ADR 0015). `TULA_DT_UINT4` = 15, unsigned codes in INT4's
+layout with `.scale` and `.min` sidecars (`code × d + m`, GGUF Q4_1), quantized
+by Q4_1's rule; `tula_find_sidecar` (and its index and set forms) finds a
+sidecar by suffix. 1.11.0 reads such files; its strict says `TULA_ERR_DTYPE`.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.11.0)
+## Tests, fuzz, gates (1.12.0)
 
-**923 assertions** across 18 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
+**974 assertions** across 19 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
 (1.11.0: a written and opened set, every refusal with its code and shard, the
 builder's and strict's rules), `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
-`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
+`ints.tcyr` 61, `uint4.tcyr` 51 (1.12.0), `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
 and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
 16-bit tables and NF4 thresholds), `floats.tcyr` 37, `protected.tcyr` 35
 (1.10.0: the copy branch under an in-place rewrite and a truncation, the forced
@@ -102,7 +106,8 @@ zero-copy branch, the verity check), `fileio.tcyr` 30,
   real names, ranks, counts and dtypes, dims ÷ 64. Each is written signed, read, strict-validated,
   verified and resolved by index. (1.11.0) Llama-2-70B, BF16, 723 tensors, as a
   shard set: 15 unsigned shards and a signed manifest, opened with
-  `tula_set_open` and resolved through `tula_set_find`.
+  `tula_set_open` and resolved through `tula_set_find`. (1.12.0) Llama-2-7B as
+  a Q4_1-style UINT4 import, each 2-D weight with `.scale` and `.min` (743).
 - `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
   mapped, strict-validated, read into a caller buffer, and (1.6.2) written back
   out from it by `tula_write_file_atomic` and `tula_write_file`, each copy
@@ -122,26 +127,27 @@ zero-copy branch, the verity check), `fileio.tcyr` 30,
   decodes and 400,000 encodes.
 - `dtype` and `builder` include differential tests against the 1.1.1
   implementations.
-- `make fuzz` (CI, ~65 s): 3,204,500 iterations with every buffer ending at a
-  `PROT_NONE` guard page, 0 faults. It covers:
-  - a payload-guard + unpack phase (4.60M entries, all fifteen dtypes, each
+- `make fuzz` (CI, ~70 s): 3,204,500 iterations with every buffer ending at a
+  `PROT_NONE` guard page, 0 faults (1.12.0's numbers; UINT4 in phases H and I
+  changed the random stream). It covers:
+  - a payload-guard + unpack phase (5.11M entries, all sixteen dtypes, each
     data_len held to the fuzzer's own size table);
-  - a strict phase, where 92,821 strict accepts were all confirmed by brute
+  - a strict phase, where 93,454 strict accepts were all confirmed by brute
     force, including the find-name round trip, every BOOL byte 0/1, an odd
-    INT4's last high nibble and the size table; 12,821 `TULA_ERR_VALUE`
-    rejections;
+    INT4's or UINT4's last high nibble and the size table; 12,337
+    `TULA_ERR_VALUE` rejections;
   - phase F, which mutates a names table, and phase G, a metadata table;
-  - phase H (1.6.1): 1,500 random builders through the streaming writers (737
+  - phase H (1.6.1): 1,500 random builders through the streaming writers (754
     nameless, the rest on the named temp), every file byte-identical to
-    `finish`, 446 canonical ones strict-accepted, no temp left behind;
-  - phase I (1.7.0; 1.8.0 adds FP8 and INT4): 300,000 mutations of a file
-    holding the integer, boolean, FP8 and INT4 dtypes, aimed at payload
-    bytes, dtype fields and shapes;
+    `finish`, 440 canonical ones strict-accepted, no temp left behind;
+  - phase I (1.7.0; 1.8.0 adds FP8 and INT4, 1.12.0 UINT4): 300,000 mutations
+    of a file holding the integer, boolean, FP8, INT4 and UINT4 dtypes, aimed
+    at payload bytes, dtype fields and shapes;
   - phase J (1.9.0): 400 parallel unpacks (nine dtypes, up to five chunks,
     odd blocks, 1–9 threads) against the serial helpers, payload and scales
     each ending at a guard page;
   - phase K (1.11.0): 200,000 mutations of a manifest's shard list, strict's
-    verdict matched against the fuzzer's own reading (18,921 accepted, 114,006
+    verdict matched against the fuzzer's own reading (18,916 accepted, 114,018
     refused), and 300 sets on disk with one shard corrupted or cut, every one
     refused by `tula_set_open`.
 
@@ -184,9 +190,8 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: on CI, confirm the fs-verity step runs rather than skips, and read the
-native arm64 runner's `make realmodels` time for the sharded 70B set (sigil's
-SHA-256 has no SHA-NI path there); 1.11.x patches only for fixes. The open lines are in the [roadmap](roadmap.md): 1.12.x
+Next: on CI, confirm the fs-verity step runs rather than skips, and read the native arm64 runner's `make realmodels`
+time for the sharded 70B set. The rest of 1.12.x waits on an importer. The open lines are in the [roadmap](roadmap.md): 1.12.x
 the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
 protection for unsealed files, then 1.x.x (shard-set follow-ups among them) and
 the v2 candidates. Each waits on

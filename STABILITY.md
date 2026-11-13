@@ -13,7 +13,9 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
   conversion semantics, from 1.7.0 `I16/I32/I64/U8/BOOL` with ADR 0009's raw
   encodings and BOOL's 0/1 rule, and from 1.8.0 `F8_E4M3/F8_E5M2` with ADR
   0010's conversion semantics and `INT4` with ADR 0011's nibble order, its
-  unused-nibble rule and the Q4_0 quantization rule), the signed-header scheme (Ed25519 over `[0, sig_off)`,
+  unused-nibble rule and the Q4_0 quantization rule, and from 1.12.0 `UINT4`
+  with ADR 0015's layout (INT4's), the `.min` sidecar beside `.scale` and the
+  Q4_1 quantization rule), the signed-header scheme (Ed25519 over `[0, sig_off)`,
   `sig_len ∈ {0, 64}`), and from 1.3.0 the long-name convention (ADR 0004): the
   key formula, the `__tula.names__` table layout, and its magic. From 1.6.0 also
   the metadata convention (ADR 0008): the `__tula.meta__` table's position,

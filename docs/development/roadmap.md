@@ -64,6 +64,7 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
   - the raw integer encodings and BOOL's 0/1 rule (ADR 0009);
   - the FP8 encodings and conversion semantics (ADR 0010), and INT4's nibble
     order, unused-nibble rule and quantization rule (ADR 0011);
+  - UINT4's layout, its `.min` sidecar and Q4_1's rule (ADR 0015);
   - shard sets: a tensor-less manifest whose `tula.shards` key lists each
     shard's SHA-256, size and name (ADR 0014).
 
@@ -78,15 +79,19 @@ Shipped lines (through 1.11.0) aren't listed; a released line takes patches
 only: fixes, with no new function, dtype or convention. The lines below are
 ordered by how soon a consumer is likely to need them. Each starts when its gate
 is met (an importer's need, a decision), not on a date, and new dtype codes start
-at 15.
+at 16.
 
 ## 1.12.x — the remaining dtypes
 
 **Goal:** the formats ADRs 0009–0011 left out, each when an importer needs it.
+1.12.0 added the asymmetric 4-bit format anukulana asked for: `TULA_DT_UINT4`
+with `.scale` and `.min` sidecars (Q4_1, ADR 0015), and `tula_find_sidecar` for
+any suffix. Still waiting on an importer:
 
-- **Asymmetric 4-bit** (Q4_1, AWQ/GPTQ with zero points): an unsigned 4-bit
-  dtype and a `.min` / zero-point sidecar convention beside `.scale` (ADR 0011).
-  GPTQ/AWQ already import losslessly as `I32`.
+- **Zero points** (AWQ/GPTQ, `(q − z) × s`): a `.zero` sidecar of integer zero
+  points beside UINT4's `.scale`. `.min` can't express them exactly, and they
+  import losslessly as `I32` today (ADR 0015).
+- **5-bit codes** (Q5_0 / Q5_1), a dtype of their own.
 - **FP8 variants** (ADR 0010): saturating conversions (as their own helpers;
   the non-saturating ones are frozen) and the FNUZ variants (`E4M3FNUZ`,
   `E5M2FNUZ`, with their own bias and a single NaN).
@@ -100,6 +105,8 @@ at 15.
   threads; the blockwise and float packs split as the unpacks do.
 - **A caller-owned worker pool**, if per-call thread starts (~29 µs each) show
   up beside `tula_unpack_par`.
+- **A parallel UINT4 unpack.** `tula_unpack_par` takes one sidecar, and UINT4
+  needs two (ADR 0015).
 
 ## 1.14.x — zero-copy protection for unsealed files
 

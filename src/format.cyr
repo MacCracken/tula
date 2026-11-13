@@ -44,6 +44,7 @@ enum TulaDType {
     TULA_DT_F8_E4M3 = 12;  # OCP FP8 E4M3 (no inf; NaN S.1111.111), 1 byte (1.8.0, ADR 0010)
     TULA_DT_F8_E5M2 = 13;  # OCP FP8 E5M2 (IEEE-like), 1 byte (1.8.0, ADR 0010)
     TULA_DT_INT4    = 14;  # signed 4-bit codes, 2 per byte, low nibble first (1.8.0, ADR 0011)
+    TULA_DT_UINT4   = 15;  # unsigned 4-bit codes, INT4's layout; .scale + .min sidecars (1.12.0, ADR 0015)
 }
 
 # The long-name table (1.3.0, ADR 0004): a reserved int8 tensor named
@@ -174,9 +175,9 @@ fn _tula_has_zero(w): i64 {
     return 0;
 }
 
-# Packed version int: major*10000 + minor*100 + patch (1.11.0 -> 11100).
+# Packed version int: major*10000 + minor*100 + patch (1.12.0 -> 11200).
 fn tula_version_int(): i64 {
-    return 11100;
+    return 11200;
 }
 
 # ---------------------------------------------------------------------------

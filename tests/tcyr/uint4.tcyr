@@ -1,0 +1,355 @@
+# tests/tcyr/uint4.tcyr — the 1.12.0 UINT4 dtype (ADR 0015): unsigned 4-bit
+# codes in INT4's layout, with an f64 ".scale" and an f64 ".min" per block,
+# value = code x scale + min. Sizes; every byte through tula_uint4_get;
+# llama.cpp's Q4_1 rule (the minimum -> 0, the maximum -> 15, round half up, a
+# block of equal values, NaNs); unpack against its definition on the table path
+# and below it; strict's nibble rule; the sidecar lookups by suffix (file,
+# index, set); a GGUF Q4_1 block imported losslessly; a streamed file.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn fv(n, d): i64 {
+    return f64_div(f64_from(n), f64_from(d));
+}
+
+fn fi(n): i64 {
+    return f64_from(n);
+}
+
+fn shape1(a): i64 {
+    var s = alloc(8);
+    store64(s, a);
+    return s;
+}
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    return x ^ ((x >> 29) & 0x7FFFFFFFF);
+}
+
+fn test_sizes_and_get() {
+    assert_eq(TULA_DT_UINT4, 15, "UINT4 is code 15");
+    assert_eq(tula_packed_len(TULA_DT_UINT4, 64), 32, "packed_len uint4 [64] = 32");
+    assert_eq(tula_packed_len(TULA_DT_UINT4, 7), 4, "packed_len uint4 [7] = 4");
+    var p = alloc(256);
+    var b = 0;
+    while (b < 256) { store8(p + b, b); b = b + 1; }
+    var ok = 1;
+    b = 0;
+    while (b < 256) {
+        if (tula_uint4_get(p, b * 2) != (b & 0xF)) { ok = 0; }
+        if (tula_uint4_get(p, b * 2 + 1) != (b >> 4)) { ok = 0; }
+        b = b + 1;
+    }
+    assert_eq(ok, 1, "all 256 bytes: low nibble first, both read as 0..15");
+    return 0;
+}
+
+fn test_q4_1_rule() {
+    # 16 values from -3 to 4.5 in steps of 0.5: m = -3, d = 7.5 / 15 = 0.5, codes 0..15
+    var src = alloc(16 * 8);
+    var i = 0;
+    while (i < 16) { store64(src + i * 8, fv(i - 6, 2)); i = i + 1; }
+    var codes = alloc(16);
+    var sc = alloc(8);
+    var mn = alloc(8);
+    assert_eq(tula_uint4_pack(src, 16, 32, sc, mn, codes), 1, "16 values: one block");
+    assert_eq(load64(mn), fi(0 - 3), "the minimum is the block's smallest value");
+    assert_eq(load64(sc), fv(1, 2), "d = (max - min) / 15 = 0.5");
+    var ok = 1;
+    i = 0;
+    while (i < 16) {
+        if (tula_uint4_get(codes, i) != i) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "each value gets its step: the minimum 0, the maximum 15");
+    var out = alloc(16 * 8);
+    assert_eq(tula_uint4_unpack(codes, sc, mn, 16, 32, out), 16, "unpack returns n");
+    ok = 1;
+    i = 0;
+    while (i < 16) {
+        if (load64(out + i * 8) != load64(src + i * 8)) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, "... and gives them back exactly (they are on the grid)");
+    # rounding half up: on [0, 15] with d = 1, 2.5 -> 3, 2.4999 -> 2
+    var s2 = alloc(4 * 8);
+    store64(s2, fi(0));
+    store64(s2 + 8, fi(15));
+    store64(s2 + 16, fv(5, 2));
+    store64(s2 + 24, f64_sub(fv(5, 2), fv(1, 10000)));
+    var c2 = alloc(4);
+    tula_uint4_pack(s2, 4, 4, sc, mn, c2);
+    assert_eq(tula_uint4_get(c2, 2), 3, "2.5 rounds half up, to 3");
+    assert_eq(tula_uint4_get(c2, 3), 2, "2.4999 to 2");
+    # a block of equal values
+    var s3 = alloc(5 * 8);
+    i = 0;
+    while (i < 5) { store64(s3 + i * 8, fi(7)); i = i + 1; }
+    var c3 = alloc(3);
+    store8(c3, 0xFF);
+    store8(c3 + 1, 0xFF);
+    store8(c3 + 2, 0xFF);
+    tula_uint4_pack(s3, 5, 32, sc, mn, c3);
+    assert_eq(load64(sc), 0, "equal values: d = +0");
+    assert_eq(load64(mn), fi(7), "... m = the value");
+    assert_eq(load8(c3) + load8(c3 + 1) + load8(c3 + 2), 0, "... every code 0, the odd count's last high nibble too");
+    tula_uint4_unpack(c3, sc, mn, 5, 32, out);
+    assert_eq(load64(out + 32), fi(7), "... and they come back exactly");
+    # NaNs take part in no comparison: code 0, and min/max ignore them
+    var s4 = alloc(4 * 8);
+    store64(s4, 0x7FF8000000000000);
+    store64(s4 + 8, fi(1));
+    store64(s4 + 16, fi(16));
+    store64(s4 + 24, 0x7FF8000000000000);
+    var c4 = alloc(2);
+    tula_uint4_pack(s4, 4, 4, sc, mn, c4);
+    assert_eq(load64(mn), fi(1), "a NaN doesn't become the minimum");
+    assert_eq(load64(sc), fi(1), "... nor the maximum: d = (16 - 1) / 15");
+    assert_eq(tula_uint4_get(c4, 0) + tula_uint4_get(c4, 3), 0, "NaNs get code 0");
+    assert_eq(tula_uint4_get(c4, 2), 15, "the maximum gets 15");
+    var s5 = alloc(8);
+    store64(s5, 0x7FF8000000000000);
+    var c5 = alloc(1);
+    tula_uint4_pack(s5, 1, 4, sc, mn, c5);
+    assert_eq(load64(mn), 0, "a block of only NaNs: m = +0");
+    assert_eq(tula_uint4_pack(src, 16, 0, sc, mn, codes), 0, "block 0: nothing written, 0");
+    assert_eq(tula_uint4_unpack(codes, sc, mn, 16, 0, out), 0, "... and unpack with block 0 returns 0");
+    return 0;
+}
+
+# Unpack against value = f64_add(f64_mul(code, d), m) on every element, at
+# blocks below, at and above the 16-element table threshold, odd and even.
+fn test_unpack_definition() {
+    var s = alloc(8);
+    store64(s, 0x41);
+    var n = 2001;
+    var codes = alloc((n + 1) / 2);
+    var i = 0;
+    while (i < (n + 1) / 2) { store8(codes + i, lcg(s) & 0xFF); i = i + 1; }
+    var sc = alloc(n * 8);
+    var mn = alloc(n * 8);
+    i = 0;
+    while (i < n) {
+        store64(sc + i * 8, (lcg(s) & 0x800FFFFFFFFFFFFF) | ((1013 + (lcg(s) & 15)) << 52));
+        store64(mn + i * 8, (lcg(s) & 0x800FFFFFFFFFFFFF) | ((1013 + (lcg(s) & 15)) << 52));
+        i = i + 1;
+    }
+    store64(sc + 8, 0x7FF0000000000000);    # an inf scale
+    store64(mn + 16, 0x7FF8000000000000);   # a NaN minimum
+    store64(sc + 24, 0x8000000000000000);   # -0
+    var out = alloc(n * 8);
+    var bl[64];
+    store64(&bl, 1); store64(&bl + 8, 3); store64(&bl + 16, 15); store64(&bl + 24, 16);
+    store64(&bl + 32, 17); store64(&bl + 40, 32); store64(&bl + 48, 33); store64(&bl + 56, 64);
+    var bad = 0;
+    var j = 0;
+    while (j < 8) {
+        var blk = load64(&bl + j * 8);
+        var len = n - (j & 1);
+        if (tula_uint4_unpack(codes, sc, mn, len, blk, out) != len) { bad = bad + 1; }
+        i = 0;
+        while (i < len) {
+            var b = i / blk;
+            var want = f64_add(f64_mul(f64_from(tula_uint4_get(codes, i)), load64(sc + b * 8)), load64(mn + b * 8));
+            if (load64(out + i * 8) != want) { bad = bad + 1; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    assert_eq(bad, 0, "unpack == mul then add (no FMA): blocks 1..64, odd/even n, inf/NaN/-0 sidecars");
+    return 0;
+}
+
+# A GGUF Q4_1 block imported as ADR 0015 says: codes moved from the block layout
+# (byte j holds elements j and j + 16) to element order, f16 d and m widened.
+fn test_q4_1_import() {
+    var qs = alloc(16);
+    var j = 0;
+    while (j < 16) { store8(qs + j, ((j * 5) & 15) | ((((15 - j) * 3) & 15) << 4)); j = j + 1; }
+    var dh = 0x2E66;    # f16 0.1 (nearest)
+    var mh = 0xBC00;    # f16 -1.0
+    var d = tula_f16_to_f64(dh);
+    var m = tula_f16_to_f64(mh);
+    var codes = alloc(16);
+    var e = 0;
+    while (e < 16) { store8(codes + e, 0); e = e + 1; }
+    e = 0;
+    while (e < 32) {
+        var q = 0;
+        if (e < 16) { q = load8(qs + e) & 15; }
+        else { q = load8(qs + e - 16) >> 4; }
+        var byi = e >> 1;
+        if ((e & 1) == 0) { store8(codes + byi, load8(codes + byi) | q); }
+        else { store8(codes + byi, load8(codes + byi) | (q << 4)); }
+        e = e + 1;
+    }
+    var sc = alloc(8);
+    var mn = alloc(8);
+    store64(sc, d);
+    store64(mn, m);
+    var out = alloc(32 * 8);
+    tula_uint4_unpack(codes, sc, mn, 32, 32, out);
+    var ok = 1;
+    e = 0;
+    while (e < 32) {
+        var q2 = 0;
+        if (e < 16) { q2 = load8(qs + e) & 15; }
+        else { q2 = load8(qs + e - 16) >> 4; }
+        if (load64(out + e * 8) != f64_add(f64_mul(f64_from(q2), d), m)) { ok = 0; }
+        e = e + 1;
+    }
+    assert_eq(ok, 1, "a Q4_1 block: every element is q x d + m of its GGUF code, in element order");
+    return 0;
+}
+
+fn test_strict_and_sidecars() {
+    var n = 7;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, fi(i * 2 - 5)); i = i + 1; }
+    var codes = alloc(8);
+    var sc = alloc(8);
+    var mn = alloc(8);
+    tula_uint4_pack(src, n, 32, sc, mn, codes);
+    assert_eq(load8(codes + 3) >> 4, 0, "pack leaves an odd count's last high nibble zero");
+    var name = "model.layers.0.mlp.down_proj.weight";
+    var b = tula_builder_new();
+    tula_builder_add_checked(b, name, TULA_DT_UINT4, shape1(n), 1, codes, 4);
+    tula_builder_add_checked(b, "model.layers.0.mlp.down_proj.weight.scale", TULA_DT_F64, shape1(1), 1, sc, 8);
+    tula_builder_add_checked(b, "model.layers.0.mlp.down_proj.weight.min", TULA_DT_F64, shape1(1), 1, mn, 8);
+    var buf = tula_builder_finish(b);
+    var len = tula_total_len(buf);
+    assert_eq(tula_validate_strict(buf, len), TULA_OK, "a canonical uint4 file is strict-accepted");
+    var e = tula_find(buf, name);
+    var s = tula_find_sidecar(buf, e, ".scale", 1);
+    var m = tula_find_sidecar(buf, e, ".min", 1);
+    assert(s != 0, "tula_find_sidecar finds the .scale");
+    assert(m != 0, "... and the .min");
+    assert(s == tula_find_scale(buf, e, 1), "... the .scale as tula_find_scale does");
+    assert_eq(tula_find_sidecar(buf, e, ".min", 2), 0, "a sidecar too short for `need`: 0");
+    assert_eq(tula_find_sidecar(buf, e, ".zero", 1), 0, "a suffix with no tensor: 0");
+    assert_eq(tula_find_sidecar(buf, e, ".min", 0), 0, "need < 1: 0");
+    var ix = tula_index_new(buf);
+    assert(tula_index_find_sidecar(ix, e, ".min", 1) == m, "the index finds the same .min");
+    assert(tula_index_find_scale(ix, e, 1) == s, "... and the same .scale");
+    tula_index_free(ix);
+    var out = alloc(n * 8);
+    tula_uint4_unpack(tula_entry_data(buf, e), tula_entry_data(buf, s), tula_entry_data(buf, m), n, 32, out);
+    assert_eq(load64(out), fi(0 - 5), "from the file: the minimum comes back");
+    var p = tula_entry_data(buf, e);
+    store8(p + 3, load8(p + 3) | 0x30);
+    assert_eq(tula_validate_strict(buf, len), TULA_ERR_VALUE, "an odd count with a non-zero last high nibble -> VALUE");
+    store8(p + 3, load8(p + 3) & 0x0F);
+    var b2 = tula_builder_new();
+    tula_builder_add(b2, "w", TULA_DT_UINT4, shape1(7), 1, codes, 3);
+    var bad = tula_builder_finish(b2);
+    assert_eq(tula_validate_strict(bad, tula_total_len(bad)), TULA_ERR_SHAPE, "uint4 [7] in 3 bytes -> SHAPE");
+    assert_eq(tula_entry_payload_ok(tula_find(bad, "w")), 0, "... and payload_ok refuses it");
+    assert_eq(tula_unpack_par(TULA_DT_UINT4, codes, n, sc, 32, out, 4), 0 - 1,
+      "tula_unpack_par doesn't cover UINT4 (two sidecars): -1");
+    return 0;
+}
+
+# Sidecars in other shards of a set (ADR 0014) are found by suffix too.
+fn test_set_sidecars() {
+    sys_mkdir("build/test_uint4", 0x1ED);
+    var n = 64;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, fv(i * 7 % 23, 3)); i = i + 1; }
+    var codes = alloc(32);
+    var nb = tula_int4_blocks(n, 32);
+    var sc = alloc(nb * 8);
+    var mn = alloc(nb * 8);
+    tula_uint4_pack(src, n, 32, sc, mn, codes);
+    var b1 = tula_builder_new();
+    tula_builder_add_checked(b1, "q", TULA_DT_UINT4, shape1(n), 1, codes, 32);
+    tula_builder_write_file(b1, "build/test_uint4/a.tula");
+    var b2 = tula_builder_new();
+    tula_builder_add_checked(b2, "q.scale", TULA_DT_F64, shape1(nb), 1, sc, nb * 8);
+    tula_builder_add_checked(b2, "q.min", TULA_DT_F64, shape1(nb), 1, mn, nb * 8);
+    tula_builder_write_file(b2, "build/test_uint4/b.tula");
+    var paths = alloc(16);
+    store64(paths, "build/test_uint4/a.tula");
+    store64(paths + 8, "build/test_uint4/b.tula");
+    var mb = tula_builder_new();
+    tula_builder_set_shards(mb, paths, 2, 2);
+    tula_builder_write_file(mb, "build/test_uint4/m.tula");
+    var set = tula_set_open("build/test_uint4/m.tula", 0, 0, 2, 0);
+    assert(set != 0, "a set: the codes in one shard, the sidecars in another");
+    var e = tula_set_find(set, "q");
+    var es = tula_set_find_sidecar(set, e, ".scale", nb);
+    var em = tula_set_find_sidecar(set, e, ".min", nb);
+    assert(es != 0, "tula_set_find_sidecar finds the .scale in the other shard");
+    assert(em != 0, "... and the .min");
+    assert(es == tula_set_find_scale(set, e, nb), "... the .scale as tula_set_find_scale does");
+    var out = alloc(n * 8);
+    tula_uint4_unpack(tula_entry_data(tula_set_reader(set, e), e), tula_entry_data(tula_set_reader(set, es), es),
+      tula_entry_data(tula_set_reader(set, em), em), n, 32, out);
+    var out2 = alloc(n * 8);
+    tula_uint4_unpack(codes, sc, mn, n, 32, out2);
+    assert_eq(memeq(out, out2, n * 8), 1, "... and the set's values are the in-memory ones");
+    tula_set_close(set);
+    return 0;
+}
+
+fn test_streamed() {
+    var n = 1000;
+    var src = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(src + i * 8, fv(i * 31 % 97 - 48, 7)); i = i + 1; }
+    var codes = alloc(tula_int4_bytes(n) + 8);
+    var nb = tula_int4_blocks(n, 32);
+    var sc = alloc(nb * 8);
+    var mn = alloc(nb * 8);
+    tula_uint4_pack(src, n, 32, sc, mn, codes);
+    var b = tula_builder_new();
+    var lname = "base_model.model.model.layers.31.mlp.gate_proj.weight";
+    tula_builder_add_long(b, lname, TULA_DT_UINT4, shape1(n), 1, codes, tula_int4_bytes(n));
+    tula_builder_add_long(b, "base_model.model.model.layers.31.mlp.gate_proj.weight.scale", TULA_DT_F64,
+      shape1(nb), 1, sc, nb * 8);
+    tula_builder_add_long(b, "base_model.model.model.layers.31.mlp.gate_proj.weight.min", TULA_DT_F64,
+      shape1(nb), 1, mn, nb * 8);
+    var mem = tula_builder_finish(b);
+    var mlen = tula_total_len(mem);
+    var path = "build/test_uint4.tula";
+    assert_eq(tula_builder_write_file(b, path), mlen, "streamed uint4: the same length as finish");
+    var r = tula_read_file(path);
+    assert_eq(memeq(r, mem, mlen), 1, "... byte for byte finish");
+    assert_eq(tula_validate_strict(r, mlen), TULA_OK, "... strict-canonical");
+    var e = tula_find_name(r, lname);
+    var s = tula_find_sidecar(r, e, ".scale", nb);
+    var m = tula_find_sidecar(r, e, ".min", nb);
+    assert(s != 0, "the long-named .scale is found");
+    assert(m != 0, "... and the long-named .min");
+    var out = alloc(n * 8);
+    tula_uint4_unpack(tula_entry_data(r, e), tula_entry_data(r, s), tula_entry_data(r, m), n, 32, out);
+    var worst = 0;
+    i = 0;
+    while (i < n) {
+        var b2 = i / 32;
+        var err = f64_abs(f64_sub(load64(out + i * 8), load64(src + i * 8)));
+        var lim = f64_div(load64(sc + b2 * 8), f64_from(2));
+        if (f64_gt(err, f64_add(lim, fv(1, 1000000))) == 1) { worst = worst + 1; }
+        i = i + 1;
+    }
+    assert_eq(worst, 0, "every value is within half a step of its source");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_sizes_and_get();
+    test_q4_1_rule();
+    test_unpack_definition();
+    test_q4_1_import();
+    test_strict_and_sidecars();
+    test_set_sidecars();
+    test_streamed();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

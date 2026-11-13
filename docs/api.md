@@ -52,6 +52,7 @@ SIGNATURE (Ed25519, 64 B) at sig_off = payload_off + payload_len, covering [0, s
 | `TULA_DT_F8_E4M3` | 12 | OCP FP8 E4M3 (no inf; NaN `S.1111.111`), `data_len = nelems` *(1.8.0)* |
 | `TULA_DT_F8_E5M2` | 13 | OCP FP8 E5M2 (IEEE-like), `data_len = nelems` *(1.8.0)* |
 | `TULA_DT_INT4`    | 14 | signed 4-bit codes, 2/byte, low nibble first, `data_len = ceil(nelems/2)` *(1.8.0)* |
+| `TULA_DT_UINT4`   | 15 | unsigned 4-bit codes 0..15, INT4's layout, `data_len = ceil(nelems/2)` *(1.12.0)* |
 
 Quantized dtypes store their scale(s) as a **sidecar** `f64` tensor named
 `"<name>.scale"` (ADR 0002) — the codec never interprets it.
@@ -82,6 +83,11 @@ count leaves the last byte's high nibble zero, and strict rejects a nonzero one
 (`TULA_ERR_VALUE`). INT4's per-block scales are an f64 `"<name>.scale"`
 sidecar, like NF4's. A 1.2–1.7 strict validator returns `TULA_ERR_DTYPE` for
 codes 12–14.
+
+**UINT4** *(1.12.0, ADR 0015)* is INT4's layout with unsigned codes and two
+sidecars, `"<name>.scale"` and `"<name>.min"`: `value = code × scale + min`
+(GGUF Q4_1). Strict's nibble rule is INT4's. A 1.2–1.11 strict validator returns
+`TULA_ERR_DTYPE` for code 15.
 
 ### Long names (1.3.0, ADR 0004)
 
@@ -389,8 +395,13 @@ so looking up every tensor is O(n²). At 4,096 tensors that's 44.8 ms by scan an
 - `fn tula_index_find(ix, name) -> e | 0` — O(log n), and **exactly**
   `tula_find_name(r, name)`'s answer: the first matching entry, any length, a
   long name confirmed against the names table.
+- `fn tula_find_sidecar(r, e, suffix, need) -> se | 0` *(1.12.0, ADR 0015)* —
+  entry `e`'s `"<full name><suffix>"` sidecar, checked as `tula_find_scale`
+  checks it: `".min"` for UINT4, or any suffix. `tula_find_scale` is this
+  lookup with `".scale"`.
 - `fn tula_index_find_scale(ix, e, need) -> se | 0` — `tula_find_scale` through
-  the index.
+  the index. `fn tula_index_find_sidecar(ix, e, suffix, need)` *(1.12.0)* is
+  `tula_find_sidecar` through it.
 - `fn tula_index_free(ix)` — release it (`0` is a no-op).
 
 ## dtype payload helpers — `src/dtype.cyr`
@@ -470,10 +481,35 @@ in integer arithmetic.
   elements from Q4_0's block layout (byte `j` holds elements `j` and `j + 16`)
   into element order, and widen each f16 `d` to f64.
 
+**UINT4** *(1.12.0, ADR 0015)*: unsigned 4-bit codes 0..15 in INT4's layout
+(sizes are `tula_int4_bytes` / `tula_int4_blocks`), with one f64 scale `d` per
+block in `"<name>.scale"` and one f64 minimum `m` in `"<name>.min"`:
+`value = code × d + m`.
+- `fn tula_uint4_get(codes, i) -> 0..15`.
+- `fn tula_uint4_pack(src_f64, n, block, scales_f64, mins_f64, codes) ->
+  n_blocks` — llama.cpp's Q4_1 reference rule in f64.
+  - `m` is the block's smallest value and `d = (max − min) / 15`.
+  - Each code is `(x − m) / d` rounded half up and clamped to 0..15, so the
+    minimum gets 0 and the maximum 15.
+  - A block of equal values gets `d = +0` and codes 0.
+  - NaNs take part in no comparison and get code 0.
+- `fn tula_uint4_unpack(codes, scales, mins, n, block, dst_f64) -> n` — each
+  value is `f64_mul(code, d)`, then `f64_add` of `m`: two IEEE operations, no
+  fused multiply-add. Both return 0 and write nothing for `block <= 0`.
+- Find the sidecars with `tula_find_sidecar(r, e, ".scale", nb)` and
+  `tula_find_sidecar(r, e, ".min", nb)`, `nb = tula_int4_blocks(nelems, block)`
+  (or the index and set forms). `tula_unpack_par` doesn't cover UINT4, which
+  needs two sidecars, and returns −1 for it.
+- **To import GGUF Q4_1 losslessly**, move the codes from the block layout
+  (byte `j` holds elements `j` and `j + 16`) into element order (no XOR: Q4_1's
+  codes are already unsigned), and widen each block's f16 `d` and `m` to f64.
+  The values tula's unpack gives are the f64 of `q × d + m`. They can differ in
+  the last bits from llama.cpp's f32 arithmetic; the stored file is exact.
+
 **Payload-length guard** (untrusted-input discipline):
 - `fn tula_packed_len(dtype, nelems) -> bytes | -1` — expected packed byte length
   (`nelems × width` for the raw dtypes, including 1.7.0's integers and BOOL and
-  1.8.0's FP8; `ceil(nelems/2)` for INT4).
+  1.8.0's FP8; `ceil(nelems/2)` for INT4 and, from 1.12.0, UINT4).
 - `fn tula_entry_payload_ok(e) -> 1 | 0` — overflow-safe check that an entry's
   `data_len` is large enough for its dtype+shape. **Run it before any unpack on a
   foreign entry** (a lying `shape` could otherwise drive an over-read), and on
@@ -507,7 +543,8 @@ scan's answer on every input). Numbers are in [`benchmarks.md`](benchmarks.md).
     - NF4, INT4: `scales` is f64 per `block` elements (`block` > 0);
     - TERNARY: `dst` is i64 trits.
   - **Returns −1, writing nothing**, for:
-    - a dtype with no unpack helper (F64, the integers, BOOL, unknown codes);
+    - a dtype it doesn't cover: F64, the integers, BOOL, unknown codes, and
+      (1.12.0) UINT4, whose unpack needs two sidecars;
     - `n < 0`;
     - NF4 or INT4 with `block <= 0`.
 
@@ -586,7 +623,8 @@ table.
 - `fn tula_set_reader(set, e) -> r | 0` — the shard holding `e`, for its
   accessors: `tula_entry_data(tula_set_reader(set, e), e)`.
 - `fn tula_set_find_scale(set, e, need) -> e | 0` — `e`'s `.scale` sidecar in
-  any shard, checked as `tula_find_scale` checks it.
+  any shard, checked as `tula_find_scale` checks it. `fn tula_set_find_sidecar(set,
+  e, suffix, need)` *(1.12.0)* finds any suffix's (`".min"`).
 - `fn tula_set_shards(set)`, `fn tula_set_shard(set, i) -> r | 0` (in name
   order), `fn tula_set_tensors(set)` (across the set, without each shard's own
   names and metadata tables), `fn tula_set_manifest(set) -> r` (the set's
@@ -628,7 +666,8 @@ p = tula_entry_data(r, e)               # in-bounds, zero-copy
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
 index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0;
-`tula_open_protected` is 1.10.0; shard sets are 1.11.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+`tula_open_protected` is 1.10.0; shard sets are 1.11.0; UINT4 and
+`tula_find_sidecar` are 1.12.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

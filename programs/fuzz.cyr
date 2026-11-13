@@ -48,7 +48,9 @@
 #      scales); on a strict accept, brute force must find an odd-length INT4's
 #      last high nibble zero. Phase I's file holds them too, and phase H's
 #      builders draw them (an odd INT4 with a set last high nibble isn't
-#      counted canonical).
+#      counted canonical). (1.12.0) UINT4 (ADR 0015) likewise: unpacked with
+#      TULA_INT4_BLOCK scales and minimums, its odd count's last high nibble
+#      checked on a strict accept, in phase I's file and phase H's builders.
 #  11. (1.9.0) the parallel unpack (ADR 0012) is the serial helper, bit for
 #      bit, and reads nothing past its inputs. Phase J draws a dtype with an
 #      unpack helper, a count up to five chunks, a block, odd ones included,
@@ -92,7 +94,7 @@ enum FuzzCfg {
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
     FZ_OUT_ELEMS    = 33024;     # 4 * (FZ_MAXBUF + 64): the most trits a buffer can hold
-    FZ_SCALES       = 1024;      # f64 block scales for nf4 unpack (>= FZ_OUT_ELEMS / 64)
+    FZ_SCALES       = 1040;      # f64 block scales, >= FZ_OUT_ELEMS / 32 (INT4 / UINT4; was 1024)
 }
 
 # ---- output helpers -------------------------------------------------------
@@ -203,6 +205,7 @@ fn oracle_len(dt, n): i64 {
     if (dt == 12) { return n; }             # f8 e4m3
     if (dt == 13) { return n; }             # f8 e5m2
     if (dt == 14) { return (n + 1) / 2; }   # int4, 2 per byte
+    if (dt == 15) { return (n + 1) / 2; }   # uint4, 2 per byte (1.12.0)
     return 0 - 1;
 }
 
@@ -220,7 +223,7 @@ fn consume(r, st, out, scl): i64 {
         var dt = tula_entry_dtype(e);
         var nd = tula_entry_ndim(e);
         var known = 0;
-        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_INT4) { known = 1; } }
+        if (dt >= TULA_DT_F64) { if (dt <= TULA_DT_UINT4) { known = 1; } }
         if (known == 1) {
             if (nd > 0) {
                 if (tula_entry_payload_ok(e) == 1) {
@@ -247,6 +250,7 @@ fn consume(r, st, out, scl): i64 {
                         if (dt == TULA_DT_F8_E4M3) { tula_e4m3_unpack(p, n, out); }   # 1.8.0
                         if (dt == TULA_DT_F8_E5M2) { tula_e5m2_unpack(p, n, out); }
                         if (dt == TULA_DT_INT4)    { tula_int4_unpack(p, scl, n, TULA_INT4_BLOCK, out); }
+                        if (dt == TULA_DT_UINT4)   { tula_uint4_unpack(p, scl, scl, n, TULA_INT4_BLOCK, out); }
                         if (dt >= TULA_DT_I16) {
                             if (dt <= TULA_DT_BOOL) {
                                 # 1.7.0: raw integers and bools; every element is read
@@ -391,6 +395,10 @@ fn build_int_base(): i64 {
     tula_builder_add_checked(b, "q4", TULA_DT_INT4, sh, 1, q4, 4);
     store64(sh, 4);
     tula_builder_add_checked(b, "q4e", TULA_DT_INT4, sh, 1, d, 2);
+    store64(sh, 7);
+    tula_builder_add_checked(b, "u4", TULA_DT_UINT4, sh, 1, q4, 4);   # 1.12.0
+    store64(sh, 4);
+    tula_builder_add_checked(b, "u4e", TULA_DT_UINT4, sh, 1, d, 2);
     return tula_builder_finish(b);
 }
 
@@ -434,7 +442,7 @@ fn strict_check(r, len, st): i64 {
         if (n < 0) { ok = 0; }
         if (tula_entry_data_len(e) != tula_packed_len(tula_entry_dtype(e), n)) { ok = 0; }
         if (tula_entry_data_len(e) != oracle_len(tula_entry_dtype(e), n)) { ok = 0; }
-        if (tula_entry_dtype(e) == TULA_DT_INT4) {
+        if (tula_entry_dtype(e) == TULA_DT_INT4 || tula_entry_dtype(e) == TULA_DT_UINT4) {
             if ((n & 1) == 1) {
                 if ((load8(tula_entry_data(r, e) + tula_entry_data_len(e) - 1) >> 4) != 0) { ok = 0; }
             }
@@ -661,7 +669,7 @@ fn rand_builder(s, pool, bpool, nm, vb, shape, ne, canon): i64 {
         } else {
             rand_name(s, nm);
             var nd = rand_shape(s, shape, ne);
-            var dt = rng_below(s, 16);                    # 15: no such dtype (1.8.0 took 12..14)
+            var dt = rng_below(s, 17);                    # 16: no such dtype (1.12.0 took 15)
             var dl = tula_packed_len(dt, load64(ne));
             var exact = 1;
             if (dl < 0) { dl = rng_below(s, 64); exact = 0; }
@@ -674,7 +682,7 @@ fn rand_builder(s, pool, bpool, nm, vb, shape, ne, canon): i64 {
                 if (rng_below(s, 8) == 0) { exact = 0; }   # random bytes: not canonical
                 else { data = bpool + rng_below(s, FZ_POOL - dl); }
             }
-            if (dt == TULA_DT_INT4) {
+            if (dt == TULA_DT_INT4 || dt == TULA_DT_UINT4) {
                 # an odd count: canonical only if the last high nibble is zero
                 if ((load64(ne) & 1) == 1) {
                     if (dl > 0) {
@@ -1369,7 +1377,7 @@ fn main(): i64 {
             var eo = bufi + 64 + ek * 144;                # offsets from the pristine entry
             var how = rng_below(s, 6);
             if (how == 0) { mutate(s, scratch, ilen); }
-            if (how == 1) { store64(ei + 48, rng_below(s, 17)); }                         # any code; 15, 16 unknown
+            if (how == 1) { store64(ei + 48, rng_below(s, 18)); }                         # any code; 16, 17 unknown
             if (how == 2) { store64(ei + 64 + rng_below(s, 2) * 8, rng_below(s, 9)); }    # a dim
             if (how == 3) { store64(ei + 136, load64(eo + 136) + rng_below(s, 3) - 1); }  # data_len -1 / 0 / +1
             if (how >= 4) {

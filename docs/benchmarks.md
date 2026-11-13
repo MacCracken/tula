@@ -261,6 +261,15 @@ So a set verifies 17× faster per byte on one thread, and ~68× on eight. In
 SHA-256 has a SHA-NI path, which this machine (Zen 3) has. A CPU without it
 wasn't measured.
 
+### 1.12.0: UINT4
+
+2²⁰ elements, `make bench`, blocks of 32:
+
+| Op | 1.12.0 | Notes |
+|---|---:|---|
+| `tula_uint4_pack` | 18.5 ms · ~56 Melem/s | Q4_1's rule in f64; INT4's pack is ~58 |
+| `tula_uint4_unpack` | 4.1 ms · ~257 Melem/s | `code × d + m`; INT4's unpack is ~333. Adding the minimum costs each block's table one more pass |
+
 ### Added in 1.5.0
 
 | Op | 1.5.0 | Notes |

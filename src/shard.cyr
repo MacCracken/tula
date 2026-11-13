@@ -689,12 +689,19 @@ fn tula_set_find(set, name): i64 {
 # Entry e's "<full name>.scale" sidecar anywhere in the set, checked for an
 # unpack reading `need` scales (as tula_find_scale), or 0.
 fn tula_set_find_scale(set, e, need): i64 {
+    return tula_set_find_sidecar(set, e, ".scale", need);
+}
+
+# tula_find_sidecar across a set (1.12.0, ADR 0015): entry e's
+# "<full name><suffix>" sidecar in any shard, checked for `need` elements, or 0.
+fn tula_set_find_sidecar(set, e, suffix, need): i64 {
     if (need < 1) { return 0; }
     var r = tula_set_reader(set, e);
     if (r == 0) { return 0; }
     var name = tula_entry_full_name(r, e);
     var alen = strlen(name);
+    var slen = strlen(suffix);
     var q[48];
-    _tula_query_field(&q, name, alen, ".scale", 6);
-    return _tula_scale_ok(_tula_set_lookup(set, &q, name, alen, ".scale", 6), need);
+    _tula_query_field(&q, name, alen, suffix, slen);
+    return _tula_scale_ok(_tula_set_lookup(set, &q, name, alen, suffix, slen), need);
 }

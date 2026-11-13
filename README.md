@@ -106,9 +106,13 @@ The full march M0→M5:
   (~1.2 GB/s at 8 threads, against 17 MB/s per signed file) and resolves names
   across it.
 
-**923/923** assertions across 18 suites (meta · shards · fp8 · names · stream ·
-builder · strict · ints · dtype · int4 · kernels · floats · protected · file-io ·
-hardening · round-trip · index · sign) + a
+- **1.12.0** — asymmetric 4-bit: `TULA_DT_UINT4` with `.scale` and `.min`
+  sidecars stores GGUF Q4_1 losslessly, and `tula_find_sidecar` finds a sidecar
+  by any suffix.
+
+**974/974** assertions across 19 suites (meta · shards · fp8 · names · stream ·
+builder · strict · ints · uint4 · dtype · int4 · kernels · floats · protected ·
+file-io · hardening · round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on
