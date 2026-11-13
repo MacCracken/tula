@@ -708,12 +708,17 @@ fn same_bytes(a, b, n): i64 {
 
 # ---- phase J helpers: the parallel unpack (1.9.0) ---------------------------
 
-# The address of a PROT_NONE page with `span` readable bytes before it, or 0.
+# The address of a PROT_NONE page with at least `span` readable bytes before it,
+# or 0. mprotect needs a page-aligned address, and pages are 16 KiB on arm64
+# macOS, so the span is rounded up to 64 KiB (a multiple of every page size in
+# CI). The mapping's length is rounded up to a page by the kernel, so the
+# protected page is inside it.
 fn guard_span(span): i64 {
-    var base = mmap_anon(span + 4096);
+    var sp = ((span + 65535) / 65536) * 65536;
+    var base = mmap_anon(sp + 4096);
     if (base == 0) { return 0; }
-    if (cyr_mprotect(base + span, 4096, PROT_NONE) != 0) { return 0; }
-    return base + span;
+    if (cyr_mprotect(base + sp, 4096, PROT_NONE) != 0) { return 0; }
+    return base + sp;
 }
 
 # The serial helper for dt, as tula_unpack_par documents it.
@@ -735,7 +740,10 @@ fn par_phase(s, st): i64 {
     var fails = 0;
     var pg = guard_span(FZ_PAR_MAXN * 4 + 4096);       # payloads: F32 is the widest
     var sg = guard_span(FZ_PAR_MAXN * 8 + 4096);       # scales: one per element at block 1
-    if (pg == 0 || sg == 0) { return 1; }
+    if (pg == 0 || sg == 0) {
+        sput("phase J: could not map its guard pages\n");
+        return 1;
+    }
     var pool = alloc(FZ_PAR_MAXN * 4);
     var k = 0;
     while (k < FZ_PAR_MAXN * 4) { store64(pool + k, rng_next(s)); k = k + 8; }
