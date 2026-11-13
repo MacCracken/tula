@@ -7,7 +7,9 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
-**Sharded checkpoints** (1.11.0). An additive MINOR with no format change
+## [1.11.0] - 2026-11-12
+
+**Sharded checkpoints.** An additive MINOR with no format change
 (ADR 0014). A model in several files is a **shard set**: ordinary tula files,
 needing no signatures, plus a signed **manifest** listing each one's SHA-256,
 size and name. The set is bound, so a swapped, missing or repeated shard fails.

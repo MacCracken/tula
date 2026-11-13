@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.10.0** (`tula_version_int()` returns `11000`). 1.0.1–1.1.1 are
+VERSION is **1.11.0** (`tula_version_int()` returns `11100`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -68,8 +68,7 @@ scanning the codebook, and the F16 / BF16 unpacks read a per-call table from
 **1.10.0 — a protected open** (ADR 0013, audit D-7). `tula_open_protected` maps an fs-verity
 file zero-copy and reads any other file into a private copy, so no later
 rewrite or truncation reaches the validated reader.
-**1.11.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.10.0):
-sharded checkpoints (ADR 0014). A shard set is ordinary tula files plus a
+**1.11.0 — sharded checkpoints** (ADR 0014). A shard set is ordinary tula files plus a
 signed, tensor-less manifest whose `tula.shards` key lists each shard's
 SHA-256, size and name. `tula_builder_set_shards` writes one; `tula_set_open`
 verifies one (one signature, then the shards' SHA-256 in parallel, ~1.2 GB/s at
@@ -78,7 +77,7 @@ Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.11.0, unreleased)
+## Tests, fuzz, gates (1.11.0)
 
 **923 assertions** across 18 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
 (1.11.0: a written and opened set, every refusal with its code and shard, the
@@ -185,8 +184,9 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: cut 1.11.0 (shard sets, in `[Unreleased]`); confirm CI's fs-verity step
-runs rather than skips. The open lines are in the [roadmap](roadmap.md): 1.12.x
+Next: on CI, confirm the fs-verity step runs rather than skips, and read the
+native arm64 runner's `make realmodels` time for the sharded 70B set (sigil's
+SHA-256 has no SHA-NI path there); 1.11.x patches only for fixes. The open lines are in the [roadmap](roadmap.md): 1.12.x
 the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
 protection for unsealed files, then 1.x.x (shard-set follow-ups among them) and
 the v2 candidates. Each waits on
