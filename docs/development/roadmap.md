@@ -29,7 +29,8 @@
   clean (CI gate) · `cyrius lint` no `warn ` lines · `cyrius doc --check src/*.cyr`
   0 undocumented · `cyrius deny programs/smoke.cyr` clean · `make fuzz` PASS ·
   `make realmodels` and `make bigfile` PASS (CI gates, also on the
-  `cross-target` runners) · `make dist` regenerated &
+  `cross-target` runners) · `make verity` PASS or SKIP (CI's build job runs it
+  on an fs-verity image) · `make dist` regenerated &
   committed (CI dist-sync gate) · CHANGELOG `[Unreleased]` updated. A speed change
   also gets a differential test against the old code and before/after
   `make bench` numbers in `docs/benchmarks.md`. A new public behaviour gets a
@@ -69,85 +70,59 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ---
 
-## 1.6.x — the write path follow-through
+## How the lines below are ordered
 
-**Goal:** the write path's remaining loose ends, and the real-weights gate.
+Shipped lines (through 1.10.0) aren't listed; a released line takes patches
+only: fixes, with no new function, dtype or convention. The lines below are
+ordered by how soon a consumer is likely to need them. Each starts when its gate
+is met (an importer's need, a decision), not on a date, and new dtype codes start
+at 15.
 
-- **1.6.x patches** (no new surface — a patch never adds a function, dtype or
-  convention): fixes as the cross-target legs and consumers turn them up. CI's
-  aarch64 Linux and arm64 macOS legs are both hard gates (macOS since 1.6.2).
-  x86_64 macOS isn't covered: GitHub's hosted Intel runners are scarce.
-- **Cross-repo** (not tula code):
-  - **anukulana's migration**, which makes its `gpt2-tula` demo the
-    real-weights gate. That demo already imports the real GPT-2 checkpoint,
-    NF4-quantizes it, saves a signed tula file, reloads it and checks the result
-    bit for bit. It needs anukulana on the current toolchain and tula, and the
-    checkpoint staged in its CI. tula's own CI can't run it without depending on
-    its consumer, so `make realmodels` covers tula's side.
-  - **Other consumers** move onto the 1.2–1.6 calls (checked / long adds,
-    strict reads, streaming writes, the index, metadata), as
-    `examples/consumer.cyr` shows.
+## 1.11.x — sharded checkpoints
 
-## 1.7.x — integer and boolean dtypes
+**Goal:** a model too big for one file. A 70B+ checkpoint ships as many files
+plus an index (safetensors' `model.safetensors.index.json`).
 
-**Goal:** an importer can store every tensor of a real checkpoint losslessly.
-1.7.0 adds `I16` / `I32` / `I64` / `U8` / `BOOL` (ADR 0009, codes 7–11).
+- **Decide the scope first (ADR).** It is either a codec convention, a signed
+  shard manifest naming each file and its digest, or the control-plane store's
+  job (ADR 0001's line). If it's the store's, the ADR closes this line.
+- If it's the codec's, then the manifest convention (a MINOR, readable by every
+  older 1.x reader as an ordinary tensor or file), its strict rules, and a
+  `make realmodels` inventory of a sharded 70B layout.
 
-- **1.7.x patches** — fixes as importers store full checkpoints; no new surface.
-  U16/U32/U64 and element-read helpers wait for a consumer that needs them (a
-  MINOR; ADR 0009 says why they were left out).
+## 1.12.x — the remaining dtypes
 
-## 1.8.x — compact formats: FP8 and int4
+**Goal:** the formats ADRs 0009–0011 left out, each when an importer needs it.
 
-**Goal:** the compact formats real checkpoints and quantized imports use. 1.8.0
-adds OCP FP8 `F8_E4M3` / `F8_E5M2` (ADR 0010, codes 12–13) and `INT4`, signed
-codes with an ADR 0002 `.scale` sidecar (ADR 0011, code 14).
+- **Asymmetric 4-bit** (Q4_1, AWQ/GPTQ with zero points): an unsigned 4-bit
+  dtype and a `.min` / zero-point sidecar convention beside `.scale` (ADR 0011).
+  GPTQ/AWQ already import losslessly as `I32`.
+- **FP8 variants** (ADR 0010): saturating conversions (as their own helpers;
+  the non-saturating ones are frozen) and the FNUZ variants (`E4M3FNUZ`,
+  `E5M2FNUZ`, with their own bias and a single NaN).
+- **Unsigned 16/32/64-bit integers and element-read helpers** (ADR 0009).
 
-- **1.8.x patches** — fixes; no new surface. Left for a MINOR when an importer
-  needs them (the ADRs say why): saturating FP8 conversions, the FNUZ FP8
-  variants, an unsigned 4-bit dtype for asymmetric schemes (Q4_1, AWQ/GPTQ zero
-  points) and its `.min` / zero-point sidecar convention. New codes start at 15.
+## 1.13.x — throughput follow-ups
 
-## 1.9.x — throughput
+**Goal:** what ADR 0012 deferred, when a consumer's profile asks for it.
 
-**Goal:** the codec is never the slow part of loading a model. Every change gets
-a differential test and before/after numbers (`docs/benchmarks.md` has today's).
-1.9.0 made the array helpers faster with the same output bit for bit: table
-paths for the byte and nibble formats, and one loop per float format. It also
-added `tula_unpack_par` (ADR 0012, `src/par.cyr`) and cut the per-call costs of
-validation, adds and index lookups.
+- **A parallel pack.** INT8's per-tensor absmax needs a reduction across
+  threads; the blockwise and float packs split as the unpacks do.
+- **A caller-owned worker pool**, if per-call thread starts (~29 µs each) show
+  up beside `tula_unpack_par`.
 
-- **1.9.x patches** — faster kernels and smaller per-call costs change no API,
-  so they can ship as patches. 1.9.1 made NF4 pack search 15 exact thresholds
-  instead of scanning the codebook, and gave the F16 / BF16 unpacks a per-call
-  table from 262,144 elements. What's left measured as not worth it:
-  - INT4 **pack** is bound by its per-element f64 division and floor; writing
-    whole bytes instead of nibbles gained ~15%.
-  - The F32 unpack (~218 Melem/s) has no table (2³² codes), and unrolling the
-    float loops by 2 or 4 gained nothing under cyrius's code generation.
-- **Left for a MINOR when a consumer needs it** (ADR 0012 says why):
-  - a parallel pack (INT8's per-tensor absmax needs a reduction across
-    threads);
-  - a caller-owned worker pool, if per-call thread starts (~29 µs each) show up
-    in a profile.
-- **Big-file signing** is bound by sigil's SHA-512 (~18 MB/s: a 14 GB checkpoint
-  takes ~25 min to sign, ~13 to verify). That's sigil's to fix, and tula
-  benefits with no change. It is filed with sigil:
-  `2026-11-09-anukulana-sha512-throughput-bounds-big-file-signing.md`, with
-  numbers from the same machine.
+## 1.14.x — zero-copy protection for unsealed files
 
-## 1.x.x — later / research (unscheduled)
+**Goal:** `tula_open_protected` without the copy on filesystems that can
+snapshot. Today it maps fs-verity files and copies anything else (ADR 0013).
 
-- **Zero-copy protection for unsealed files**: 1.10.0's `tula_open_protected`
-  (ADR 0013, closing audit D-7) maps fs-verity files and copies anything else.
-  A reflink snapshot could make the copy free on btrfs/XFS (`FICLONE` into a
-  nameless file in the same directory) and APFS (`clonefile`). Do it when a
-  consumer's files live there and CI can test it. Neither this machine nor CI
-  has such a filesystem today.
-- **Sharded checkpoints**: decide the scope first (ADR). A 70B+ model ships as
-  many files plus an index (safetensors' `model.safetensors.index.json`). Either
-  that is a codec convention (a signed shard manifest naming each file and its
-  digest), or it belongs to the control-plane store (ADR 0001's line).
+- **A reflink snapshot**: `FICLONE` into a nameless file in the same directory
+  on btrfs/XFS, and `clonefile` on APFS, mapped and validated like the verity
+  case. Do it when a consumer's files live there and CI can test it. Neither
+  this machine nor CI has such a filesystem today.
+
+## 1.x.x — later / unscheduled
+
 - **Size caps**: `TULA_READ_MAX_BYTES` is 1 TiB. STABILITY allows raising it in a
   MINOR, so do that when a real model needs it (≈ 500B parameters in BF16).
 - **Binary size** (audit D-12): ~488 KB of the smoke binary is bayan's Unicode
@@ -156,6 +131,8 @@ validation, adds and index lookups.
 - **Locked deps**: under git-first resolution `cyrius.lock` is reproducible, so it
   could be committed and CI could run `cyrius deps --locked`. A maintainer call
   (it's gitignored today).
+- **An x86_64 macOS CI leg**, once GitHub's hosted Intel runners are practical.
+  The aarch64 Linux and arm64 macOS legs are hard gates.
 
 ## v2 — potential items
 
@@ -167,7 +144,7 @@ reading v1. Candidates, each to be argued in an ADR before it's planned:
   table of per-tensor hashes instead of the whole payload. A reader then verifies
   only the tensors it touches (lazy, mmap-friendly), and signing stops costing two
   full passes through the hash. That is the structural fix for big-file signing;
-  1.9.x's sigil speedup is the incremental one.
+  a faster SHA-512 in sigil is the incremental one.
 - **Variable-length names in the manifest**, retiring the names table, but only
   if ADR 0004's table proves insufficient in practice.
 - **Richer entries**: more than 8 dims, and per-tensor attributes (quantization
@@ -189,10 +166,20 @@ reading v1. Candidates, each to be argued in an ADR before it's planned:
 - **Consumers:** `rupantara` / `anukūlana` (Type-3 pretrained-import), the murti
   load-seam, the control-plane checkpoint store — all pull `dist/tula.cyr` via
   `[deps.tula]`. Keep the format stable for them; v2 is a coordinated event.
-- **Cross-repo asks:**
-  - anukulana — migrate, so its `gpt2-tula` demo becomes the real-weights gate
-    (1.6.x).
-  - sigil — SHA-512 throughput (filed with sigil, see 1.9.x), and the bayan
-    binary-size issue (1.x.x).
+- **Cross-repo asks** (not tula code):
+  - **anukulana's migration**, which makes its `gpt2-tula` demo the
+    real-weights gate. That demo imports the real GPT-2 checkpoint,
+    NF4-quantizes it, saves a signed tula file, reloads it and checks the result
+    bit for bit. It needs anukulana on the current toolchain and tula, and the
+    checkpoint staged in its CI. tula's own CI can't run it without depending on
+    its consumer, so `make realmodels` covers tula's side.
+  - **Other consumers** move onto the newer calls (checked and long adds, strict
+    reads, streaming writes, the index, metadata, `tula_unpack_par`,
+    `tula_open_protected`), as `examples/consumer.cyr` shows.
+  - **sigil's SHA-512 throughput** bounds big-file signing (~18 MB/s: a 14 GB
+    checkpoint takes ~25 min to sign, ~13 to verify). tula benefits with no
+    change. Filed with sigil:
+    `2026-11-09-anukulana-sha512-throughput-bounds-big-file-signing.md`.
+  - **sigil's bayan binary-size issue** (see 1.x.x).
 - **Ecosystem context:** the AGNOS planning docs `type3-weight-import.md`
   (gap #1) + `software-port-path.md` (Tier A). tula is gap #1's format codec.

@@ -172,6 +172,9 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 ## Next
 
 Next: confirm CI's fs-verity step runs rather than skips (its first real run
-of the zero-copy branch); 1.10.x patches only for fixes. Later: the 1.x.x
-research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
-gate) and sigil's SHA-512 throughput.
+of the zero-copy branch); 1.10.x patches only for fixes. The open lines are in
+the [roadmap](roadmap.md): 1.11.x sharded checkpoints (an ADR on scope first),
+1.12.x the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
+protection for unsealed files, then 1.x.x and the v2 candidates. Each waits on
+its gate (an importer's need or a decision). Cross-repo: anukulana's migration
+(the real-weights gate) and sigil's SHA-512 throughput.

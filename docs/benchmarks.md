@@ -130,7 +130,7 @@ the first strict rule that reads tensor values. Measured with `make bench` on a
 
 2²⁰ elements, `make bench`, three runs (the range). FP8 converts one element per
 call in integer arithmetic (ADR 0010); the shared F16 path's inline fast path
-isn't used for E5M2 yet, which 1.9.x's throughput work can change.
+isn't used for E5M2 yet (1.9.0 changed both; see below).
 
 | Op | 1.8.0 | Notes |
 |---|---:|---|

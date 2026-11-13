@@ -7,6 +7,22 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Roadmap cleaned up.** The shipped lines (1.6.x – 1.9.x) are gone; what
+  shipped is here. Their open items are regrouped:
+  - 1.11.x sharded checkpoints (an ADR on scope first);
+  - 1.12.x the remaining dtypes (asymmetric 4-bit with a zero-point sidecar,
+    saturating and FNUZ FP8, unsigned 16/32/64-bit);
+  - 1.13.x throughput follow-ups (a parallel pack, a worker pool);
+  - 1.14.x zero-copy protection for unsealed files (reflink snapshots);
+  - 1.x.x size caps, binary size, locked deps and an x86_64 macOS leg.
+
+  The v2 candidates stay. Cross-repo asks (anukulana's migration, sigil's
+  SHA-512 and binary size) are under Gates / relations. The 1.9.1 "measured,
+  not worth it" notes went too; they are in the 1.9.1 entry below and
+  `docs/benchmarks.md`.
+
 ## [1.10.0] - 2026-11-12
 
 **A protected open.** An additive MINOR with no format change
