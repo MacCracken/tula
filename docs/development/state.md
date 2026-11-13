@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.9.1** (`tula_version_int()` returns `10901`). 1.0.1–1.1.1 are
+VERSION is **1.10.0** (`tula_version_int()` returns `11000`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -65,17 +65,22 @@ diff against the 1.8.0 tag matched every changed call's output.
 **1.9.1** (patch): faster kernels. NF4 pack finds each code through 15 exact thresholds instead of
 scanning the codebook, and the F16 / BF16 unpacks read a per-call table from
 262,144 elements. Every output matches 1.9.0 (cross-version diff).
+**1.10.0 — a protected open** (ADR 0013, audit D-7). `tula_open_protected` maps an fs-verity
+file zero-copy and reads any other file into a private copy, so no later
+rewrite or truncation reaches the validated reader.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.9.1)
+## Tests, fuzz, gates (1.10.0)
 
-**801 assertions** across 16 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
+**836 assertions** across 17 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
 `ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
 and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
-16-bit tables and NF4 thresholds), `floats.tcyr` 37, `fileio.tcyr` 30,
+16-bit tables and NF4 thresholds), `floats.tcyr` 37, `protected.tcyr` 35
+(1.10.0: the copy branch under an in-place rewrite and a truncation, the forced
+zero-copy branch, the verity check), `fileio.tcyr` 30,
 `hardening.tcyr` 30,
 `roundtrip.tcyr` 22, `index.tcyr` 13, `sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
@@ -92,7 +97,13 @@ and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
 - `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
   mapped, strict-validated, read into a caller buffer, and (1.6.2) written back
   out from it by `tula_write_file_atomic` and `tula_write_file`, each copy
-  compared word for word.
+  compared word for word, then (1.10.0) opened protected: a private copy past
+  the 2 GiB cap, strict-validated.
+- `make verity` (CI, 1.10.0): the protected open's zero-copy branch on a real
+  fs-verity file, in an ext4 image made with `-O verity` and loop-mounted at
+  `build/verity`. It checks the flag, that the kernel refuses a rewrite, and
+  that the reader is a mapping of the file. Elsewhere (this machine's ext4 has
+  no verity feature, and setting one needs root) it prints SKIP.
 - `make bigfile-signed` (local; minutes, bound by sigil's ~18 MB/s SHA-512): the
   same, signed and verified.
 - `floats` checks F16/BF16 exhaustively (every code, every midpoint) and F32
@@ -160,7 +171,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: 1.9.x has nothing left measured as worth doing (INT4 pack and F32
-unpack, see the roadmap), so 1.9.x patches only for fixes importers turn up. Later: the 1.x.x
+Next: confirm CI's fs-verity step runs rather than skips (its first real run
+of the zero-copy branch); 1.10.x patches only for fixes. Later: the 1.x.x
 research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

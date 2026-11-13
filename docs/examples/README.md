@@ -9,7 +9,8 @@ comment explaining *why*, not just *what*.
   downstream consumer, the v1.0 "≥1 consumer green" gate and a CI check. It plays
   both roles end-to-end: a quantizing checkpoint **writer** (ternary-quantize →
   builder + `"<name>.scale"` sidecar → Ed25519 sign → write) and a hardened
-  **loader** (read as untrusted → verify signature → `tula_entry_payload_ok`
+  **loader** (read as untrusted through `tula_open_protected` (1.10.0) → verify
+  signature → `tula_entry_payload_ok`
   guard → unpack → dequant), plus a bit-exact plain-`f64` tensor, a long-named
   BF16 tensor unpacked through `tula_unpack_par` (1.9.0), and integer and boolean
   tensors.

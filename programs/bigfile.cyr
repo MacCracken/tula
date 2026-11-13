@@ -9,7 +9,10 @@
 #   4. tula_read_file refuses it (one heap allocation can't hold it), and
 #      tula_read_file_into reads it into a caller-provided mapping;
 #   5. tula_write_file_atomic, then tula_write_file, write that buffer back out
-#      (1.6.2): more than INT_MAX bytes from one buffer, compared word for word.
+#      (1.6.2): more than INT_MAX bytes from one buffer, compared word for word;
+#   6. tula_open_protected opens the copy (1.10.0, ADR 0013): not fs-verity here,
+#      so a private copy past the 2 GiB allocation cap, strict-validated, with the
+#      big tensor's last word checked. The read buffer is released first.
 #
 # 36 tensors: 35 of 4 MiB (f64 [512 Ki]) and, in the middle, one of 2 GiB +
 # 64 MiB (f64 [264 Mi], 2,214,592,512 bytes) — more than INT_MAX, the most macOS
@@ -212,6 +215,21 @@ fn main(): i64 {
     kv("  write_file ms        : ", (t10 - t9) / 1000000);
     sput("  write back           : both copies equal the buffer, word for word\n");
     cyr_munmap(into, total);
+
+    # 6. a protected open (1.10.0, ADR 0013): a private copy of the whole file,
+    #    past the 2 GiB allocation cap, validated where nothing can change it
+    var t11 = now_ns();
+    var rp = tula_open_protected(copy);
+    var t12 = now_ns();
+    if (rp == 0) { return fail("tula_open_protected"); }
+    if (tula_validate_strict(rp, total) != TULA_OK) { return fail("protected: strict"); }
+    var ep = tula_find_name(rp, tname(nm, BG_BIG));
+    if (load64(tula_entry_data(rp, ep) + BG_BIG_ELEMS * 8 - 8) != wl) {
+        return fail("protected: the big tensor's last word");
+    }
+    kv("  open_protected ms    : ", (t12 - t11) / 1000000);
+    sput("  protected open       : a private copy, strict-valid, the big tensor's last word exact\n");
+    tula_close_mmap(rp);
 
     xunlink(copy);
     sput("RESULT: PASS — a 2.36 GB checkpoint (one tensor > INT_MAX bytes) streamed, validated, read\n");

@@ -295,8 +295,27 @@ buffer over INT_MAX bytes works on macOS, which refuses a bigger request.
   that fails validation is unmapped again. Release with `fn tula_close_mmap(r)`
   (`tula_close_mmap(0)` is a no-op). The mapping is live: map only files no other
   process writes (`SECURITY.md`).
+- `fn tula_open_protected(path) -> r | 0` *(1.10.0, ADR 0013)* — a reader whose
+  bytes nothing done to the file afterwards can change: a rewrite in place or a
+  truncation by another process never reaches it, and can't make it SIGBUS.
+  Release with `tula_close_mmap`.
+  - **An fs-verity file** (Linux: ext4 with `-O verity`, f2fs, btrfs) is mapped
+    zero-copy, as `tula_open_mmap` does, because the kernel refuses every write
+    and truncation to it. Storage returning data that fails verification still
+    raises SIGBUS on the touching read, as any mapping of a failing disk does.
+  - **Any other file** is read into a private anonymous mapping and validated
+    there. That costs one read (about 8.8 GB/s from the page cache here) and
+    memory equal to the file, up to `TULA_READ_MAX_BYTES`, with no 2 GiB cap.
+  - The fs-verity check runs on the descriptor that is then mapped or read, so a
+    rename in between can't swap the file. The immutable attribute (`chattr +i`)
+    isn't trusted, because some filesystems let a writer that was already open
+    keep writing. On macOS the open always copies.
 
-tula files are self-describing (the header carries the total length). Both
+  Choose `tula_open_mmap` when you control who writes the file, and
+  `tula_open_protected` when you don't. A store that seals its checkpoints with
+  fs-verity gets both.
+
+tula files are self-describing (the header carries the total length). The
 readers compare it with the file's real size via `lseek(SEEK_END)`, not
 `stat()`, and reject a source that can't be sized (a pipe). A file *longer* than
 its total opens, and the readers take exactly the declared bytes.
@@ -518,7 +537,7 @@ buf = tula_builder_finish_signed(b, sk)
 tula_write_file("model.tula", buf, tula_total_len(buf))
 
 # read (untrusted)
-r = tula_read_file("model.tula")        # 0 if malformed
+r = tula_read_file("model.tula")        # 0 if malformed; tula_open_protected for a file others may write (1.10.0)
 if (r == 0) { ...reject... }
 if (tula_validate_strict(r, tula_total_len(r)) != TULA_OK) { ...reject... }
 if (tula_verify_required(r, pk) != TULA_OK) { ...reject... }
@@ -536,7 +555,8 @@ p = tula_entry_data(r, e)               # in-bounds, zero-copy
 
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
-index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0;
+`tula_open_protected` is 1.10.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

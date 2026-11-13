@@ -35,3 +35,4 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 | [0010](0010-fp8-e4m3-e5m2-dtypes.md) | Accepted | FP8 dtypes: OCP E4M3 and E5M2, converted from f64 without saturation |
 | [0011](0011-int4-blockwise-codes-with-scale-sidecar.md) | Accepted | INT4: signed 4-bit codes, with blockwise scales in an ADR 0002 sidecar |
 | [0012](0012-parallel-unpack.md) | Accepted | Parallel unpack: one call over every unpack helper, threads started per call |
+| [0013](0013-protected-open.md) | Accepted | A protected open: zero-copy for fs-verity files, a private copy otherwise |

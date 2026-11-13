@@ -24,7 +24,8 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
 - **Public functions** — the builder, reader, accessors, signature, file-I/O, and
   dtype helpers documented in `docs/api.md`, with their signatures and semantics;
   from 1.9.0 also `tula_unpack_par` (ADR 0012), whose output is the serial
-  helper's at any thread count.
+  helper's at any thread count, and from 1.10.0 `tula_open_protected` (ADR 0013)
+  with its guarantee: no later change to the file reaches the reader.
 - **Public constants** — `TULA_DT_*`, `TULA_SIG_*`, the `TULA_ERR_*` codes and
   their numeric values, and the format constants (`TULA_HEADER_SIZE`,
   `TULA_ENTRY_SIZE`, `TULA_NAME_CAP`, `TULA_MAXDIM`, `TULA_BUILDER_MAX`,

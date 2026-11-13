@@ -1,0 +1,175 @@
+# programs/verity.cyr — the protected open's zero-copy branch on a real fs-verity
+# file (1.10.0, ADR 0013). Linux only. Run from the repo root with `build/verity`
+# a directory on a filesystem that supports fs-verity; CI makes one, an ext4 image
+# formatted with `-O verity` and loop-mounted there. It writes a signed tula file,
+# enables fs-verity on it, and checks:
+#   - _tula_fd_verity reports the file as fs-verity;
+#   - the kernel now refuses to open it for writing (tula_write_file fails);
+#   - tula_open_protected maps it zero-copy: /proc/self/maps names the file at the
+#     reader's address. The reader is strict-valid, its signature verifies, and its
+#     bytes are the file's.
+# Where fs-verity can't be enabled (no build/verity, a filesystem without the
+# feature, a kernel without CONFIG_FS_VERITY), it prints SKIP and exits 0. Only a
+# failed check on a real verity file fails.
+#
+#   cyrius build programs/verity.cyr build/tula_verity && ./build/tula_verity
+
+include "src/lib.cyr"
+
+fn sput(s): i64 {
+    syscall(1, 1, s, strlen(s));
+    return 0;
+}
+
+# Lowercase hex of v with no leading zeros, NUL-terminated, at p. Returns its length.
+fn hex_at(p, v): i64 {
+    var d = 15;
+    while (d > 0) {
+        if (((v >> (d * 4)) & 15) != 0) { break; }
+        d = d - 1;
+    }
+    var k = 0;
+    while (d >= 0) {
+        var nib = (v >> (d * 4)) & 15;
+        var c = 48 + nib;
+        if (nib >= 10) { c = 87 + nib; }
+        store8(p + k, c);
+        k = k + 1;
+        d = d - 1;
+    }
+    store8(p + k, 0);
+    return k;
+}
+
+# 1 if /proc/self/maps has a line starting at address `addr` that names `fname`.
+fn mapped_from(addr, fname): i64 {
+    var fd = file_open("/proc/self/maps", 0, 0);
+    if (fd < 0) { return 0; }
+    var cap = 1048576;
+    var buf = alloc(cap);
+    var n = 0;
+    loop {
+        var got = file_read(fd, buf + n, cap - 1 - n);
+        if (got <= 0) { break; }
+        n = n + got;
+        if (n >= cap - 1) { break; }
+    }
+    file_close(fd);
+    store8(buf + n, 0);
+    var hx = alloc(24);
+    var hl = hex_at(hx, addr);
+    var fl = strlen(fname);
+    var i = 0;
+    while (i < n) {
+        # i is the start of a line
+        var j = 0;
+        while (j < hl) {
+            if (load8(buf + i + j) != load8(hx + j)) { break; }
+            j = j + 1;
+        }
+        var eol = i;
+        while (eol < n) {
+            if (load8(buf + eol) == 10) { break; }
+            eol = eol + 1;
+        }
+        if (j == hl) {
+            if (load8(buf + i + hl) == 45) {        # '-'
+                var k = i;
+                while (k + fl <= eol) {
+                    var m = 0;
+                    while (m < fl) {
+                        if (load8(buf + k + m) != load8(fname + m)) { break; }
+                        m = m + 1;
+                    }
+                    if (m == fl) { return 1; }
+                    k = k + 1;
+                }
+            }
+        }
+        i = eol + 1;
+    }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var path = "build/verity/model.tula";
+    if (file_exists("build/verity") == 0) {
+        sput("SKIP: no build/verity directory (no fs-verity filesystem mounted there)\n");
+        return 0;
+    }
+    sys_unlink(path);                              # a verity file can't be rewritten, only removed
+    var sk = alloc(64);
+    var pk = alloc(32);
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, (i * 11 + 5) & 0xFF); i = i + 1; }
+    ed25519_keypair(seed, sk, pk);
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 1024);
+    var data = alloc(8192);
+    i = 0;
+    while (i < 1024) { store64(data + i * 8, f64_from(i)); i = i + 1; }
+    tula_builder_add_checked(b, "w", TULA_DT_F64, shape, 1, data, 8192);
+    var buf = tula_builder_finish_signed(b, sk);
+    var len = tula_total_len(buf);
+    if (tula_write_file(path, buf, len) != len) {
+        sput("SKIP: could not write build/verity/model.tula\n");
+        return 0;
+    }
+    # Enable fs-verity: FS_IOC_ENABLE_VERITY on an O_RDONLY fd with a
+    # struct fsverity_enable_arg (128 bytes): version 1, SHA-256, 4 KiB blocks.
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { sput("FAIL: could not reopen the file\n"); return 1; }
+    var arg[128];
+    var z = 0;
+    while (z < 128) { store64(&arg + z, 0); z = z + 8; }
+    store32(&arg, 1);
+    store32(&arg + 4, 1);
+    store32(&arg + 8, 4096);
+    var rc = sys_ioctl(fd, 0x40806685, &arg);
+    if (rc != 0) {
+        file_close(fd);
+        sput("SKIP: fs-verity could not be enabled here (FS_IOC_ENABLE_VERITY returned ");
+        fmt_int(rc);
+        sput(")\n");
+        return 0;
+    }
+    var fails = 0;
+    if (_tula_fd_verity(fd) != 1) {
+        sput("FAIL: _tula_fd_verity doesn't see the verity file\n");
+        fails = fails + 1;
+    } else {
+        sput("verity flag: seen on the opened file\n");
+    }
+    file_close(fd);
+    if (tula_write_file(path, buf, len) >= 0) {
+        sput("FAIL: the kernel let the verity file be rewritten\n");
+        fails = fails + 1;
+    } else {
+        sput("rewrite: refused by the kernel\n");
+    }
+    var r = tula_open_protected(path);
+    if (r == 0) { sput("FAIL: tula_open_protected refused the verity file\n"); return 1; }
+    if (mapped_from(r, "model.tula") != 1) {
+        sput("FAIL: the reader isn't a mapping of the file\n");
+        fails = fails + 1;
+    } else {
+        sput("protected open: zero-copy, a mapping of the file\n");
+    }
+    if (memeq(r, buf, len) != 1) { sput("FAIL: the reader's bytes differ\n"); fails = fails + 1; }
+    if (tula_validate_strict(r, len) != TULA_OK) { sput("FAIL: not strict-valid\n"); fails = fails + 1; }
+    if (tula_verify_required(r, pk) != TULA_OK) { sput("FAIL: signature\n"); fails = fails + 1; }
+    tula_close_mmap(r);
+    sys_unlink(path);
+    if (fails == 0) {
+        sput("RESULT: PASS — an fs-verity file opens protected and zero-copy, and the kernel refuses writers\n");
+        return 0;
+    }
+    sput("RESULT: FAIL\n");
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);

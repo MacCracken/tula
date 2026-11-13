@@ -1,0 +1,247 @@
+# tests/tcyr/protected.tcyr — the 1.10.0 protected open (ADR 0013).
+#
+# tula_open_protected's reader must keep the bytes it validated while the file
+# is rewritten in place and truncated under it (the copy branch), where a plain
+# tula_open_mmap mapping shows the rewrite. The zero-copy branch is forced on an
+# ordinary file (no fs-verity here), and a rewrite shows through it, proving it
+# maps. A MAP_PRIVATE mapping showing later writes is Linux behaviour (POSIX
+# leaves it unspecified), so those two contrasts are asserted on Linux only.
+# Rejections return 0, and the fs-verity check says 0 for ordinary files,
+# directories, bad descriptors and (where one exists) an immutable file that
+# isn't verity. Files go under build/.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+# A signed file of `n` f64 tensors, each [4] of values base + k.
+fn make_file(sk, n, base): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 4);
+    var nm = alloc(16);
+    var i = 0;
+    while (i < n) {
+        var data = alloc(32);
+        var k = 0;
+        while (k < 4) { store64(data + k * 8, f64_from(base + i * 4 + k)); k = k + 1; }
+        store8(nm, 116);                 # "t" + one letter
+        store8(nm + 1, 97 + i);
+        store8(nm + 2, 0);
+        tula_builder_add_checked(b, nm, TULA_DT_F64, shape, 1, data, 32);
+        i = i + 1;
+    }
+    return tula_builder_finish_signed(b, sk);
+}
+
+fn keys(sk, pk): i64 {
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, (i * 7 + 3) & 0xFF); i = i + 1; }
+    ed25519_keypair(seed, sk, pk);
+    return 0;
+}
+
+fn sum_bytes(p, n): i64 {
+    var s = 0;
+    var i = 0;
+    while (i < n) { s = s + load8(p + i); i = i + 1; }
+    return s;
+}
+
+fn test_open_and_close() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(sk, pk);
+    var buf = make_file(sk, 3, 10);
+    var len = tula_total_len(buf);
+    var path = "build/test_protected_a.tula";
+    assert_eq(tula_write_file(path, buf, len), len, "wrote a signed file");
+    var r = tula_open_protected(path);
+    assert(r != 0, "tula_open_protected opens it");
+    assert_eq(memeq(r, buf, len), 1, "... the file's bytes");
+    assert_eq(tula_validate_strict(r, len), TULA_OK, "... strict-valid");
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "... and its signature verifies");
+    assert(tula_find(r, "tb") != 0, "... a tensor is found");
+    assert_eq(tula_close_mmap(r), 0, "tula_close_mmap releases it");
+    return 0;
+}
+
+# The copy branch: rewriting the file in place (same inode, O_TRUNC) with other
+# bytes, then truncating it, never reaches the reader. A plain mapping of the
+# same file sees the rewrite.
+fn test_survives_rewrite() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(sk, pk);
+    var a = make_file(sk, 4, 100);
+    var la = tula_total_len(a);
+    var b = make_file(sk, 4, 900);                 # same length, other values
+    var path = "build/test_protected_b.tula";
+    tula_write_file(path, a, la);
+    var fd = file_open(path, 0, 0);
+    var sealed = _tula_fd_verity(fd);
+    file_close(fd);
+    if (sealed == 1) {
+        assert(1, "the test file is fs-verity: rewrite checks skipped");
+        return 0;
+    }
+    var r = tula_open_protected(path);
+    var m = tula_open_mmap(path);
+    assert(r != 0, "protected open");
+    assert(m != 0, "plain mapping");
+    assert_eq(tula_total_len(b), la, "the replacement has the same length");
+    assert_eq(tula_write_file(path, b, la), la, "the file is rewritten in place");
+    # Whether a MAP_PRIVATE mapping shows later writes is unspecified by POSIX;
+    # Linux shows them, so the contrast is asserted there.
+    #ifndef CYRIUS_TARGET_MACOS
+    assert_eq(memeq(m, b, la), 1, "the plain mapping now shows the new bytes (Linux)");
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    assert_eq(memeq(r, b, la), 0, "the protected reader isn't the new file");
+    #endif
+    assert_eq(memeq(r, a, la), 1, "the protected reader still holds the validated bytes");
+    assert_eq(tula_verify_required(r, pk), TULA_OK, "... and they still verify");
+    tula_close_mmap(m);                            # before the truncation: it would SIGBUS
+    assert_eq(tula_write_file(path, a, 64), 64, "the file is cut to its header");
+    assert_eq(sum_bytes(r, la), sum_bytes(a, la), "every byte of the reader still reads, unchanged");
+    assert_eq(tula_validate_strict(r, la), TULA_OK, "... strict-valid");
+    assert_eq(tula_open_protected(path), 0, "a protected open of the cut file is refused");
+    tula_close_mmap(r);
+    return 0;
+}
+
+# The zero-copy branch, forced on an ordinary file: it maps (a rewrite shows
+# through) and validates; the copy branch on the same file doesn't change.
+fn test_branches() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(sk, pk);
+    var a = make_file(sk, 2, 5);
+    var la = tula_total_len(a);
+    var b = make_file(sk, 2, 50);
+    var path = "build/test_protected_c.tula";
+    tula_write_file(path, a, la);
+    var fd = file_open(path, 0, 0);
+    var z = _tula_open_fd_protected(fd, 1);
+    file_close(fd);
+    fd = file_open(path, 0, 0);
+    var c = _tula_open_fd_protected(fd, 0);
+    file_close(fd);
+    assert(z != 0, "the forced zero-copy branch opens");
+    assert(c != 0, "the copy branch opens");
+    assert_eq(memeq(z, a, la), 1, "... both hold the file");
+    assert_eq(memeq(c, a, la), 1, "...");
+    tula_write_file(path, b, la);
+    #ifndef CYRIUS_TARGET_MACOS
+    assert_eq(memeq(z, b, la), 1, "the zero-copy branch is a live mapping (the rewrite shows; Linux)");
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    assert_eq(tula_validate_strict(z, la), TULA_OK, "the zero-copy branch's mapping still reads whole");
+    #endif
+    assert_eq(memeq(c, a, la), 1, "the copy branch isn't");
+    tula_close_mmap(z);
+    tula_close_mmap(c);
+    return 0;
+}
+
+fn test_rejects() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(sk, pk);
+    assert_eq(tula_open_protected("build/test_protected_missing.tula"), 0, "a missing file: 0");
+    var a = make_file(sk, 3, 1);
+    var la = tula_total_len(a);
+    var path = "build/test_protected_d.tula";
+    tula_write_file(path, a, la - 8);
+    assert_eq(tula_open_protected(path), 0, "a file shorter than its header says: 0");
+    var bad = alloc(la);
+    memcpy(bad, a, la);
+    store8(bad, 0x58);
+    tula_write_file(path, bad, la);
+    assert_eq(tula_open_protected(path), 0, "a bad magic: 0");
+    memcpy(bad, a, la);
+    store64(bad + 64 + 136, la * 4);               # the first tensor's data_len escapes the payload
+    tula_write_file(path, bad, la);
+    assert_eq(tula_open_protected(path), 0, "a lying data_len: 0 (validation runs on the copy)");
+    tula_write_file(path, "short", 5);
+    assert_eq(tula_open_protected(path), 0, "five bytes: 0");
+    var fd = file_open(path, 0, 0);
+    assert_eq(_tula_open_fd_protected(fd, 1), 0, "the zero-copy branch refuses it too");
+    file_close(fd);
+    return 0;
+}
+
+# The fs-verity check: ordinary files, a directory and bad descriptors say 0.
+fn test_verity_check() {
+    var path = "build/test_protected_a.tula";
+    var fd = file_open(path, 0, 0);
+    assert_eq(_tula_fd_verity(fd), 0, "an ordinary file isn't fs-verity");
+    file_close(fd);
+    var dfd = file_open("build", 0, 0);
+    var dv = 0;
+    if (dfd >= 0) {
+        dv = _tula_fd_verity(dfd);
+        file_close(dfd);
+    }
+    assert_eq(dv, 0, "a directory isn't");
+    assert_eq(_tula_fd_verity(0 - 1), 0, "a bad descriptor: 0");
+    assert_eq(_tula_fd_verity(987654), 0, "a closed descriptor: 0");
+    return 0;
+}
+
+# The immutable attribute isn't trusted (ADR 0013). Where the machine has an
+# immutable file to try (an EFI variable, on Linux with UEFI), the check must
+# still say 0 for it. Elsewhere there's nothing to try and the assertion holds.
+fn immutable_taken_for_verity(): i64 {
+    #ifndef CYRIUS_TARGET_MACOS
+    var dir = "/sys/firmware/efi/efivars/";
+    var v = dir_list(str_from(dir));
+    var p = alloc(600);
+    var dl = strlen(dir);
+    var i = 0;
+    while (i < vec_len(v)) {
+        var nm = vec_get(v, i);
+        var nl = str_len(nm);
+        if (nl < 500) {
+            memcpy(p, dir, dl);
+            memcpy(p + dl, str_data(nm), nl);
+            store8(p + dl + nl, 0);
+            var fd = file_open(p, 0, 0);
+            if (fd >= 0) {
+                var fl[8];
+                store64(&fl, 0);
+                var imm = 0;
+                if (sys_ioctl(fd, 0x80086601, &fl) == 0) {
+                    if ((load32(&fl) & 0x10) != 0) { imm = 1; }
+                }
+                var bad = 0;
+                if (imm == 1) {
+                    if (_tula_fd_verity(fd) != 0) { bad = 1; }
+                }
+                file_close(fd);
+                if (imm == 1) { return bad; }
+            }
+        }
+        i = i + 1;
+    }
+    #endif
+    return 0;
+}
+
+fn test_immutable_not_trusted() {
+    assert_eq(immutable_taken_for_verity(), 0, "an immutable file (where one exists) isn't taken for fs-verity");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_open_and_close();
+    test_survives_rewrite();
+    test_branches();
+    test_rejects();
+    test_verity_check();
+    test_immutable_not_trusted();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

@@ -87,6 +87,15 @@ realmodels: check-lib-wiring
 	CYRIUS_DCE=1 $(CYRIUS) build programs/realmodels.cyr build/tula_realmodels
 	./build/tula_realmodels
 
+# The protected open's zero-copy branch on a real fs-verity file (1.10.0, ADR
+# 0013). Needs build/verity on a filesystem with fs-verity (CI makes an ext4
+# image with -O verity and mounts it there); elsewhere it prints SKIP.
+.PHONY: verity
+verity: check-lib-wiring
+	@mkdir -p build
+	CYRIUS_DCE=1 $(CYRIUS) build programs/verity.cyr build/tula_verity
+	./build/tula_verity
+
 .PHONY: example
 example: check-lib-wiring
 	@mkdir -p build

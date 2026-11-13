@@ -97,9 +97,13 @@ The full march M0→M5:
   scan) and F16 / BF16 unpacking 1.75× faster on large tensors, with the same
   output.
 
-**801/801** assertions across 16 suites (meta · fp8 · names · stream · builder ·
-strict · ints · dtype · int4 · kernels · floats · file-io · hardening ·
-round-trip · index · sign) + a
+- **1.10.0** — a protected open: `tula_open_protected` gives a reader that no
+  later rewrite or truncation of the file can reach, zero-copy for fs-verity
+  files and a private copy otherwise.
+
+**836/836** assertions across 17 suites (meta · fp8 · names · stream · builder ·
+strict · ints · dtype · int4 · kernels · floats · protected · file-io ·
+hardening · round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on

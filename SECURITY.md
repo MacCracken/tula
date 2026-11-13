@@ -144,8 +144,10 @@ every key matching its name.
   `TULA_SIG_UNSIGNED` and `TULA_SIG_BAD` as untrusted.
 - **Map only files nobody else writes.** A `tula_open_mmap` mapping shows the
   file as it is now: a process that truncates or rewrites it after validation
-  can change validated bytes, or make a later read SIGBUS. Use `tula_read_file`
-  (a private copy) for files in a location others can write.
+  can change validated bytes, or make a later read SIGBUS. For a file others may
+  write, use `tula_open_protected` (1.10.0, ADR 0013). It maps an fs-verity file
+  zero-copy, since the kernel refuses every writer, and reads any other file
+  into a private copy. `tula_read_file` is also a private copy, up to 2 GiB.
 - **Write through `tula_builder_add_long`** (1.3.0) or
   `tula_builder_add_checked` (1.2.0). The plain add truncates names over 47
   characters (frozen v1 behaviour), so two distinct long names can become the

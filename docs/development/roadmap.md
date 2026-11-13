@@ -138,11 +138,12 @@ validation, adds and index lookups.
 
 ## 1.x.x — later / research (unscheduled)
 
-- **mmap and concurrent writers** (audit D-7): a mapping is live, so a process
-  that truncates or rewrites the file after validation changes what was checked
-  (documented). Research a protected open without losing zero-copy for the
-  common case: a Linux read lease (`F_SETLEASE`), or copy-on-open into an
-  anonymous mapping.
+- **Zero-copy protection for unsealed files**: 1.10.0's `tula_open_protected`
+  (ADR 0013, closing audit D-7) maps fs-verity files and copies anything else.
+  A reflink snapshot could make the copy free on btrfs/XFS (`FICLONE` into a
+  nameless file in the same directory) and APFS (`clonefile`). Do it when a
+  consumer's files live there and CI can test it. Neither this machine nor CI
+  has such a filesystem today.
 - **Sharded checkpoints**: decide the scope first (ADR). A 70B+ model ships as
   many files plus an index (safetensors' `model.safetensors.index.json`). Either
   that is a codec convention (a signed shard manifest naming each file and its

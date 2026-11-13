@@ -7,6 +7,72 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-12
+
+**A protected open.** An additive MINOR with no format change
+(ADR 0013), closing the 2026-11-04 audit's D-7. A `tula_open_mmap` mapping is
+live: a process that rewrites the file in place afterwards changes bytes tula
+has already validated and a signature has already covered. One that truncates
+it makes the reader's next touch SIGBUS. `tula_open_protected` gives a reader
+nothing done to the file afterwards can reach. Every existing call is
+unchanged.
+
+### Added
+
+- **`tula_open_protected(path)`** (ADR 0013): returns a validated reader, or 0.
+  Release it with `tula_close_mmap`.
+  - **An fs-verity file** (Linux: ext4 with `-O verity`, f2fs, btrfs; detected
+    by `FS_VERITY_FL` from `FS_IOC_GETFLAGS`) is mapped zero-copy. The kernel
+    refuses every write and truncation to it, and no writer can be open.
+  - **Any other file** is read into a private anonymous mapping and validated
+    there. That costs one read and memory equal to the file, up to
+    `TULA_READ_MAX_BYTES`, with no 2 GiB allocation cap.
+  - The check runs on the descriptor that is then mapped or read.
+  - `chattr +i` isn't trusted for zero-copy: ext4 enforces it on writers that
+    were already open, tmpfs doesn't. On macOS the open always copies.
+- **ADR 0013** records what the research found:
+  - a read lease only delays a writer by 45 s, needs the file's owner, and its
+    break signal ends a process with no handler;
+  - the immutable flag isn't enforced on open writers everywhere;
+  - fs-verity is a real guarantee;
+  - a reflink snapshot (btrfs/XFS/APFS) can't be tested here or in CI, and is
+    left as a candidate.
+- **`make verity` / `programs/verity.cyr`**: the zero-copy branch on a real
+  fs-verity file. It enables verity on a signed file under `build/verity` and
+  checks four things:
+  - the flag is seen;
+  - the kernel refuses to rewrite the file;
+  - `/proc/self/maps` names the file at the reader's address;
+  - the reader is strict-valid and its signature verifies.
+
+  Where verity can't be enabled it prints SKIP and exits 0. CI's build job
+  makes an ext4 image with `-O verity`, loop-mounts it and runs it there.
+
+### Changed
+
+- **`tests/tcyr/protected.tcyr`** (new, 35 assertions):
+  - the open and its release;
+  - the copy branch keeping its bytes, and its signature, while the file is
+    rewritten in place and then cut to its header (a plain mapping of the same
+    file shows the rewrite);
+  - the zero-copy branch forced on an ordinary file, where a rewrite shows
+    through, proving it maps;
+  - rejections: a missing file, a short one, a bad magic, a lying `data_len`,
+    five bytes;
+  - the fs-verity check saying 0 for files, a directory, bad descriptors and,
+    where one exists, an immutable EFI variable.
+
+  Two seeded bugs are each caught: always mapping, and trusting the immutable
+  flag.
+- **`make bigfile`** gains step 6: a protected open of the 2.36 GB copy, a
+  private copy past the 2 GiB cap, strict-validated in 306 ms.
+- **Bench**: `open protect` on the 100 MB file, 11.8 ms (a heap read's cost),
+  against `tula_open_mmap`'s 11 µs.
+- **`SECURITY.md`, the guide and `api.md`** point loaders of files others may
+  write at `tula_open_protected`.
+- **Roadmap**: D-7's research item is done. A reflink snapshot stays as a
+  candidate for zero-copy protection of unsealed files.
+
 ## [1.9.1] - 2026-11-12
 
 **Faster NF4 packing and 16-bit unpacking.** A patch: no API or format

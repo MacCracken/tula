@@ -6,6 +6,8 @@
 #   read (untrusted) -> strict validate -> signature required -> scale lookup +
 #   payload-ok guard -> unpack -> dequant.
 #
+# 1.10.0: the file is read back with tula_open_protected (ADR 0013), so no later
+# rewrite or truncation of it can reach the validated bytes.
 # 1.9.0: the bf16 tensor is unpacked through tula_unpack_par (ADR 0012), which
 # dispatches on the entry's dtype and splits a large tensor across threads (this
 # one is small, so it runs on the caller's thread, with the same output).
@@ -151,7 +153,9 @@ fn main(): i64 {
     # Every check below REJECTS — returns — on failure: nothing after a failed
     # check may touch the file, because what it guarded is then unproven.
     # ================================================================
-    var r = tula_read_file(path);
+    # 1.10.0: a protected open (ADR 0013): nothing done to the file from here on
+    # can change what is validated below (a private copy here; zero-copy on fs-verity)
+    var r = tula_open_protected(path);
     if (r == 0) { sput("FAIL: model did not open\n"); return 1; }
 
     # 1. consistency — canonical layout, unique names, every shape matching its
@@ -274,6 +278,7 @@ fn main(): i64 {
     if (oki != 1) { sput("FAIL: integer / boolean tensors\n"); fails = fails + 1; }
     else { sput("i64 ids, bool mask, i32 offsets: exact\n"); }
 
+    tula_close_mmap(r);
     if (fails == 0) {
         sput("RESULT: PASS — consumer loaded a signed, quantized model end-to-end\n");
         return 0;

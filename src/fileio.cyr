@@ -180,10 +180,73 @@ fn tula_open_mmap(path): i64 {
     return addr;
 }
 
-# Release a buffer obtained from tula_open_mmap. 0 (a failed open) is a no-op.
+# Release a buffer obtained from tula_open_mmap or tula_open_protected. 0 (a
+# failed open) is a no-op.
 fn tula_close_mmap(r): i64 {
     if (r == 0) { return 0; }
     return cyr_munmap(r, tula_total_len(r));
+}
+
+# A protected open (1.10.0, ADR 0013): a reader whose bytes nothing done to the
+# file afterwards can change. Returns the reader or 0; release it with
+# tula_close_mmap.
+#
+# An fs-verity file (Linux) is mapped read-only, zero-copy: the kernel refuses
+# every write and truncation to it, and none can be open. Any other file is
+# read into a private anonymous mapping (any size up to TULA_READ_MAX_BYTES)
+# and validated there, so a writer or a truncation afterwards never reaches the
+# reader; that costs one read and memory equal to the file. The check is made
+# on the descriptor that is then mapped or read. The immutable attribute isn't
+# trusted for zero-copy, since some filesystems let an already-open writer keep
+# writing. A verity mapping can still SIGBUS if the storage returns data that
+# fails verification, as any mapping of a failing disk can.
+fn tula_open_protected(path): i64 {
+    var fd = file_open(path, 0, 0);   # O_RDONLY
+    if (fd < 0) { return 0; }
+    var r = _tula_open_fd_protected(fd, _tula_fd_verity(fd));
+    file_close(fd);
+    return r;
+}
+
+# tula_open_protected on an open fd: map when `sealed` is 1 (the caller found
+# the file fs-verity), else read into a private anonymous mapping. Either way
+# the buffer is validated, and released again if validation fails.
+fn _tula_open_fd_protected(fd, sealed): i64 {
+    var total = _tula_fd_total(fd);
+    if (total < 0) { return 0; }
+    if (sealed == 1) {
+        var addr = mmap_file_ro(fd, total);
+        if (addr == 0) { return 0; }
+        if (tula_open(addr, total) == 0) {
+            cyr_munmap(addr, total);
+            return 0;
+        }
+        return addr;
+    }
+    var buf = mmap_anon(total);
+    if (buf == 0) { return 0; }
+    var r = _tula_read_fd_into(fd, buf, total);
+    if (r == 0) { cyr_munmap(buf, total); }
+    return r;
+}
+
+# 1 if fd's file has fs-verity enabled (Linux: FS_VERITY_FL, 0x00100000, from
+# FS_IOC_GETFLAGS), else 0: on any error (a filesystem without the ioctl), and
+# on every other OS. The kernel writes the flags as one 32-bit word.
+fn _tula_fd_verity(fd): i64 {
+    #ifndef CYRIUS_TARGET_MACOS
+    #ifndef CYRIUS_TARGET_WIN
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_CX
+    var fl[8];
+    store64(&fl, 0);
+    if (sys_ioctl(fd, 0x80086601, &fl) != 0) { return 0; }   # FS_IOC_GETFLAGS
+    if ((load32(&fl) & 0x100000) != 0) { return 1; }
+    #endif
+    #endif
+    #endif
+    #endif
+    return 0;
 }
 
 # ---------------------------------------------------------------------------

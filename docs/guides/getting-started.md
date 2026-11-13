@@ -102,7 +102,9 @@ target atomically, so nothing the size of the file is allocated. Read with
 For large files prefer `tula_open_mmap` (zero-copy; sub-millisecond regardless of
 size) + `tula_close_mmap`. See [benchmarks](../benchmarks.md). A mapping shows the
 file as it is *now*: map only files nobody else is writing. For a file another
-process may truncate or rewrite, use `tula_read_file`, which takes a private copy.
+process may truncate or rewrite, use `tula_open_protected` (1.10.0): it maps an
+fs-verity file zero-copy and takes a private copy of anything else, so nothing
+done to the file later reaches what you validated.
 
 ## Quantized tensors
 

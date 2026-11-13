@@ -230,6 +230,20 @@ Every other row was unchanged within the runs' spread. Below 262,144 elements
 the 16-bit unpacks run 1.9.0's loop: the table costs about 0.4 ms to build and
 map, which a smaller tensor wouldn't win back.
 
+### 1.10.0: the protected open
+
+The 100 MB, 200-tensor file, `make bench`, page-cache-warm:
+
+| Op | 1.10.0 | Notes |
+|---|---:|---|
+| `tula_open_protected` | 11.8 ms · ~8.9 GB/s | not fs-verity here: a private copy, then validation; the same cost as `read (heap)` |
+| `tula_open_mmap` | 11 µs | for comparison: maps lazily, and each page faults in on first touch |
+| `make bigfile`: `tula_open_protected` of 2.36 GB | 306 ms · ~7.7 GB/s | a private copy past the 2 GiB allocation cap |
+
+On an fs-verity file, the protected open costs what `tula_open_mmap` does, plus
+one `ioctl`. The kernel then verifies each page against the file's Merkle tree
+the first time it's read.
+
 ### Added in 1.5.0
 
 | Op | 1.5.0 | Notes |

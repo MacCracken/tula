@@ -117,6 +117,25 @@ jobs:
           CYRIUS_DCE=1 cyrius build programs/bigfile.cyr build/tula_bigfile
           ./build/tula_bigfile
 
+      - name: Protected open on a real fs-verity file (1.10.0, ADR 0013)
+        # An ext4 image formatted with -O verity, loop-mounted at build/verity.
+        # programs/verity.cyr enables fs-verity on a signed tula file there and
+        # checks that tula_open_protected maps it zero-copy and that the kernel
+        # refuses writers. If the runner can't make or mount the image, or its
+        # kernel has no fs-verity, the step says SKIP; only a failed check fails.
+        run: |
+          mkdir -p build/verity
+          if truncate -s 64M build/verity.img \
+             && mkfs.ext4 -q -F -O verity -b 4096 build/verity.img \
+             && sudo mount -o loop build/verity.img build/verity \
+             && sudo chown "$(id -u):$(id -g)" build/verity; then
+            CYRIUS_DCE=1 cyrius build programs/verity.cyr build/tula_verity
+            ./build/tula_verity
+            sudo umount build/verity
+          else
+            echo "SKIP: could not make or mount an fs-verity ext4 image on this runner"
+          fi
+
       - name: Fuzz (reader hardening + the streaming writers, ~1 min)
         # 2.9M hostile buffers through every reader, each placed against a
         # PROT_NONE guard page, then (1.6.1, phase H) 1,500 random builders

@@ -249,6 +249,21 @@ fn main(): i64 {
     }
     report_mb("mmap scan    : ", total, smin);
 
+    # ---- protected open (1.10.0, ADR 0013): not fs-verity here, so a private copy ----
+    var pomin = 0;
+    round = 0;
+    while (round < BN_ROUNDS) {
+        var tpo = now_ns();
+        var rpo = tula_open_protected(path);
+        var dpo = now_ns() - tpo;
+        if (rpo == 0) { sput("open_protected FAILED\n"); return 1; }
+        chk = chk + load64(rpo + total - 8);
+        tula_close_mmap(rpo);
+        pomin = min_of(pomin, round, dpo);
+        round = round + 1;
+    }
+    report_mb("open protect : ", total, pomin);
+
     # ---- validate (the untrusted-input gate; 200 entries) ----
     var vmin = 0;
     round = 0;
