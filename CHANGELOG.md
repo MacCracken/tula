@@ -7,7 +7,9 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
-**Throughput** (1.9.0). An additive MINOR with no format change (ADR 0012).
+## [1.9.0] - 2026-11-12
+
+**Throughput.** An additive MINOR with no format change (ADR 0012).
 The array helpers are 1.4–6.7× faster on one thread, and the new
 `tula_unpack_par` splits an unpack across threads. Every existing call's output
 is what 1.8.0 gives, bit for bit. A cross-version diff built against the 1.8.0

@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.8.0** (`tula_version_int()` returns `10800`). 1.0.1–1.1.1 are
+VERSION is **1.9.0** (`tula_version_int()` returns `10900`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -57,8 +57,7 @@ exact non-saturating conversions in integer arithmetic; `TULA_DT_INT4` = 14
 (ADR 0011), signed codes with an f64 `.scale` sidecar, quantized by Q4_0's rule,
 strict-checked for an odd count's unused nibble. 1.7.0 reads such files; its
 strict says `TULA_ERR_DTYPE`.
-**1.9.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.8.0):
-throughput. The array helpers are 1.4–6.7× faster on one thread with the same
+**1.9.0 — throughput**: the array helpers are 1.4–6.7× faster on one thread with the same
 output (tables for the byte and nibble formats, one loop per float format), and
 `tula_unpack_par` (ADR 0012, `src/par.cyr`) splits an unpack across threads.
 Strict, adds and short-name lookups cost 12–35% less per call. A cross-version
@@ -67,7 +66,7 @@ Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.9.0, unreleased)
+## Tests, fuzz, gates (1.9.0)
 
 **793 assertions** across 16 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
@@ -157,7 +156,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: cut 1.9.0 (throughput, in `[Unreleased]`); then 1.9.x patches (NF4 and
-INT4 pack are unchanged). Later: the 1.x.x
+Next: 1.9.x patches (NF4 and INT4 pack are unchanged), and fixes importers
+turn up. Later: the 1.x.x
 research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.
