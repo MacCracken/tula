@@ -22,7 +22,9 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
   by v1.x opens on any later 1.x, and vice versa. An older reader sees a
   long-named tensor by its key.
 - **Public functions** — the builder, reader, accessors, signature, file-I/O, and
-  dtype helpers documented in `docs/api.md`, with their signatures and semantics.
+  dtype helpers documented in `docs/api.md`, with their signatures and semantics;
+  from 1.9.0 also `tula_unpack_par` (ADR 0012), whose output is the serial
+  helper's at any thread count.
 - **Public constants** — `TULA_DT_*`, `TULA_SIG_*`, the `TULA_ERR_*` codes and
   their numeric values, and the format constants (`TULA_HEADER_SIZE`,
   `TULA_ENTRY_SIZE`, `TULA_NAME_CAP`, `TULA_MAXDIM`, `TULA_BUILDER_MAX`,
@@ -50,8 +52,10 @@ These may change in a MINOR release without a major bump:
   `tula_name_write`, `tula_serialize`, `tula_hdr_total`, `tula_nf4_nearest`, and
   every `_tula_*` function. Treat them as private, together with the builder's
   in-memory layout and the internal tuning constants (`TULA_BHDR_SIZE`,
-  `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`, and
-  from 1.5.0 the index layout `TULA_IDX_HDR` / `TULA_IDX_REC`).
+  `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`, from
+  1.5.0 the index layout `TULA_IDX_HDR` / `TULA_IDX_REC`, and from 1.9.0 the
+  parallel unpack's `TULA_PAR_MAX_THREADS` / `TULA_PAR_MIN_CHUNK`, which change
+  how a call is split but never its output).
 - **Benchmark numbers** and the fuzz/bench harness internals.
 - **The exact `TULA_ERR_*` returned** for a given malformed input may be refined
   to a more specific code (the *set* of codes only grows; a given input keeps

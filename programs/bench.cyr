@@ -18,6 +18,7 @@ enum BenchCfg {
     BN_FIND_REP = 20;        # full sweeps of every name per round
     BN_VAL_REP  = 2000;      # tula_validate calls per round
     BN_DT_N     = 1048576;   # elements per dtype op (2^20)
+    BN_PAR_N    = 16777216;  # elements per parallel unpack (2^24) (1.9.0)
 }
 
 fn sput(s): i64 {
@@ -640,6 +641,55 @@ fn main(): i64 {
     sput(" us   by index (build incl.): ");
     fmt_int((t8c - t8b) / 1000);
     sput(" us\n");
+
+    # ---- parallel unpack (1.9.0, ADR 0012): 2^24 elements at 1/2/4/8 threads. Last,
+    #      so its threads (which arm the allocator's lock) and its buffers touch no other row ----
+    var pn = BN_PAR_N;
+    var psig = alloc(pn * 8);
+    fill_signal(psig, pn);
+    var pout = alloc(pn * 8);
+    var pbf = alloc(pn * 2);
+    tula_bf16_pack(psig, pn, pbf);
+    var pe4 = alloc(pn);
+    tula_e4m3_pack(psig, pn, pe4);
+    var pi8 = alloc(pn);
+    var pi8s = alloc(8);
+    store64(pi8s, tula_int8_quant(psig, pn, pi8));
+    var pq4 = alloc(tula_int4_bytes(pn));
+    var pq4s = alloc(tula_int4_blocks(pn, TULA_INT4_BLOCK) * 8);
+    tula_int4_pack(psig, pn, TULA_INT4_BLOCK, pq4s, pq4);
+    var pnf = alloc(tula_nf4_bytes(pn));
+    var pnfs = alloc(tula_nf4_blocks(pn, TULA_NF4_BLOCK) * 8);
+    tula_nf4_pack(psig, pn, TULA_NF4_BLOCK, pnfs, pnf);
+    var pk = 0;
+    while (pk < 5) {
+        var pdt = TULA_DT_BF16;
+        var psrc = pbf;
+        var psc = 0;
+        var pbl = 0;
+        var plab = "par bf16  x";
+        if (pk == 1) { pdt = TULA_DT_F8_E4M3; psrc = pe4; plab = "par e4m3  x"; }
+        if (pk == 2) { pdt = TULA_DT_INT8; psrc = pi8; psc = pi8s; plab = "par int8  x"; }
+        if (pk == 3) { pdt = TULA_DT_INT4; psrc = pq4; psc = pq4s; pbl = TULA_INT4_BLOCK; plab = "par int4  x"; }
+        if (pk == 4) { pdt = TULA_DT_NF4; psrc = pnf; psc = pnfs; pbl = TULA_NF4_BLOCK; plab = "par nf4   x"; }
+        var pt = 1;
+        while (pt <= 8) {
+            var pmin = 0;
+            round = 0;
+            while (round < 3) {
+                var tp = now_ns();
+                tula_unpack_par(pdt, psrc, pn, psc, pbl, pout, pt);
+                pmin = min_of(pmin, round, now_ns() - tp);
+                round = round + 1;
+            }
+            chk = chk + load64(pout + 8 * 31337);
+            sput(plab);
+            fmt_int(pt);
+            report_el(" : ", pn, pmin);
+            pt = pt * 2;
+        }
+        pk = pk + 1;
+    }
 
     sput("checksum: ");
     fmt_int(chk);

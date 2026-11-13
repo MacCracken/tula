@@ -110,7 +110,11 @@ The dtype helpers pack/unpack ternary / int8 / NF4 / INT4 (and convert FP8); sca
 `"<name>.scale"` sidecar tensor ([ADR 0002](../adr/0002-quant-scales-as-sidecar-tensors.md)).
 Before unpacking a foreign quantized tensor, call `tula_entry_payload_ok(e)`.
 Integer and boolean tensors (`TULA_DT_I16/I32/I64/U8/BOOL`, 1.7.0) need no
-helper: each element is one load, as [`docs/api.md`](../api.md) shows. See
+helper: each element is one load, as [`docs/api.md`](../api.md) shows. To
+unpack a large tensor of any dtype that has a helper on several threads, call
+`tula_unpack_par(tula_entry_dtype(e), …, nthreads)` (1.9.0,
+[ADR 0012](../adr/0012-parallel-unpack.md)): one call for every dtype, with the
+serial helper's output. See
 [`docs/api.md`](../api.md) for the full surface and
 [`examples/consumer.cyr`](../../examples/consumer.cyr) for a complete
 quantize→sign→read→verify→dequant loop.

@@ -143,18 +143,34 @@ fn _tula_zero(dst, n): i64 {
 }
 
 # Copy a cstring into a 48-byte name field: truncate to 47, null-pad the rest.
+# (1.9.0) The cstring is measured only up to 47 bytes, and the field is zeroed
+# and filled a word at a time.
 fn tula_name_write(dst, src): i64 {
-    var n = strlen(src);
-    if (n > TULA_NAME_MAX) { n = TULA_NAME_MAX; }
-    var i = 0;
-    while (i < n) {
-        store8(dst + i, load8(src + i));
-        i = i + 1;
+    var n = 0;
+    while (n < TULA_NAME_MAX) {
+        if (load8(src + n) == 0) { break; }
+        n = n + 1;
     }
-    while (i < TULA_NAME_CAP) {
-        store8(dst + i, 0);
-        i = i + 1;
-    }
+    _tula_zero48(dst);
+    _tula_copy(dst, src, n);
+    return 0;
+}
+
+# Zero a 48-byte name field.
+fn _tula_zero48(dst): i64 {
+    store64(dst, 0);
+    store64(dst + 8, 0);
+    store64(dst + 16, 0);
+    store64(dst + 24, 0);
+    store64(dst + 32, 0);
+    store64(dst + 40, 0);
+    return 0;
+}
+
+# 1 if the 8 bytes of w include a zero byte (exact: (w - 0x01..) & ~w & 0x80..
+# is nonzero iff some byte is zero).
+fn _tula_has_zero(w): i64 {
+    if (((w - 0x0101010101010101) & (w ^ (0 - 1)) & 0x8080808080808080) != 0) { return 1; }
     return 0;
 }
 
@@ -360,16 +376,21 @@ fn _tula_bentry(b, i): i64 {
     return b + TULA_BHDR_SIZE + i * TULA_BENTRY_SIZE;
 }
 
-# Hash of a 48-byte name field.
+# Hash of a 48-byte name field: six rounds of (h ^ word) * prime, then
+# h ^ (h >> 31), one per word (unrolled in 1.9.0; the same value).
 fn _tula_name_hash(k): i64 {
-    var h = 0x6A09E667F3BCC908;
-    var w = 0;
-    while (w < 6) {
-        h = (h ^ load64(k + w * 8)) * 0x100000001B3;
-        h = h ^ (h >> 31);
-        w = w + 1;
-    }
-    return h;
+    var h = (0x6A09E667F3BCC908 ^ load64(k)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 8)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 16)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 24)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 32)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 40)) * 0x100000001B3;
+    return h ^ (h >> 31);
 }
 
 # 1 if two 48-byte name fields are identical.
@@ -439,7 +460,14 @@ fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, mode): i64 {
     # Stage the entry in slot c (not yet counted), then look its name up.
     var m = _tula_bentry(b, c);
     if (is_long == 1) { _tula_key2(m, name, nlen, "", 0); }
-    else              { tula_name_write(m, name); }
+    else {
+        if (mode >= 1) {               # nlen is known and <= 47: no second scan
+            _tula_zero48(m);
+            _tula_copy(m, name, nlen);
+        } else {
+            tula_name_write(m, name);
+        }
+    }
     if (mode >= 1) {
         # The table's own name: refused by the long add always, and by the
         # checked add once a long name is held (the table will take it). The
@@ -953,12 +981,14 @@ fn tula_validate(buf, len): i64 {
         var ndim = load64(buf + e + 56);
         if (ndim < 0)                    { return TULA_ERR_NDIM; }
         if (ndim > TULA_MAXDIM)          { return TULA_ERR_NDIM; }
-        # name must be NUL-terminated within its 48-byte field.
+        # name must be NUL-terminated within its 48-byte field: some byte of its
+        # six words is zero (1.9.0: a word at a time).
+        var nw = buf + e;
         var term = 0;
         var k = 0;
         while (k < TULA_NAME_CAP) {
-            if (load8(buf + e + k) == 0) { term = 1; k = TULA_NAME_CAP; }
-            else { k = k + 1; }
+            if (_tula_has_zero(load64(nw + k)) == 1) { term = 1; k = TULA_NAME_CAP; }
+            else { k = k + 8; }
         }
         if (term == 0)                   { return TULA_ERR_NAME_LONG; }
         # data_off + data_len must lie within the payload (overflow-safe).

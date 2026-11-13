@@ -145,8 +145,74 @@ isn't used for E5M2 yet, which 1.9.x's throughput work can change.
 **Signing and verifying big files is bound by sigil's SHA-512.** At ~18 MB/s, a
 14 GB (7B BF16) checkpoint takes about 25 minutes to sign and 13 to verify. tula
 adds only the write and one mapping. Crypto is sigil's (ADR 0001), so the fix is
-there: a tuned SHA-512 runs at hundreds of MB/s. It's on the roadmap as a
-cross-repo ask.
+there: a tuned SHA-512 runs at hundreds of MB/s. It is filed with sigil
+(`2026-11-09-anukulana-sha512-throughput-bounds-big-file-signing.md`, ~19 MB/s
+on this machine).
+
+### 1.9.0: throughput
+
+`make bench` builds of 1.8.0 and 1.9.0, run alternately on the same machine,
+three runs each (the range). Every row's output is the same in both: the suites
+check each new path against the definition it replaces, and a cross-version
+diff over random inputs matched 1.8.0 on every array helper, builder, strict
+verdict and lookup.
+
+**The array helpers**, 2²⁰ elements, one thread:
+
+| Op | 1.8.0 Melem/s | 1.9.0 Melem/s | | How |
+|---|---:|---:|---:|---|
+| `tula_e4m3_unpack` | 121–127 | 581–585 | 4.7× | 256-entry table, 8 codes per load |
+| `tula_e5m2_unpack` | 84–88 | 577–584 | 6.7× | the same |
+| `tula_int8_dequant` | 411–432 | 590–596 | 1.4× | its table, 8 codes per load |
+| `tula_ternary_unpack` | 358–379 | 617–621 | 1.7× | a byte's 4 trits from a 256-entry table |
+| `tula_int4_unpack` | 134–139 | 353–355 | 2.6× | each block's 16 products by one `f64v_scale`, a byte at a time |
+| `tula_nf4_unpack` | 244–256 | 374–375 | 1.5× | the same |
+| `tula_f32_unpack` / `f16` / `bf16` | 140–147 | 216–219 | 1.5× | one loop per format, one range test |
+| `tula_f32_pack` / `f16` / `bf16` | 101–116 | 151–154 | 1.4× | the same, rounding without a branch |
+| `tula_e4m3_pack` | 66–70 | 149–150 | 2.2× | inline rounding below the top exponent |
+| `tula_e5m2_pack` | 50–52 | 152–154 | 3.0× | the same |
+| `tula_int4_pack` | 58–61 | 60–61 | — | unchanged (the division per element) |
+| `tula_nf4_pack` | 25–26 | 26 | — | unchanged (the codebook search) |
+
+One core's memory bandwidth bounds the byte-sized formats: a plain 8-byte copy
+of the same output runs at about 570 Melem/s.
+
+**`tula_unpack_par`** (ADR 0012), 2²⁴ elements (128 MiB of f64 out):
+
+| dtype | 1 thread | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| BF16 | 208–215 | 409–414 | 738–771 | 958–976 |
+| E4M3 | 543–567 | 1,027–1,062 | 1,880–1,941 | 1,905–1,996 |
+| INT8 | 544–564 | 1,021–1,063 | 1,849–1,925 | 1,964–1,994 |
+| INT4 (block 32) | 333–347 | 633–659 | 1,173–1,190 | 1,477–1,492 |
+| NF4 (block 64) | 364–366 | 680–691 | 1,228–1,311 | 1,596–1,612 |
+
+Melem/s. Past 4 threads the byte formats are bound by memory bandwidth (about
+16 GB/s of f64 written). A thread start costs about 29 µs (a 2 MiB stack mapped,
+then the clone) and a join about 6 µs, so 8 threads cost a call about 0.25 ms.
+That is why each thread gets at least 65,536 elements. At that minimum, BF16
+gains from 131,072 elements (629 → 413 µs on 2 threads), and E4M3 breaks even
+there and gains from 262,144 (458 → 264 µs on 4).
+
+**Per-call costs**:
+
+| Op | 1.8.0 | 1.9.0 | How |
+|---|---:|---:|---|
+| `tula_validate`, 200 tensors | 2.71–2.78 µs | 2.39–2.43 µs | the name's NUL found a word at a time |
+| `tula_validate_strict`, 200 tensors | 50.6–51.3 µs | 38.9 µs | the duplicate sort compares hashes inline |
+| `tula_validate_strict`, 256 tensors | 86.5–89.3 µs | 59.1–59.3 µs | the same |
+| `tula_builder_add` | 187–198 ns | 154–160 ns | the name measured once, copied a word at a time |
+| `tula_builder_add_checked` | 210–223 ns | 137–142 ns | no second measure of the name |
+| `tula_index_new`, 256 long names | 83.5–84.8 µs | 66.7–67.2 µs | the sort |
+| `tula_index_find`, short names | 249–260 ns | 216–231 ns | the query built in one measured pass |
+| `tula_index_find`, long names | 617–635 ns | 614–615 ns | unchanged: the key's hash dominates |
+| `tula_find_name`, long names | 1.97–2.09 µs | 1.98–2.00 µs | unchanged |
+| `tula_builder_set_meta` | 731–772 ns | 776–803 ns | no change on its path: code layout |
+
+`f64v` is cyrius's SIMD array arithmetic. It has no integer and float
+conversion, no shifts, masks or gathers, so the conversions can't use it; NF4
+and INT4 use `f64v_scale` for their block products, always over 16 elements
+(see ADR 0012 on the open cyrius issue for odd lengths).
 
 ### Added in 1.5.0
 
@@ -185,7 +251,9 @@ read 41 ms, mmap open < 1 ms, mmap scan 4 ms. That harness measured file I/O onl
   else writes (`SECURITY.md`).
 - **`read (heap)` copies the whole file**, so its cost is linear in size; use it
   for small files, for files others can write, or when you need an owned buffer.
-- **validate is O(tensors), not O(bytes)**: ~14 ns per entry.
+- **validate is O(tensors), not O(bytes)**: ~12 ns per entry.
+- **Unpack big tensors with `tula_unpack_par`** (1.9.0): the serial helpers top
+  out near one core's memory bandwidth, and 4–8 threads give 3–5× more.
 - **`tula_find` is a linear scan**: ~3 ns per entry. For many lookups on one
   file, build the name index (1.5.0): looking up every tensor is then
   O(n log n) instead of O(n²).

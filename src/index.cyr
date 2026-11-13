@@ -83,16 +83,18 @@ fn _tula_index_lookup(ix, q): i64 {
     var lo = 0;
     var hi = n;
     while (lo < hi) {
-        var mid = (lo + hi) / 2;
+        var mid = (lo + hi) >> 1;
         var rh = load64(recs + mid * TULA_IDX_REC);
         # the hash decides most steps in one compare; equal hashes compare keys
-        var less = 0;
-        if (rh < qh) { less = 1; }
-        if (rh == qh) {
-            if (_tula_rec_order(recs + mid * TULA_IDX_REC, &qrec, 0) < 0) { less = 1; }
+        if (rh < qh) { lo = mid + 1; }
+        else {
+            if (rh == qh) {
+                if (_tula_rec_order(recs + mid * TULA_IDX_REC, &qrec, 0) < 0) { lo = mid + 1; }
+                else { hi = mid; }
+            } else {
+                hi = mid;
+            }
         }
-        if (less == 1) { lo = mid + 1; }
-        else { hi = mid; }
     }
     if (lo >= n) { return 0; }
     var rec = recs + lo * TULA_IDX_REC;
@@ -116,7 +118,13 @@ fn _tula_index_find2(ix, a, alen, b, blen): i64 {
 # answer tula_find_name(r, name) gives — the first matching entry, a long name
 # confirmed against the names table — or 0.
 fn tula_index_find(ix, name): i64 {
-    return _tula_index_find2(ix, name, strlen(name), "", 0);
+    var q[48];
+    var n = _tula_query_name(&q, name);
+    var te = load64(ix + 32);
+    if (te == 0) {
+        if (n > TULA_NAME_MAX) { return 0; }   # no names table: no long names
+    }
+    return _tula_confirm_t(load64(ix), te, _tula_index_lookup(ix, &q), name, n, "", 0);
 }
 
 # tula_find_scale through the index (1.5.0): entry e's "<full name>.scale"

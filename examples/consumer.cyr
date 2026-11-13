@@ -6,6 +6,9 @@
 #   read (untrusted) -> strict validate -> signature required -> scale lookup +
 #   payload-ok guard -> unpack -> dequant.
 #
+# 1.9.0: the bf16 tensor is unpacked through tula_unpack_par (ADR 0012), which
+# dispatches on the entry's dtype and splits a large tensor across threads (this
+# one is small, so it runs on the caller's thread, with the same output).
 # 1.7.0: integer and boolean tensors (ADR 0009) — a BERT-style position_ids
 # (I64), an attention mask (BOOL) and signed I32 offsets — stored raw and read
 # back with plain loads; strict guarantees each mask byte is 0 or 1.
@@ -222,7 +225,11 @@ fn main(): i64 {
     if (tula_entry_dim(el, 0) != bn) { sput("FAIL: LoRA length\n"); return 1; }
     if (tula_entry_payload_ok(el) != 1) { sput("FAIL: payload guard (LoRA)\n"); return 1; }
     var lout = alloc(bn * 8);
-    tula_bf16_unpack(tula_entry_data(r, el), bn, lout);
+    # 1.9.0: one call for any dtype with an unpack helper, on up to 4 threads
+    if (tula_unpack_par(tula_entry_dtype(el), tula_entry_data(r, el), bn, 0, 0, lout, 4) != bn) {
+        sput("FAIL: LoRA unpack\n");
+        return 1;
+    }
     var okl = 1;
     i = 0;
     while (i < bn) {

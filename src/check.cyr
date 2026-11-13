@@ -29,6 +29,7 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
     # are scanned only up to the end of the word holding the NUL; every later
     # word must be all zero, one compare each.
     var k = 0;
+    while (_tula_has_zero(load64(e + k)) == 0) { k = k + 8; }   # the word with the NUL
     while (load8(e + k) != 0) { k = k + 1; }
     k = k + 1;
     while ((k & 7) != 0) {
@@ -128,19 +129,39 @@ fn _tula_rec_swap(a, b): i64 {
     return 0;
 }
 
-# Sift record `root` down the max-heap recs[0..end] (end inclusive).
+# 1 if record a orders before record b (_tula_rec_order(a, b, tie) < 0). The
+# hashes decide almost every comparison, inline; only equal hashes call the
+# full order (1.9.0).
+fn _tula_rec_lt(a, b, tie): i64 {
+    var ha = load64(a);
+    var hb = load64(b);
+    if (ha < hb) { return 1; }
+    if (ha > hb) { return 0; }
+    if (_tula_rec_order(a, b, tie) < 0) { return 1; }
+    return 0;
+}
+
+# Sift record `root` down the max-heap recs[0..end] (end inclusive). The larger
+# child is found with two comparisons, as before; the swap is inline (1.9.0).
 fn _tula_sift(recs, root, end, tie): i64 {
     loop {
         var child = root * 2 + 1;
         if (child > end) { return 0; }
-        var sw = root;
-        if (_tula_rec_order(recs + sw * 16, recs + child * 16, tie) < 0) { sw = child; }
+        var pr = recs + root * 16;
+        var ps = pr;
+        var pc = recs + child * 16;
+        if (_tula_rec_lt(ps, pc, tie) == 1) { ps = pc; }
         if (child + 1 <= end) {
-            if (_tula_rec_order(recs + sw * 16, recs + child * 16 + 16, tie) < 0) { sw = child + 1; }
+            if (_tula_rec_lt(ps, pc + 16, tie) == 1) { ps = pc + 16; }
         }
-        if (sw == root) { return 0; }
-        _tula_rec_swap(recs + root * 16, recs + sw * 16);
-        root = sw;
+        if (ps == pr) { return 0; }
+        var h = load64(pr);
+        var p = load64(pr + 8);
+        store64(pr, load64(ps));
+        store64(pr + 8, load64(ps + 8));
+        store64(ps, h);
+        store64(ps + 8, p);
+        root = (ps - recs) / 16;
     }
     return 0;
 }

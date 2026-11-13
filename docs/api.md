@@ -462,6 +462,47 @@ in integer arithmetic.
 Double-quant composes: int8-quantize a `"<name>.scale"` tensor and store its own
 `"<name>.scale.scale"` — the same convention, one level down.
 
+**Speed** *(1.9.0)*: the array helpers are faster, with the same output bit for
+bit, and no signature or contract changed. The FP8 unpacks and int8's
+dequant read a 256-entry table from 1,024 elements, and ternary's unpack from
+1,024 trits. NF4 and INT4 build each block's 16 products once, from a block of
+16. Each float format has its own loop. Numbers are in
+[`benchmarks.md`](benchmarks.md).
+
+---
+
+## Parallel unpack — `src/par.cyr` *(1.9.0, ADR 0012)*
+
+- `fn tula_unpack_par(dtype, src, n, scales, block, dst, nthreads) -> n | -1`
+  — runs the dtype's unpack helper over a tensor on up to `nthreads` threads,
+  the caller's included. The output is the serial helper's, bit for bit, at any
+  thread count.
+  - **Arguments by dtype**, as the serial helpers take them:
+    - F32, F16, BF16, F8_E4M3, F8_E5M2: `scales` and `block` are unused;
+    - INT8: `scales` points at the one f64 scale;
+    - NF4, INT4: `scales` is f64 per `block` elements (`block` > 0);
+    - TERNARY: `dst` is i64 trits.
+  - **Returns −1, writing nothing**, for:
+    - a dtype with no unpack helper (F64, the integers, BOOL, unknown codes);
+    - `n < 0`;
+    - NF4 or INT4 with `block <= 0`.
+
+    `n = 0` returns 0 without reading `scales`.
+  - **Threads**: the caller chooses `nthreads`, and tula doesn't probe the
+    machine. A count below 1 counts as 1. A call uses at most
+    `TULA_PAR_MAX_THREADS` (64), and gives each thread at least
+    `TULA_PAR_MIN_CHUNK` (65,536) elements, so a smaller tensor runs on the
+    caller's thread alone. A thread that fails to start has its slice run on the
+    caller's thread. Where the stdlib's `THREADS_CONCURRENT` isn't 1 (agnos,
+    cx), the whole call runs serially. The two constants tune the split only,
+    so they may change in a MINOR (STABILITY.md); the output never depends on
+    them.
+  - **Cost**: each call starts and joins its threads; there is no pool. Each
+    thread started leaves about 4 KiB of the stdlib's bookkeeping on cyrius's
+    bump allocator, which has no free.
+  - Like the serial helpers it trusts its arguments: run `tula_entry_payload_ok`
+    on a foreign entry and its `.scale` sidecar first.
+
 ---
 
 ## Minimal consumer flow
@@ -486,11 +527,14 @@ arch = tula_meta_get(r, "hf.architecture")    # 1.6.0; 0 if absent
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
 # a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
+# to f64 on 8 threads (1.9.0); -1 for a dtype with no unpack helper:
+#   n = tula_entry_nelems(e)
+#   tula_unpack_par(tula_entry_dtype(e), p, n, tula_entry_data(r, se), block, dst, 8)
 ```
 
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
-index is 1.5.0; metadata is 1.6.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

@@ -49,6 +49,12 @@
 #      last high nibble zero. Phase I's file holds them too, and phase H's
 #      builders draw them (an odd INT4 with a set last high nibble isn't
 #      counted canonical).
+#  11. (1.9.0) the parallel unpack (ADR 0012) is the serial helper, bit for
+#      bit, and reads nothing past its inputs. Phase J draws a dtype with an
+#      unpack helper, a count up to five chunks, a block, odd ones included,
+#      and 1..9 threads. The payload and the scales each end exactly at a guard
+#      page, so a slice that starts or ends a byte or a block wrong faults. The
+#      output must equal the serial helper's, with the word after it untouched.
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -72,6 +78,8 @@ enum FuzzCfg {
     FZ_META_ITERS   = 300000;    # phase G: a metadata + names file, mutations aimed at the metadata
     FZ_WRITE_ITERS  = 1500;      # phase H: random builders through the streaming writers
     FZ_INT_ITERS    = 300000;    # phase I: the 1.7.0 dtypes, mutations aimed at BOOL bytes, dtypes, shapes
+    FZ_PAR_ITERS    = 400;       # phase J: parallel unpacks against the serial helpers (1.9.0)
+    FZ_PAR_MAXN     = 327680;    # phase J: the most elements per unpack (5 x TULA_PAR_MIN_CHUNK)
     FZ_POOL         = 135168;    # phase H: random payload bytes (> the 64 KiB stage + 60000)
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
@@ -698,6 +706,93 @@ fn same_bytes(a, b, n): i64 {
     return 1;
 }
 
+# ---- phase J helpers: the parallel unpack (1.9.0) ---------------------------
+
+# The address of a PROT_NONE page with `span` readable bytes before it, or 0.
+fn guard_span(span): i64 {
+    var base = mmap_anon(span + 4096);
+    if (base == 0) { return 0; }
+    if (cyr_mprotect(base + span, 4096, PROT_NONE) != 0) { return 0; }
+    return base + span;
+}
+
+# The serial helper for dt, as tula_unpack_par documents it.
+fn par_serial(dt, src, n, scales, block, dst): i64 {
+    if (dt == TULA_DT_F32)     { return tula_f32_unpack(src, n, dst); }
+    if (dt == TULA_DT_F16)     { return tula_f16_unpack(src, n, dst); }
+    if (dt == TULA_DT_BF16)    { return tula_bf16_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E4M3) { return tula_e4m3_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E5M2) { return tula_e5m2_unpack(src, n, dst); }
+    if (dt == TULA_DT_INT8)    { tula_int8_dequant(src, n, load64(scales), dst); return n; }
+    if (dt == TULA_DT_NF4)     { return tula_nf4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_INT4)    { return tula_int4_unpack(src, scales, n, block, dst); }
+    return tula_ternary_unpack(src, n, dst);
+}
+
+# Phase J: FZ_PAR_ITERS parallel unpacks, each against the serial helper, with
+# the payload and the scales ending at guard pages. Returns the failures.
+fn par_phase(s, st): i64 {
+    var fails = 0;
+    var pg = guard_span(FZ_PAR_MAXN * 4 + 4096);       # payloads: F32 is the widest
+    var sg = guard_span(FZ_PAR_MAXN * 8 + 4096);       # scales: one per element at block 1
+    if (pg == 0 || sg == 0) { return 1; }
+    var pool = alloc(FZ_PAR_MAXN * 4);
+    var k = 0;
+    while (k < FZ_PAR_MAXN * 4) { store64(pool + k, rng_next(s)); k = k + 8; }
+    var spool = alloc(FZ_PAR_MAXN * 8);
+    k = 0;
+    while (k < FZ_PAR_MAXN) {
+        var r = rng_next(s);
+        if ((r & 3) != 0) { r = (r & 0x800FFFFFFFFFFFFF) | ((1013 + ((r >> 2) & 15)) << 52); }
+        store64(spool + k * 8, r);                     # mostly normal scales; any bits now and then
+        k = k + 1;
+    }
+    var ref = alloc((FZ_PAR_MAXN + 1) * 8);
+    var out = alloc((FZ_PAR_MAXN + 1) * 8);
+    var dts[72];
+    store64(&dts, TULA_DT_F32); store64(&dts + 8, TULA_DT_F16); store64(&dts + 16, TULA_DT_BF16);
+    store64(&dts + 24, TULA_DT_F8_E4M3); store64(&dts + 32, TULA_DT_F8_E5M2);
+    store64(&dts + 40, TULA_DT_INT8); store64(&dts + 48, TULA_DT_NF4);
+    store64(&dts + 56, TULA_DT_INT4); store64(&dts + 64, TULA_DT_TERNARY);
+    var it = 0;
+    while (it < FZ_PAR_ITERS) {
+        var dt = load64(&dts + rng_below(s, 9) * 8);
+        var n = 1 + rng_below(s, FZ_PAR_MAXN);
+        if (rng_below(s, 4) == 0) { n = 1 + rng_below(s, 3 * TULA_PAR_MIN_CHUNK); }
+        var block = 0;
+        var nsc = 0;
+        if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) {
+            block = 1 + rng_below(s, 300);
+            if (rng_below(s, 3) == 0) { block = 32 + 32 * rng_below(s, 2); }
+            if (rng_below(s, 20) == 0) { block = n / 2 + rng_below(s, n + 1); }   # one or two blocks
+            if (block < 1) { block = 1; }
+            nsc = (n + block - 1) / block;
+        }
+        if (dt == TULA_DT_INT8) { nsc = 1; }
+        var plen = tula_packed_len(dt, n);
+        var src = pg - plen;
+        memcpy_n(src, pool, plen);
+        var scales = sg - nsc * 8;
+        memcpy_n(scales, spool, nsc * 8);
+        var threads = 1 + rng_below(s, 9);
+        par_serial(dt, src, n, scales, block, ref);
+        store64(out + n * 8, 0x5A5A5A5A5A5A5A5A);
+        var rc = tula_unpack_par(dt, src, n, scales, block, out, threads);
+        var ok = 1;
+        if (rc != n) { ok = 0; }
+        if (load64(out + n * 8) != 0x5A5A5A5A5A5A5A5A) { ok = 0; }
+        k = 0;
+        while (k < n) {
+            if (load64(out + k * 8) != load64(ref + k * 8)) { ok = 0; k = n; }
+            k = k + 1;
+        }
+        if (ok == 0) { fails = fails + 1; }
+        store64(st + 104, load64(st + 104) + 1);
+        it = it + 1;
+    }
+    return fails;
+}
+
 fn main(): i64 {
     alloc_init();
     var s = alloc(8);
@@ -708,7 +803,7 @@ fn main(): i64 {
     while (z < 16) { store64(st + z * 8, 0); z = z + 1; }
     # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
     # +56 strict accepted  +64 strict DUP_NAME  +72 stream writes  +80 nameless
-    # +88 canonical builders  +96 strict VALUE (1.7.0)
+    # +88 canonical builders  +96 strict VALUE (1.7.0)  +104 parallel unpacks (1.9.0)
 
     var guard = guard_region();
     if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
@@ -1003,6 +1098,9 @@ fn main(): i64 {
         ii = ii + 1;
     }
 
+    # ---- phase J (1.9.0): the parallel unpack against the serial helpers ----
+    store64(st + 16, load64(st + 16) + par_phase(s, st));
+
     var t1 = now_ns();
 
     sput("tula fuzz — reader hardening (M3) under hostile input\n");
@@ -1015,6 +1113,7 @@ fn main(): i64 {
     kv("  strict accepted    : ", load64(st + 56));
     kv("  strict DUP_NAME    : ", load64(st + 64));
     kv("  strict VALUE       : ", load64(st + 96));
+    kv("  parallel unpacks   : ", load64(st + 104));
     kv("  stream writes      : ", load64(st + 72));
     kv("    nameless         : ", load64(st + 80));
     kv("    canonical        : ", load64(st + 88));

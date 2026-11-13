@@ -208,18 +208,34 @@ fn _tula_zero(dst, n): i64 {
 }
 
 # Copy a cstring into a 48-byte name field: truncate to 47, null-pad the rest.
+# (1.9.0) The cstring is measured only up to 47 bytes, and the field is zeroed
+# and filled a word at a time.
 fn tula_name_write(dst, src): i64 {
-    var n = strlen(src);
-    if (n > TULA_NAME_MAX) { n = TULA_NAME_MAX; }
-    var i = 0;
-    while (i < n) {
-        store8(dst + i, load8(src + i));
-        i = i + 1;
+    var n = 0;
+    while (n < TULA_NAME_MAX) {
+        if (load8(src + n) == 0) { break; }
+        n = n + 1;
     }
-    while (i < TULA_NAME_CAP) {
-        store8(dst + i, 0);
-        i = i + 1;
-    }
+    _tula_zero48(dst);
+    _tula_copy(dst, src, n);
+    return 0;
+}
+
+# Zero a 48-byte name field.
+fn _tula_zero48(dst): i64 {
+    store64(dst, 0);
+    store64(dst + 8, 0);
+    store64(dst + 16, 0);
+    store64(dst + 24, 0);
+    store64(dst + 32, 0);
+    store64(dst + 40, 0);
+    return 0;
+}
+
+# 1 if the 8 bytes of w include a zero byte (exact: (w - 0x01..) & ~w & 0x80..
+# is nonzero iff some byte is zero).
+fn _tula_has_zero(w): i64 {
+    if (((w - 0x0101010101010101) & (w ^ (0 - 1)) & 0x8080808080808080) != 0) { return 1; }
     return 0;
 }
 
@@ -425,16 +441,21 @@ fn _tula_bentry(b, i): i64 {
     return b + TULA_BHDR_SIZE + i * TULA_BENTRY_SIZE;
 }
 
-# Hash of a 48-byte name field.
+# Hash of a 48-byte name field: six rounds of (h ^ word) * prime, then
+# h ^ (h >> 31), one per word (unrolled in 1.9.0; the same value).
 fn _tula_name_hash(k): i64 {
-    var h = 0x6A09E667F3BCC908;
-    var w = 0;
-    while (w < 6) {
-        h = (h ^ load64(k + w * 8)) * 0x100000001B3;
-        h = h ^ (h >> 31);
-        w = w + 1;
-    }
-    return h;
+    var h = (0x6A09E667F3BCC908 ^ load64(k)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 8)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 16)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 24)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 32)) * 0x100000001B3;
+    h = h ^ (h >> 31);
+    h = (h ^ load64(k + 40)) * 0x100000001B3;
+    return h ^ (h >> 31);
 }
 
 # 1 if two 48-byte name fields are identical.
@@ -504,7 +525,14 @@ fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, mode): i64 {
     # Stage the entry in slot c (not yet counted), then look its name up.
     var m = _tula_bentry(b, c);
     if (is_long == 1) { _tula_key2(m, name, nlen, "", 0); }
-    else              { tula_name_write(m, name); }
+    else {
+        if (mode >= 1) {               # nlen is known and <= 47: no second scan
+            _tula_zero48(m);
+            _tula_copy(m, name, nlen);
+        } else {
+            tula_name_write(m, name);
+        }
+    }
     if (mode >= 1) {
         # The table's own name: refused by the long add always, and by the
         # checked add once a long name is held (the table will take it). The
@@ -1018,12 +1046,14 @@ fn tula_validate(buf, len): i64 {
         var ndim = load64(buf + e + 56);
         if (ndim < 0)                    { return TULA_ERR_NDIM; }
         if (ndim > TULA_MAXDIM)          { return TULA_ERR_NDIM; }
-        # name must be NUL-terminated within its 48-byte field.
+        # name must be NUL-terminated within its 48-byte field: some byte of its
+        # six words is zero (1.9.0: a word at a time).
+        var nw = buf + e;
         var term = 0;
         var k = 0;
         while (k < TULA_NAME_CAP) {
-            if (load8(buf + e + k) == 0) { term = 1; k = TULA_NAME_CAP; }
-            else { k = k + 1; }
+            if (_tula_has_zero(load64(nw + k)) == 1) { term = 1; k = TULA_NAME_CAP; }
+            else { k = k + 8; }
         }
         if (term == 0)                   { return TULA_ERR_NAME_LONG; }
         # data_off + data_len must lie within the payload (overflow-safe).
@@ -1915,8 +1945,32 @@ fn tula_ternary_get(packed, i): i64 {
 # Byte-at-a-time: each packed byte is loaded once and its four 2-bit codes are
 # decoded with (code & 1) - (code >> 1), which is 0, +1, -1, 0 for codes 0..3 —
 # exactly tula_ternary_get's mapping (the unused code 3 decodes to 0 there too).
+# From 1,024 trits (1.9.0) the four decoded trits of every byte value come from
+# a 256-entry table built per call (8 KiB on the stack), so a byte is four copies.
 fn tula_ternary_unpack(src, n, dst): i64 {
     var i = 0;
+    if (n >= 1024) {
+        var tab[8192];
+        var c = 0;
+        while (c < 256) {
+            var k = 0;
+            while (k < 4) {
+                var cd = (c >> (k * 2)) & 3;
+                store64(&tab + c * 32 + k * 8, (cd & 1) - (cd >> 1));
+                k = k + 1;
+            }
+            c = c + 1;
+        }
+        while (i + 4 <= n) {
+            var t = &tab + (load8(src + (i >> 2)) << 5);
+            var q = dst + i * 8;
+            store64(q, load64(t));
+            store64(q + 8, load64(t + 8));
+            store64(q + 16, load64(t + 16));
+            store64(q + 24, load64(t + 24));
+            i = i + 4;
+        }
+    }
     while (i + 4 <= n) {
         var byte = load8(src + (i >> 2));
         var c0 = byte & 3;
@@ -1969,6 +2023,30 @@ fn tula_int8_quant(src, n, dst): i64 {
     return scale;
 }
 
+# dst[i] = the 8-byte entry of `tab` (256 of them) that byte src[i] selects, for
+# i < n (1.9.0). Eight bytes per load: reads exactly n bytes and writes n words.
+fn _tula_lut8(src, n, dst, tab): i64 {
+    var i = 0;
+    while (i + 8 <= n) {
+        var w = load64(src + i);
+        var q = dst + i * 8;
+        store64(q, load64(tab + ((w << 3) & 0x7F8)));
+        store64(q + 8, load64(tab + ((w >> 5) & 0x7F8)));
+        store64(q + 16, load64(tab + ((w >> 13) & 0x7F8)));
+        store64(q + 24, load64(tab + ((w >> 21) & 0x7F8)));
+        store64(q + 32, load64(tab + ((w >> 29) & 0x7F8)));
+        store64(q + 40, load64(tab + ((w >> 37) & 0x7F8)));
+        store64(q + 48, load64(tab + ((w >> 45) & 0x7F8)));
+        store64(q + 56, load64(tab + ((w >> 53) & 0x7F8)));
+        i = i + 8;
+    }
+    while (i < n) {
+        store64(dst + i * 8, load64(tab + (load8(src + i) << 3)));
+        i = i + 1;
+    }
+    return n;
+}
+
 # Dequantize int8[n] `src` into f64[n] `dst` using `scale` (f64 bits). Returns 0.
 fn tula_int8_dequant(src, n, scale, dst): i64 {
     var i = 0;
@@ -1983,10 +2061,7 @@ fn tula_int8_dequant(src, n, scale, dst): i64 {
             store64(&tab + c * 8, f64_mul(f64_from(v), scale));
             c = c + 1;
         }
-        while (i < n) {
-            store64(dst + i * 8, load64(&tab + load8(src + i) * 8));
-            i = i + 1;
-        }
+        _tula_lut8(src, n, dst, &tab);
         return 0;
     }
     while (i < n) {
@@ -2140,17 +2215,52 @@ fn tula_nf4_pack(src, n, block, scales, nibbles): i64 {
     return nblocks;
 }
 
+# dst[i..end) from the 4-bit codes at `nibbles` (element k in the low nibble of
+# byte k/2 when k is even, the high one when odd), each code selecting one of
+# the 16 words at `tab` (1.9.0). A whole byte at a time between the edges.
+fn _tula_lut4_span(nibbles, i, end, dst, tab): i64 {
+    if (i >= end) { return 0; }
+    if ((i & 1) == 1) {
+        store64(dst + i * 8, load64(tab + ((load8(nibbles + (i >> 1)) >> 4) << 3)));
+        i = i + 1;
+    }
+    while (i + 2 <= end) {
+        var b = load8(nibbles + (i >> 1));
+        store64(dst + i * 8, load64(tab + ((b & 15) << 3)));
+        store64(dst + i * 8 + 8, load64(tab + ((b >> 4) << 3)));
+        i = i + 2;
+    }
+    if (i < end) {
+        store64(dst + i * 8, load64(tab + ((load8(nibbles + (i >> 1)) & 15) << 3)));
+    }
+    return 0;
+}
+
 # Unpack NF4 `nibbles` + `scales` back into f64[n] `dst`. Returns n; 0 for
 # block <= 0, with nothing written (it used to divide by zero).
 # Block by block: each block's scale is loaded once, and each code is looked up
 # in a 16-entry codebook table instead of tula_nf4_level's compare chain. Every
-# output is the same f64_mul(level, scale) as before, bit for bit.
+# output is the same f64_mul(level, scale) as before, bit for bit. From a block
+# of 16 (1.9.0) the block's 16 products are made once, by one f64v_scale over the
+# codebook (the same IEEE multiply per lane), and each code is a load.
 fn tula_nf4_unpack(nibbles, scales, n, block, dst): i64 {
     if (block <= 0) { return 0; }
     var lv[128];
     _tula_nf4_table(&lv);
     var i = 0;
     var bi = 0;
+    if (block >= 16) {
+        var tab[128];
+        while (i < n) {
+            f64v_scale(&tab, &lv, load64(scales + bi * 8), 16);
+            var stop = i + block;
+            if (stop > n) { stop = n; }
+            _tula_lut4_span(nibbles, i, stop, dst, &tab);
+            i = stop;
+            bi = bi + 1;
+        }
+        return n;
+    }
     while (i < n) {
         var amax = load64(scales + bi * 8);
         var end = i + block;
@@ -2346,87 +2456,126 @@ fn tula_f64_to_bf16(x): i64 { return _tula_f64_narrow(x, 8, 7); }
 # bfloat16 bits (low 16 bits used) -> f64 bits.
 fn tula_bf16_to_f64(h): i64 { return _tula_narrow_widen(h & 0xFFFF, 8, 7); }
 
-# Narrow f64[n] `src` into the (E, M) format at `dst`, `width` bytes each. The
-# common case — a normal f64 whose result is a normal narrow value below the top
-# exponent — is rounded inline: round the 52-bit fraction to M bits (nearest,
-# ties to even) and ADD it to the exponent field, so a carry out of the fraction
-# bumps the exponent, as IEEE rounding does. Below the top exponent that carry
-# can't reach inf. Everything else — zeros, subnormals, the top exponent, inf,
-# NaN — takes _tula_f64_narrow. Same bits either way (tests/tcyr/floats.tcyr).
-fn _tula_narrow_array(src, n, dst, ebits, mbits, width): i64 {
-    var bias = (1 << (ebits - 1)) - 1;
-    var emax = (1 << ebits) - 1;
-    var shift = 52 - mbits;
-    var rmask = (1 << shift) - 1;
-    var half = 1 << (shift - 1);
+# The array conversions (1.9.0: one loop per format, its constants inline). The
+# common case is done inline and everything else takes the scalar conversion, so
+# the bits are the scalar's either way (tests/tcyr/floats.tcyr, kernels.tcyr).
+#
+# Narrowing: a normal f64 whose result is a normal narrow value below the top
+# exponent (biased en in 1..emax-2, the range test ((en - 1) | (emax - 2 - en))
+# >= 0) is rounded inline. The 52-bit fraction is rounded to M bits, nearest,
+# ties to even, without a branch: with s = 52 - M, q = frac >> s and rem the low
+# s bits, q + ((rem + 2^(s-1) - 1 + (q & 1)) >> s) adds 1 exactly when rem is
+# over half, or half with q odd. The rounded fraction is ADDED to the exponent
+# field, so a carry out of it bumps the exponent, as IEEE rounding does; below
+# the top exponent that carry can't reach inf. Zeros, subnormals, the top
+# exponent, inf and NaN take _tula_f64_narrow.
+#
+# Widening: a normal value (exponent field neither 0 nor all ones, the test
+# ((e + 1) & emax) > 1) is rebuilt inline: the exponent and mantissa shift up
+# together and the rebias is added to the exponent field. Zeros, subnormals, inf
+# and NaN take _tula_narrow_widen.
+
+# Pack f64[n] `src` as binary32 into `dst` (4 bytes each, LE). Returns n * 4.
+fn tula_f32_pack(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
         var x = load64(src + i * 8);
-        var en = ((x >> 52) & 0x7FF) - 1023 + bias;
-        var h = 0;
-        if (en >= 1) {
-            if (en < emax - 1) {
-                var frac = x & 0xFFFFFFFFFFFFF;
-                var q = frac >> shift;
-                var rem = frac & rmask;
-                if (rem > half) { q = q + 1; }
-                if (rem == half) { q = q + (q & 1); }
-                h = (((x >> 63) & 1) << (ebits + mbits)) | ((en << mbits) + q);
-            } else {
-                h = _tula_f64_narrow(x, ebits, mbits);
-            }
+        var en = ((x >> 52) & 0x7FF) - 896;
+        if (((en - 1) | (253 - en)) >= 0) {
+            var frac = x & 0xFFFFFFFFFFFFF;
+            var q = frac >> 29;
+            q = q + (((frac & 0x1FFFFFFF) + 0xFFFFFFF + (q & 1)) >> 29);
+            store32(dst + i * 4, ((x >> 63) << 31) | ((en << 23) + q));
         } else {
-            h = _tula_f64_narrow(x, ebits, mbits);
+            store32(dst + i * 4, _tula_f64_narrow(x, 8, 23));
         }
-        if (width == 4) { store32(dst + i * 4, h); }
-        else            { store16(dst + i * 2, h); }
         i = i + 1;
     }
-    return n * width;
+    return n * 4;
 }
 
-# Widen n values of the (E, M) format at `src` (`width` bytes each) into f64[n]
-# `dst`. A normal value is rebuilt inline (sign, rebiased exponent, shifted
-# mantissa); zeros, subnormals, inf and NaN take _tula_narrow_widen.
-fn _tula_widen_array(src, n, dst, ebits, mbits, width): i64 {
-    var rebias = 1023 - ((1 << (ebits - 1)) - 1);
-    var emax = (1 << ebits) - 1;
-    var mmask = (1 << mbits) - 1;
-    var top = ebits + mbits;
+# Unpack n binary32 values from `src` into f64[n] `dst`. Returns n.
+fn tula_f32_unpack(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
-        var h = 0;
-        if (width == 4) { h = load32(src + i * 4) & 0xFFFFFFFF; }
-        else            { h = load16(src + i * 2) & 0xFFFF; }
-        var e = (h >> mbits) & emax;
-        var v = 0;
-        if (e != 0) {
-            if (e != emax) {
-                v = (((h >> top) & 1) << 63) | ((e + rebias) << 52) | ((h & mmask) << (52 - mbits));
-            } else {
-                v = _tula_narrow_widen(h, ebits, mbits);
-            }
+        var h = load32(src + i * 4);
+        if (((((h >> 23) & 255) + 1) & 255) > 1) {
+            store64(dst + i * 8, ((h >> 31) << 63) | (((h & 0x7FFFFFFF) << 29) + (896 << 52)));
         } else {
-            v = _tula_narrow_widen(h, ebits, mbits);
+            store64(dst + i * 8, _tula_narrow_widen(h, 8, 23));
         }
-        store64(dst + i * 8, v);
         i = i + 1;
     }
     return n;
 }
 
-# Pack f64[n] `src` as binary32 into `dst` (4 bytes each, LE). Returns n * 4.
-fn tula_f32_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 8, 23, 4); }
-# Unpack n binary32 values from `src` into f64[n] `dst`. Returns n.
-fn tula_f32_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 8, 23, 4); }
 # Pack f64[n] `src` as binary16 into `dst` (2 bytes each, LE). Returns n * 2.
-fn tula_f16_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 5, 10, 2); }
+fn tula_f16_pack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var x = load64(src + i * 8);
+        var en = ((x >> 52) & 0x7FF) - 1008;
+        if (((en - 1) | (29 - en)) >= 0) {
+            var frac = x & 0xFFFFFFFFFFFFF;
+            var q = frac >> 42;
+            q = q + (((frac & 0x3FFFFFFFFFF) + 0x1FFFFFFFFFF + (q & 1)) >> 42);
+            store16(dst + i * 2, ((x >> 63) << 15) | ((en << 10) + q));
+        } else {
+            store16(dst + i * 2, _tula_f64_narrow(x, 5, 10));
+        }
+        i = i + 1;
+    }
+    return n * 2;
+}
+
 # Unpack n binary16 values from `src` into f64[n] `dst`. Returns n.
-fn tula_f16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 5, 10, 2); }
+fn tula_f16_unpack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = load16(src + i * 2);
+        if (((((h >> 10) & 31) + 1) & 31) > 1) {
+            store64(dst + i * 8, ((h >> 15) << 63) | (((h & 0x7FFF) << 42) + (1008 << 52)));
+        } else {
+            store64(dst + i * 8, _tula_narrow_widen(h, 5, 10));
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
 # Pack f64[n] `src` as bfloat16 into `dst` (2 bytes each, LE). Returns n * 2.
-fn tula_bf16_pack(src, n, dst): i64 { return _tula_narrow_array(src, n, dst, 8, 7, 2); }
+fn tula_bf16_pack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var x = load64(src + i * 8);
+        var en = ((x >> 52) & 0x7FF) - 896;
+        if (((en - 1) | (253 - en)) >= 0) {
+            var frac = x & 0xFFFFFFFFFFFFF;
+            var q = frac >> 45;
+            q = q + (((frac & 0x1FFFFFFFFFFF) + 0xFFFFFFFFFFF + (q & 1)) >> 45);
+            store16(dst + i * 2, ((x >> 63) << 15) | ((en << 7) + q));
+        } else {
+            store16(dst + i * 2, _tula_f64_narrow(x, 8, 7));
+        }
+        i = i + 1;
+    }
+    return n * 2;
+}
+
 # Unpack n bfloat16 values from `src` into f64[n] `dst`. Returns n.
-fn tula_bf16_unpack(src, n, dst): i64 { return _tula_widen_array(src, n, dst, 8, 7, 2); }
+fn tula_bf16_unpack(src, n, dst): i64 {
+    var i = 0;
+    while (i < n) {
+        var h = load16(src + i * 2);
+        if (((((h >> 7) & 255) + 1) & 255) > 1) {
+            store64(dst + i * 8, ((h >> 15) << 63) | (((h & 0x7FFF) << 45) + (896 << 52)));
+        } else {
+            store64(dst + i * 8, _tula_narrow_widen(h, 8, 7));
+        }
+        i = i + 1;
+    }
+    return n;
+}
 
 # ---------------------------------------------------------------------------
 # FP8: E4M3 and E5M2 (1.8.0, ADR 0010), the OCP 8-bit floats, converted to and
@@ -2482,11 +2631,27 @@ fn tula_f64_to_e5m2(x): i64 { return _tula_f64_narrow(x, 5, 2); }
 # E5M2 bits (low 8 bits used) -> f64 bits, exactly.
 fn tula_e5m2_to_f64(h): i64 { return _tula_narrow_widen(h & 0xFF, 5, 2); }
 
+# The FP8 arrays (1.9.0). Packing rounds the common case inline, as the wider
+# floats do (above): E5M2 for a biased exponent en in 1..29, E4M3 in 1..14. A
+# carry from E4M3's en 14 gives 0x78 (256), a finite value: E4M3 is finite at
+# its top exponent too, so only en 15 can reach NaN, and it goes to the scalar.
+# Unpacking from 1,024 elements reads a 256-entry table of the scalar's results,
+# built per call (2 KiB on the stack); fewer elements convert one by one.
+
 # Pack f64[n] `src` as E4M3 into `dst`, one byte each. Returns n.
 fn tula_e4m3_pack(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
-        store8(dst + i, tula_f64_to_e4m3(load64(src + i * 8)));
+        var x = load64(src + i * 8);
+        var en = ((x >> 52) & 0x7FF) - 1016;
+        if (((en - 1) | (14 - en)) >= 0) {
+            var frac = x & 0xFFFFFFFFFFFFF;
+            var q = frac >> 49;
+            q = q + (((frac & 0x1FFFFFFFFFFFF) + 0xFFFFFFFFFFFF + (q & 1)) >> 49);
+            store8(dst + i, ((x >> 63) << 7) | ((en << 3) + q));
+        } else {
+            store8(dst + i, tula_f64_to_e4m3(x));
+        }
         i = i + 1;
     }
     return n;
@@ -2495,6 +2660,15 @@ fn tula_e4m3_pack(src, n, dst): i64 {
 # Unpack n E4M3 values from `src` into f64[n] `dst`. Returns n.
 fn tula_e4m3_unpack(src, n, dst): i64 {
     var i = 0;
+    if (n >= 1024) {
+        var tab[2048];
+        var c = 0;
+        while (c < 256) {
+            store64(&tab + c * 8, tula_e4m3_to_f64(c));
+            c = c + 1;
+        }
+        return _tula_lut8(src, n, dst, &tab);
+    }
     while (i < n) {
         store64(dst + i * 8, tula_e4m3_to_f64(load8(src + i)));
         i = i + 1;
@@ -2506,7 +2680,16 @@ fn tula_e4m3_unpack(src, n, dst): i64 {
 fn tula_e5m2_pack(src, n, dst): i64 {
     var i = 0;
     while (i < n) {
-        store8(dst + i, _tula_f64_narrow(load64(src + i * 8), 5, 2));
+        var x = load64(src + i * 8);
+        var en = ((x >> 52) & 0x7FF) - 1008;
+        if (((en - 1) | (29 - en)) >= 0) {
+            var frac = x & 0xFFFFFFFFFFFFF;
+            var q = frac >> 50;
+            q = q + (((frac & 0x3FFFFFFFFFFFF) + 0x1FFFFFFFFFFFF + (q & 1)) >> 50);
+            store8(dst + i, ((x >> 63) << 7) | ((en << 2) + q));
+        } else {
+            store8(dst + i, _tula_f64_narrow(x, 5, 2));
+        }
         i = i + 1;
     }
     return n;
@@ -2515,6 +2698,15 @@ fn tula_e5m2_pack(src, n, dst): i64 {
 # Unpack n E5M2 values from `src` into f64[n] `dst`. Returns n.
 fn tula_e5m2_unpack(src, n, dst): i64 {
     var i = 0;
+    if (n >= 1024) {
+        var tab[2048];
+        var c = 0;
+        while (c < 256) {
+            store64(&tab + c * 8, _tula_narrow_widen(c, 5, 2));
+            c = c + 1;
+        }
+        return _tula_lut8(src, n, dst, &tab);
+    }
     while (i < n) {
         store64(dst + i * 8, _tula_narrow_widen(load8(src + i), 5, 2));
         i = i + 1;
@@ -2610,11 +2802,31 @@ fn tula_int4_pack(src, n, block, scales, codes): i64 {
 
 # Dequantize n INT4 codes into f64[n] `dst`: value = code x the scale of its
 # block (tula_int4_blocks(n, block) scales read). Returns n (0, writing
-# nothing, for block <= 0).
+# nothing, for block <= 0). From a block of 16 (1.9.0) the block's 16 products
+# are made once, by one f64v_scale over the codes -8..7 (the same IEEE multiply
+# per lane as f64_mul), and each code is a load.
 fn tula_int4_unpack(codes, scales, n, block, dst): i64 {
     if (block <= 0) { return 0; }
     var i = 0;
     var bi = 0;
+    if (block >= 16) {
+        var cv[128];
+        var c = 0;
+        while (c < 16) {
+            store64(&cv + c * 8, f64_from(c - ((c & 8) << 1)));
+            c = c + 1;
+        }
+        var tab[128];
+        while (i < n) {
+            f64v_scale(&tab, &cv, load64(scales + bi * 8), 16);
+            var stop = i + block;
+            if (stop > n) { stop = n; }
+            _tula_lut4_span(codes, i, stop, dst, &tab);
+            i = stop;
+            bi = bi + 1;
+        }
+        return n;
+    }
     while (i < n) {
         var d = load64(scales + bi * 8);
         var end = i + block;
@@ -2760,6 +2972,26 @@ fn _tula_query_field(q, a, alen, b, blen): i64 {
     return q;
 }
 
+# _tula_query_field for one cstring (1.9.0): the name is measured up to 48
+# bytes; a short one is copied into the zeroed field a word at a time, and a
+# long one is measured to its end and the field becomes its key. Returns the
+# name's length.
+fn _tula_query_name(q, name): i64 {
+    var i = 0;
+    while (i < TULA_NAME_CAP) {
+        if (load8(name + i) == 0) { break; }
+        i = i + 1;
+    }
+    if (i <= TULA_NAME_MAX) {
+        _tula_zero48(q);
+        _tula_copy(q, name, i);
+        return i;
+    }
+    var n = TULA_NAME_CAP + strlen(name + TULA_NAME_CAP);
+    _tula_key2(q, name, n, "", 0);
+    return n;
+}
+
 # The entry whose FULL name is a[0..alen) ‖ b[0..blen), or 0: the stored field
 # it would have is looked up in place, then the full name confirmed.
 fn _tula_find_name2(r, a, alen, b, blen): i64 {
@@ -2774,7 +3006,9 @@ fn _tula_find_name2(r, a, alen, b, blen): i64 {
 # the names table confirms the full name, so a hash collision can't return the
 # wrong tensor. Returns the entry or 0.
 fn tula_find_name(r, name): i64 {
-    return _tula_find_name2(r, name, strlen(name), "", 0);
+    var q[48];
+    var n = _tula_query_name(&q, name);
+    return _tula_confirm(r, tula_find(r, &q), name, n, "", 0);
 }
 
 # --- meta.cyr ---
@@ -2915,6 +3149,7 @@ fn _tula_strict_entry(e, payload, payload_len, cursor): i64 {
     # are scanned only up to the end of the word holding the NUL; every later
     # word must be all zero, one compare each.
     var k = 0;
+    while (_tula_has_zero(load64(e + k)) == 0) { k = k + 8; }   # the word with the NUL
     while (load8(e + k) != 0) { k = k + 1; }
     k = k + 1;
     while ((k & 7) != 0) {
@@ -3014,19 +3249,39 @@ fn _tula_rec_swap(a, b): i64 {
     return 0;
 }
 
-# Sift record `root` down the max-heap recs[0..end] (end inclusive).
+# 1 if record a orders before record b (_tula_rec_order(a, b, tie) < 0). The
+# hashes decide almost every comparison, inline; only equal hashes call the
+# full order (1.9.0).
+fn _tula_rec_lt(a, b, tie): i64 {
+    var ha = load64(a);
+    var hb = load64(b);
+    if (ha < hb) { return 1; }
+    if (ha > hb) { return 0; }
+    if (_tula_rec_order(a, b, tie) < 0) { return 1; }
+    return 0;
+}
+
+# Sift record `root` down the max-heap recs[0..end] (end inclusive). The larger
+# child is found with two comparisons, as before; the swap is inline (1.9.0).
 fn _tula_sift(recs, root, end, tie): i64 {
     loop {
         var child = root * 2 + 1;
         if (child > end) { return 0; }
-        var sw = root;
-        if (_tula_rec_order(recs + sw * 16, recs + child * 16, tie) < 0) { sw = child; }
+        var pr = recs + root * 16;
+        var ps = pr;
+        var pc = recs + child * 16;
+        if (_tula_rec_lt(ps, pc, tie) == 1) { ps = pc; }
         if (child + 1 <= end) {
-            if (_tula_rec_order(recs + sw * 16, recs + child * 16 + 16, tie) < 0) { sw = child + 1; }
+            if (_tula_rec_lt(ps, pc + 16, tie) == 1) { ps = pc + 16; }
         }
-        if (sw == root) { return 0; }
-        _tula_rec_swap(recs + root * 16, recs + sw * 16);
-        root = sw;
+        if (ps == pr) { return 0; }
+        var h = load64(pr);
+        var p = load64(pr + 8);
+        store64(pr, load64(ps));
+        store64(pr + 8, load64(ps + 8));
+        store64(ps, h);
+        store64(ps + 8, p);
+        root = (ps - recs) / 16;
     }
     return 0;
 }
@@ -3356,16 +3611,18 @@ fn _tula_index_lookup(ix, q): i64 {
     var lo = 0;
     var hi = n;
     while (lo < hi) {
-        var mid = (lo + hi) / 2;
+        var mid = (lo + hi) >> 1;
         var rh = load64(recs + mid * TULA_IDX_REC);
         # the hash decides most steps in one compare; equal hashes compare keys
-        var less = 0;
-        if (rh < qh) { less = 1; }
-        if (rh == qh) {
-            if (_tula_rec_order(recs + mid * TULA_IDX_REC, &qrec, 0) < 0) { less = 1; }
+        if (rh < qh) { lo = mid + 1; }
+        else {
+            if (rh == qh) {
+                if (_tula_rec_order(recs + mid * TULA_IDX_REC, &qrec, 0) < 0) { lo = mid + 1; }
+                else { hi = mid; }
+            } else {
+                hi = mid;
+            }
         }
-        if (less == 1) { lo = mid + 1; }
-        else { hi = mid; }
     }
     if (lo >= n) { return 0; }
     var rec = recs + lo * TULA_IDX_REC;
@@ -3389,7 +3646,13 @@ fn _tula_index_find2(ix, a, alen, b, blen): i64 {
 # answer tula_find_name(r, name) gives — the first matching entry, a long name
 # confirmed against the names table — or 0.
 fn tula_index_find(ix, name): i64 {
-    return _tula_index_find2(ix, name, strlen(name), "", 0);
+    var q[48];
+    var n = _tula_query_name(&q, name);
+    var te = load64(ix + 32);
+    if (te == 0) {
+        if (n > TULA_NAME_MAX) { return 0; }   # no names table: no long names
+    }
+    return _tula_confirm_t(load64(ix), te, _tula_index_lookup(ix, &q), name, n, "", 0);
 }
 
 # tula_find_scale through the index (1.5.0): entry e's "<full name>.scale"
@@ -3398,4 +3661,155 @@ fn tula_index_find_scale(ix, e, need): i64 {
     if (need < 1) { return 0; }
     var name = _tula_full_name_t(load64(ix), load64(ix + 32), e);
     return _tula_scale_ok(_tula_index_find2(ix, name, strlen(name), ".scale", 6), need);
+}
+
+# --- par.cyr ---
+
+# @public — tula parallel unpack (1.9.0, ADR 0012): one call that runs a dtype's
+# unpack helper over a large tensor on several threads.
+#
+# The tensor is cut into contiguous slices, each slice is unpacked by the same
+# serial helper (src/dtype.cyr) on its own thread, and the caller's thread takes
+# the first slice and then joins the rest. The helpers are pure and elementwise,
+# and every slice starts on a byte of codes and on a block of scales, so the
+# output is the serial helper's, bit for bit, whatever the thread count.
+#
+# Each call starts its threads and joins them before it returns: no pool and no
+# state between calls. Starting a thread costs tens of microseconds, so a slice
+# is at least TULA_PAR_MIN_CHUNK elements and a smaller tensor runs on the
+# caller's thread alone. Each thread started also leaves its stdlib bookkeeping
+# (about 4 KiB) on cyrius's bump allocator, which has no free.
+
+enum TulaParCfg {
+    TULA_PAR_MAX_THREADS = 64;      # threads one call uses at most
+    TULA_PAR_MIN_CHUNK   = 65536;   # elements per thread, at least
+}
+
+# Run `dt`'s serial unpack over n elements. Returns n, or -1 for a dtype with no
+# unpack helper.
+fn _tula_unpack1(dt, src, n, scales, block, dst): i64 {
+    if (dt == TULA_DT_F32)     { return tula_f32_unpack(src, n, dst); }
+    if (dt == TULA_DT_F16)     { return tula_f16_unpack(src, n, dst); }
+    if (dt == TULA_DT_BF16)    { return tula_bf16_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E4M3) { return tula_e4m3_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E5M2) { return tula_e5m2_unpack(src, n, dst); }
+    if (dt == TULA_DT_INT8) {
+        tula_int8_dequant(src, n, load64(scales), dst);
+        return n;
+    }
+    if (dt == TULA_DT_NF4)     { return tula_nf4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_INT4)    { return tula_int4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_TERNARY) { return tula_ternary_unpack(src, n, dst); }
+    return 0 - 1;
+}
+
+# A thread's body: one slice, described by the 48-byte job at `job`
+# (dtype, src, n, scales, block, dst).
+fn _tula_par_job(job): i64 {
+    var dt = load64(job);
+    var src = load64(job + 8);
+    var n = load64(job + 16);
+    _tula_unpack1(dt, src, n, load64(job + 24), load64(job + 32), load64(job + 40));
+    return 0;
+}
+
+# The element count every slice boundary is a multiple of, so a slice starts on
+# a whole byte of codes and, for the blockwise dtypes, on a whole block: 4 for
+# ternary, the block (twice it if odd) for NF4 and INT4, 1 otherwise. 0 for a
+# dtype with no unpack helper or a block <= 0 where one is needed. The caller
+# keeps an odd block below half the element count, so doubling it can't wrap.
+fn _tula_par_unit(dt, block): i64 {
+    if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) {
+        if (block <= 0) { return 0; }
+        if ((block & 1) == 1) { return block * 2; }
+        return block;
+    }
+    if (dt == TULA_DT_TERNARY) { return 4; }
+    if (dt == TULA_DT_INT8 || dt == TULA_DT_F32 || dt == TULA_DT_F16 || dt == TULA_DT_BF16) {
+        return 1;
+    }
+    if (dt == TULA_DT_F8_E4M3 || dt == TULA_DT_F8_E5M2) { return 1; }
+    return 0;
+}
+
+# The packed byte offset of element s, a multiple of _tula_par_unit.
+fn _tula_par_src_off(dt, s): i64 {
+    if (dt == TULA_DT_F32) { return s * 4; }
+    if (dt == TULA_DT_F16 || dt == TULA_DT_BF16) { return s * 2; }
+    if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) { return s / 2; }
+    if (dt == TULA_DT_TERNARY) { return s / 4; }
+    return s;
+}
+
+# Unpack n elements of dtype `dtype` from `src` into `dst` on up to `nthreads`
+# threads, the caller's included. Returns n, or -1 (writing nothing) for a
+# dtype with no unpack helper, n < 0, or block <= 0 for NF4 or INT4.
+#
+# The dtypes and their arguments are the serial helpers': F32, F16, BF16,
+# F8_E4M3 and F8_E5M2 (`scales` and `block` unused), INT8 (the one f64 scale at
+# `scales`), NF4 and INT4 (`scales` holds one f64 per `block` elements), and
+# TERNARY (i64 trits out). `dst` is f64[n] (i64[n] for ternary), and the output
+# is the serial helper's, bit for bit. nthreads below 1 counts as 1, and above
+# TULA_PAR_MAX_THREADS as that. Each thread gets at least TULA_PAR_MIN_CHUNK
+# elements, so a smaller tensor runs on the caller's thread alone. A thread
+# that fails to start has its slice run on the caller's thread. Like the serial
+# helpers it trusts its arguments: check a foreign entry with
+# tula_entry_payload_ok (and its sidecar) first.
+fn tula_unpack_par(dtype, src, n, scales, block, dst, nthreads): i64 {
+    if (_tula_par_unit(dtype, 1) == 0) { return 0 - 1; }   # no unpack helper
+    if (n < 0) { return 0 - 1; }
+    var blockwise = 0;
+    if (dtype == TULA_DT_NF4 || dtype == TULA_DT_INT4) {
+        if (block <= 0) { return 0 - 1; }
+        blockwise = 1;
+    }
+    if (n == 0) { return 0; }
+    var k = nthreads;
+    if (k < 1) { k = 1; }
+    if (k > TULA_PAR_MAX_THREADS) { k = TULA_PAR_MAX_THREADS; }
+    if (k > n / TULA_PAR_MIN_CHUNK) { k = n / TULA_PAR_MIN_CHUNK; }
+    if (THREADS_CONCURRENT != 1) { k = 1; }
+    if (blockwise == 1) {
+        if (block >= n / 2) { k = 1; }   # at most two blocks, or a slice unit past n
+    }
+    if (k <= 1) { return _tula_unpack1(dtype, src, n, scales, block, dst); }
+    # Slices of c elements, c a multiple of the unit (block < n / 2 here, so the
+    # unit is below n); the last slice takes the rest.
+    var unit = _tula_par_unit(dtype, block);
+    var c = n / k;
+    if (c * k < n) { c = c + 1; }
+    c = ((c + unit - 1) / unit) * unit;
+    var jobs[3072];   # TULA_PAR_MAX_THREADS x 48 bytes
+    var ths[512];     # TULA_PAR_MAX_THREADS x 8 bytes
+    var used = 0;
+    var s = 0;
+    while (s < n) {
+        var cnt = c;
+        if (cnt > n - s) { cnt = n - s; }
+        var jb = &jobs + used * 48;
+        store64(jb, dtype);
+        store64(jb + 8, src + _tula_par_src_off(dtype, s));
+        store64(jb + 16, cnt);
+        if (blockwise == 1) { store64(jb + 24, scales + (s / block) * 8); }
+        else                { store64(jb + 24, scales); }
+        store64(jb + 32, block);
+        store64(jb + 40, dst + s * 8);
+        used = used + 1;
+        s = s + cnt;
+    }
+    var j = 1;
+    while (j < used) {
+        var th = thread_create(&_tula_par_job, &jobs + j * 48);
+        store64(&ths + j * 8, th);
+        if (th == 0) { _tula_par_job(&jobs + j * 48); }   # no thread: run it here
+        j = j + 1;
+    }
+    _tula_par_job(&jobs);
+    j = 1;
+    while (j < used) {
+        var t = load64(&ths + j * 8);
+        if (t != 0) { thread_join(t); }
+        j = j + 1;
+    }
+    return n;
 }

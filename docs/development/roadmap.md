@@ -112,23 +112,29 @@ codes with an ADR 0002 `.scale` sidecar (ADR 0011, code 14).
 
 **Goal:** the codec is never the slow part of loading a model. Every change gets
 a differential test and before/after numbers (`docs/benchmarks.md` has today's).
-Faster kernels and smaller per-call costs change no API, so they can ship as
-patches in any line. A parallel-unpack API (helpers taking a thread count) is
-new surface: that's **1.9.0**.
+1.9.0 made the array helpers faster with the same output bit for bit: table
+paths for the byte and nibble formats, and one loop per float format. It also
+added `tula_unpack_par` (ADR 0012, `src/par.cyr`) and cut the per-call costs of
+validation, adds and index lookups.
 
-- **Conversions and dequant**: F32/F16/BF16 run at ~100–140 Melem/s, NF4 unpack
-  ~250, ternary ~375, int8 ~420. Vectorize with cyrius's `f64v` builtins. Split
-  multi-GB tensors across cyrius threads; the helpers are already pure.
-- **Per-call constants**:
-  - `tula_index_find` ~250 ns short / ~580 ns long (query canonicalization, the
-    hash, the confirm step);
-  - `tula_validate_strict` ~210 ns per tensor;
-  - adds ~190–210 ns.
-
-  Profile and cut function-call overhead on these paths.
+- **1.9.x patches** — faster kernels and smaller per-call costs change no API,
+  so they can ship as patches. Candidates:
+  - NF4 and INT4 **pack** are unchanged (~25 and ~58 Melem/s), bound by the
+    codebook search and the f64 division. NF4's nearest-level scan could become
+    a search over exact thresholds, if it gives the scan's answer on every
+    input, NaN and ties included.
+  - Below one core's memory bandwidth, the float unpacks (~210 Melem/s) still
+    branch per element.
+- **Left for a MINOR when a consumer needs it** (ADR 0012 says why):
+  - a parallel pack (INT8's per-tensor absmax needs a reduction across
+    threads);
+  - a caller-owned worker pool, if per-call thread starts (~29 µs each) show up
+    in a profile.
 - **Big-file signing** is bound by sigil's SHA-512 (~18 MB/s: a 14 GB checkpoint
-  takes ~25 min to sign, ~13 to verify). That's sigil's to fix, and tula benefits
-  with no change. File it with sigil, with the numbers in `docs/benchmarks.md`.
+  takes ~25 min to sign, ~13 to verify). That's sigil's to fix, and tula
+  benefits with no change. It is filed with sigil:
+  `2026-11-09-anukulana-sha512-throughput-bounds-big-file-signing.md`, with
+  numbers from the same machine.
 
 ## 1.x.x — later / research (unscheduled)
 
@@ -185,7 +191,7 @@ reading v1. Candidates, each to be argued in an ADR before it's planned:
 - **Cross-repo asks:**
   - anukulana — migrate, so its `gpt2-tula` demo becomes the real-weights gate
     (1.6.x).
-  - sigil — SHA-512 throughput (1.9.x), and the bayan binary-size issue
-    (1.x.x).
+  - sigil — SHA-512 throughput (filed with sigil, see 1.9.x), and the bayan
+    binary-size issue (1.x.x).
 - **Ecosystem context:** the AGNOS planning docs `type3-weight-import.md`
   (gap #1) + `software-port-path.md` (Tier A). tula is gap #1's format codec.

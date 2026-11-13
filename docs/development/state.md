@@ -57,17 +57,24 @@ exact non-saturating conversions in integer arithmetic; `TULA_DT_INT4` = 14
 (ADR 0011), signed codes with an f64 `.scale` sidecar, quantized by Q4_0's rule,
 strict-checked for an odd count's unused nibble. 1.7.0 reads such files; its
 strict says `TULA_ERR_DTYPE`.
+**1.9.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.8.0):
+throughput. The array helpers are 1.4–6.7× faster on one thread with the same
+output (tables for the byte and nibble formats, one loop per float format), and
+`tula_unpack_par` (ADR 0012, `src/par.cyr`) splits an unpack across threads.
+Strict, adds and short-name lookups cost 12–35% less per call. A cross-version
+diff against the 1.8.0 tag matched every changed call's output.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.8.0)
+## Tests, fuzz, gates (1.9.0, unreleased)
 
-**757 assertions** across 15 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81
-(1.8.0), `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
-`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48 (1.8.0), `floats.tcyr` 37,
-`fileio.tcyr` 30, `hardening.tcyr` 30, `roundtrip.tcyr` 22, `index.tcyr` 13,
-`sign.tcyr` 8.
+**793 assertions** across 16 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
+`names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
+`ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `floats.tcyr` 37,
+`kernels.tcyr` 36 (1.9.0: the table and inline paths, and `tula_unpack_par`
+against the serial helpers), `fileio.tcyr` 30, `hardening.tcyr` 30,
+`roundtrip.tcyr` 22, `index.tcyr` 13, `sign.tcyr` 8.
 - **Targets**: x86_64 Linux natively; aarch64 Linux under qemu (every suite, the
   consumer, realmodels, bigfile and the fuzzer). CI's `cross-target` job runs the
   same on native `ubuntu-26.04-arm` and `macos-15` (arm64), both hard gates
@@ -106,7 +113,10 @@ the maintainer bumps VERSION + renames the section + tags at each subsequent cut
     `finish`, 446 canonical ones strict-accepted, no temp left behind;
   - phase I (1.7.0; 1.8.0 adds FP8 and INT4): 300,000 mutations of a file
     holding the integer, boolean, FP8 and INT4 dtypes, aimed at payload
-    bytes, dtype fields and shapes.
+    bytes, dtype fields and shapes;
+  - phase J (1.9.0): 400 parallel unpacks (nine dtypes, up to five chunks,
+    odd blocks, 1–9 threads) against the serial helpers, payload and scales
+    each ending at a guard page.
 
   `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
   0 undocumented.
@@ -127,7 +137,7 @@ switch a build prints one `hint:` line naming the unused checkout.
 Since 6.6.18, `cyrius distlib` writes a sidecar only for leaves the bundle itself needs.
 tula needs none beyond what sigil's sidecar brings, so there is no `dist/tula.deps`.
 
-**Smoke binary: 595,664 B** (~100 KB code, 488 KB data). Most of the data is bayan's
+**Smoke binary: 603,872 B** (1.9.0: +8 KB for the parallel unpack and the stdlib thread code it now reaches; ~488 KB is data). Most of the data is bayan's
 `lib/unicode/` tables, which sigil's bundle pulls in. DCE can't drop global initializers,
 and tula itself makes no bayan calls. It shrinks when sigil's open issue
 `2026-11-01-sigil-mldsa-pulls-bayans-unicode-tables.md` lands.
@@ -147,7 +157,7 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: 1.9.x throughput (the FP8 and INT4 helpers are per-element calls today);
-1.8.x patches only for fixes importers turn up. Later: the 1.x.x
+Next: cut 1.9.0 (throughput, in `[Unreleased]`); then 1.9.x patches (NF4 and
+INT4 pack are unchanged). Later: the 1.x.x
 research list and v2 candidates ([roadmap](roadmap.md)). Cross-repo: anukulana's migration (the real-weights
 gate) and sigil's SHA-512 throughput.

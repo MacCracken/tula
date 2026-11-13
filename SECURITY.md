@@ -126,7 +126,10 @@ every key matching its name.
   caller-driven transforms sized by the element count *you* pass; a lying `shape`
   whose stored `data_len` is too small would otherwise drive an over-read.
   `tula_entry_payload_ok` cross-checks dtype+shape against `data_len`
-  (overflow-safe) so this is a one-line guard.
+  (overflow-safe) so this is a one-line guard. `tula_unpack_par` (1.9.0) runs
+  the same helpers on slices of the same element count, so the same guard
+  covers it. The guard-page fuzzer's phase J checks that its slices read
+  nothing past the payload or the scales.
 - **Check a quantized tensor's scale sidecar too.** `tula_nf4_unpack` reads
   `tula_nf4_blocks(n, block)` scales from the `"<name>.scale"` tensor. Get the
   sidecar with `tula_find_scale(r, e, need)` (1.2.0): it returns 0 unless the

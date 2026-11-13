@@ -10,7 +10,9 @@ comment explaining *why*, not just *what*.
   both roles end-to-end: a quantizing checkpoint **writer** (ternary-quantize →
   builder + `"<name>.scale"` sidecar → Ed25519 sign → write) and a hardened
   **loader** (read as untrusted → verify signature → `tula_entry_payload_ok`
-  guard → unpack → dequant), plus a bit-exact plain-`f64` tensor.
+  guard → unpack → dequant), plus a bit-exact plain-`f64` tensor, a long-named
+  BF16 tensor unpacked through `tula_unpack_par` (1.9.0), and integer and boolean
+  tensors.
 
 > **Location note**: runnable examples live at the repo root under
 > [`examples/`](../../examples/) so `make example` and CI can build them directly

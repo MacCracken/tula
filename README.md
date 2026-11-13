@@ -88,9 +88,14 @@ The full march M0→M5:
   non-saturating conversions, checked on every code and midpoint) and `TULA_DT_INT4`
   (signed 4-bit codes with a `.scale` sidecar, quantized by Q4_0's rule).
 
-**757/757** assertions across 15 suites (meta · fp8 · names · stream · builder ·
-strict · ints · dtype · int4 · floats · file-io · hardening · round-trip · index ·
-sign) + a
+- **1.9.0** — throughput: the array helpers are 1.4–6.7× faster with the same
+  output, and `tula_unpack_par` splits an unpack across threads (~1–2 Gelem/s
+  at 8 threads); strict validation, adds and short-name lookups cost less per
+  call.
+
+**793/793** assertions across 16 suites (meta · fp8 · names · stream · builder ·
+strict · ints · dtype · int4 · floats · kernels · file-io · hardening ·
+round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model
 inventory gate and a 2.36 GB big-file gate, all green on x86_64 Linux and on

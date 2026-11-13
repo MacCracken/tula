@@ -7,6 +7,108 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+**Throughput** (1.9.0). An additive MINOR with no format change (ADR 0012).
+The array helpers are 1.4–6.7× faster on one thread, and the new
+`tula_unpack_par` splits an unpack across threads. Every existing call's output
+is what 1.8.0 gives, bit for bit. A cross-version diff built against the 1.8.0
+tag ran 400 rounds of every changed array helper:
+- lengths 0–70,000, past every table threshold;
+- random bits, normals, subnormals, inf and NaN;
+- blocks 1–100, 32 and 64.
+
+It also ran 600 random builders (plain, checked and long adds, short, 47/48-byte
+and long names, all fifteen dtypes) with every lookup on them, 18,000 strict
+verdicts on mutated 40–300-tensor files and 20,000 `tula_name_write`s. Every
+output matched 1.8.0: the builders' bytes and return codes, the verdicts, and
+the find-name, index and scale answers.
+
+### Added
+
+- **`tula_unpack_par(dtype, src, n, scales, block, dst, nthreads)`** (ADR 0012,
+  new module `src/par.cyr`): one call for every dtype with an unpack helper.
+  It runs that helper over contiguous slices on up to `nthreads` threads, the
+  caller's included, and its output is the serial helper's at any thread count.
+  - Slices start on a whole byte of codes and a whole block of scales.
+  - Each thread gets at least `TULA_PAR_MIN_CHUNK` (65,536) elements, and a call
+    uses at most `TULA_PAR_MAX_THREADS` (64). Both only tune the split, so they
+    stay outside the freeze.
+  - A smaller tensor, a target without real threads (`THREADS_CONCURRENT`), or
+    a thread that fails to start falls back to the caller's thread.
+  - Returns n, or −1 (writing nothing) for a dtype with no unpack helper, n < 0,
+    or NF4/INT4 with block <= 0.
+  - At 8 threads, 2²⁴ elements unpack at ~970 Melem/s (BF16), ~2,000 (E4M3,
+    INT8), ~1,490 (INT4) and ~1,600 (NF4).
+- **ADR 0012**. It covers the decisions:
+  - one dispatching call rather than nine `_par` siblings;
+  - threads started per call rather than a pool;
+  - the caller picks the count, because the stdlib has no portable CPU count.
+
+  It also covers why the `f64v` builtins fit only dequantization's multiply,
+  and what this costs: ~29 µs per thread start, and ~4 KiB of stdlib
+  bookkeeping per thread that cyrius's bump allocator never frees.
+
+### Changed
+
+- **Faster array helpers, same output.** 2²⁰ elements, one thread, 1.8.0 →
+  1.9.0 (Melem/s):
+
+  | Helper | 1.8.0 | 1.9.0 | How |
+  |---|---:|---:|---|
+  | E4M3, E5M2 unpack | ~124, ~86 | ~583, ~580 | from 1,024 elements, a 256-entry table read 8 codes per load |
+  | int8 dequant | ~420 | ~593 | its table, now read 8 codes per load |
+  | ternary unpack | ~368 | ~619 | from 1,024 trits, each byte's four trits from a 256-entry table |
+  | INT4, NF4 unpack | ~136, ~250 | ~354, ~374 | from a block of 16, each block's 16 products made once by `f64v_scale`, a byte at a time |
+  | F32, F16, BF16 unpack | ~143 | ~218 | one loop per format with its constants inline |
+  | F32, F16, BF16 pack | ~107 | ~152 | the same, rounding to nearest even without a branch |
+  | E4M3, E5M2 pack | ~68, ~51 | ~150, ~153 | inline rounding below the top exponent |
+
+  INT4 and NF4 pack are unchanged. The generic `_tula_narrow_array` /
+  `_tula_widen_array` are gone; the scalar conversions are untouched.
+- **Smaller per-call costs, same answers:**
+
+  | Call | 1.8.0 → 1.9.0 | How |
+  |---|---|---|
+  | `tula_validate_strict`, 200 tensors | 51 → 39 µs | the duplicate sort compares hashes inline |
+  | `tula_validate_strict`, 256 tensors | 88 → 59 µs | the same |
+  | `tula_index_new` | 84 → 67 µs | the same sort |
+  | `tula_validate`, 200 tensors | 2.7 → 2.4 µs | names checked for their NUL a word at a time |
+  | `tula_builder_add` | ~190 → ~157 ns | `tula_name_write` measures the name once and copies whole words |
+  | `tula_builder_add_checked` | ~215 → ~140 ns | the name is no longer measured twice |
+  | `tula_index_find`, short names | ~255 → ~222 ns | its 48-byte query is built in one measured pass |
+
+  Long-name lookups are unchanged, because the key's hash dominates them.
+- **`tests/tcyr/kernels.tcyr`** (new, 36 assertions):
+  - the FP8 table and inline paths against the scalar conversions: every code,
+    midpoint and ±1 ulp, plus 50,000 random values;
+  - int8's and ternary's tables, with every tail length;
+  - NF4 and INT4 at blocks 1–64, odd and even, with zero, signed-zero,
+    subnormal, inf and NaN scales;
+  - `tula_unpack_par` against the serial helper for all nine dtypes, at thread
+    counts 1–1000, 0 and −5, with odd blocks, blocks past half the tensor and
+    small tensors;
+  - a guard word past the output, the refusals, and a file's BF16 and INT4 +
+    sidecar unpacked in parallel.
+
+  Five seeded bugs are each caught: a nibble-slice offset, a scale offset, an
+  F32 slice offset, the 8-wide table's last lane, and the nibble tail.
+- **The fuzzer's phase J**: 400 parallel unpacks over random dtypes, counts up
+  to five chunks, blocks (odd, 32/64, and past half the tensor) and 1–9
+  threads. The payload and scales each end at a guard page. The output must be
+  the serial helper's, with the word after it untouched.
+  - A slice seeded to read one element too far dies on the guard page
+    (SIGSEGV).
+  - The run: 3,204,500 iterations plus the 400 unpacks, 0 failures. The strict
+    counts are unchanged from 1.8.0 (92,821 accepts), which confirms the sort
+    and name-scan changes on the same deterministic input.
+- **Bench**:
+  - 2²⁴-element parallel rows at 1, 2, 4 and 8 threads, run last so their
+    threads and buffers affect no other row;
+  - `docs/benchmarks.md` has the 1.8.0 / 1.9.0 table.
+- **`examples/consumer.cyr`** unpacks its BF16 tensor through `tula_unpack_par`.
+- **Roadmap**: 1.9.0 is done. Big-file signing points at sigil's open SHA-512
+  issue, which anukulana filed on 2026-11-09 with numbers from the same machine,
+  so tula files no duplicate.
+
 ## [1.8.0] - 2026-11-12
 
 **Compact formats: FP8 and INT4.** An additive MINOR with no format

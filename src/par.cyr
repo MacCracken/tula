@@ -1,0 +1,148 @@
+# @public — tula parallel unpack (1.9.0, ADR 0012): one call that runs a dtype's
+# unpack helper over a large tensor on several threads.
+#
+# The tensor is cut into contiguous slices, each slice is unpacked by the same
+# serial helper (src/dtype.cyr) on its own thread, and the caller's thread takes
+# the first slice and then joins the rest. The helpers are pure and elementwise,
+# and every slice starts on a byte of codes and on a block of scales, so the
+# output is the serial helper's, bit for bit, whatever the thread count.
+#
+# Each call starts its threads and joins them before it returns: no pool and no
+# state between calls. Starting a thread costs tens of microseconds, so a slice
+# is at least TULA_PAR_MIN_CHUNK elements and a smaller tensor runs on the
+# caller's thread alone. Each thread started also leaves its stdlib bookkeeping
+# (about 4 KiB) on cyrius's bump allocator, which has no free.
+
+enum TulaParCfg {
+    TULA_PAR_MAX_THREADS = 64;      # threads one call uses at most
+    TULA_PAR_MIN_CHUNK   = 65536;   # elements per thread, at least
+}
+
+# Run `dt`'s serial unpack over n elements. Returns n, or -1 for a dtype with no
+# unpack helper.
+fn _tula_unpack1(dt, src, n, scales, block, dst): i64 {
+    if (dt == TULA_DT_F32)     { return tula_f32_unpack(src, n, dst); }
+    if (dt == TULA_DT_F16)     { return tula_f16_unpack(src, n, dst); }
+    if (dt == TULA_DT_BF16)    { return tula_bf16_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E4M3) { return tula_e4m3_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E5M2) { return tula_e5m2_unpack(src, n, dst); }
+    if (dt == TULA_DT_INT8) {
+        tula_int8_dequant(src, n, load64(scales), dst);
+        return n;
+    }
+    if (dt == TULA_DT_NF4)     { return tula_nf4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_INT4)    { return tula_int4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_TERNARY) { return tula_ternary_unpack(src, n, dst); }
+    return 0 - 1;
+}
+
+# A thread's body: one slice, described by the 48-byte job at `job`
+# (dtype, src, n, scales, block, dst).
+fn _tula_par_job(job): i64 {
+    var dt = load64(job);
+    var src = load64(job + 8);
+    var n = load64(job + 16);
+    _tula_unpack1(dt, src, n, load64(job + 24), load64(job + 32), load64(job + 40));
+    return 0;
+}
+
+# The element count every slice boundary is a multiple of, so a slice starts on
+# a whole byte of codes and, for the blockwise dtypes, on a whole block: 4 for
+# ternary, the block (twice it if odd) for NF4 and INT4, 1 otherwise. 0 for a
+# dtype with no unpack helper or a block <= 0 where one is needed. The caller
+# keeps an odd block below half the element count, so doubling it can't wrap.
+fn _tula_par_unit(dt, block): i64 {
+    if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) {
+        if (block <= 0) { return 0; }
+        if ((block & 1) == 1) { return block * 2; }
+        return block;
+    }
+    if (dt == TULA_DT_TERNARY) { return 4; }
+    if (dt == TULA_DT_INT8 || dt == TULA_DT_F32 || dt == TULA_DT_F16 || dt == TULA_DT_BF16) {
+        return 1;
+    }
+    if (dt == TULA_DT_F8_E4M3 || dt == TULA_DT_F8_E5M2) { return 1; }
+    return 0;
+}
+
+# The packed byte offset of element s, a multiple of _tula_par_unit.
+fn _tula_par_src_off(dt, s): i64 {
+    if (dt == TULA_DT_F32) { return s * 4; }
+    if (dt == TULA_DT_F16 || dt == TULA_DT_BF16) { return s * 2; }
+    if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) { return s / 2; }
+    if (dt == TULA_DT_TERNARY) { return s / 4; }
+    return s;
+}
+
+# Unpack n elements of dtype `dtype` from `src` into `dst` on up to `nthreads`
+# threads, the caller's included. Returns n, or -1 (writing nothing) for a
+# dtype with no unpack helper, n < 0, or block <= 0 for NF4 or INT4.
+#
+# The dtypes and their arguments are the serial helpers': F32, F16, BF16,
+# F8_E4M3 and F8_E5M2 (`scales` and `block` unused), INT8 (the one f64 scale at
+# `scales`), NF4 and INT4 (`scales` holds one f64 per `block` elements), and
+# TERNARY (i64 trits out). `dst` is f64[n] (i64[n] for ternary), and the output
+# is the serial helper's, bit for bit. nthreads below 1 counts as 1, and above
+# TULA_PAR_MAX_THREADS as that. Each thread gets at least TULA_PAR_MIN_CHUNK
+# elements, so a smaller tensor runs on the caller's thread alone. A thread
+# that fails to start has its slice run on the caller's thread. Like the serial
+# helpers it trusts its arguments: check a foreign entry with
+# tula_entry_payload_ok (and its sidecar) first.
+fn tula_unpack_par(dtype, src, n, scales, block, dst, nthreads): i64 {
+    if (_tula_par_unit(dtype, 1) == 0) { return 0 - 1; }   # no unpack helper
+    if (n < 0) { return 0 - 1; }
+    var blockwise = 0;
+    if (dtype == TULA_DT_NF4 || dtype == TULA_DT_INT4) {
+        if (block <= 0) { return 0 - 1; }
+        blockwise = 1;
+    }
+    if (n == 0) { return 0; }
+    var k = nthreads;
+    if (k < 1) { k = 1; }
+    if (k > TULA_PAR_MAX_THREADS) { k = TULA_PAR_MAX_THREADS; }
+    if (k > n / TULA_PAR_MIN_CHUNK) { k = n / TULA_PAR_MIN_CHUNK; }
+    if (THREADS_CONCURRENT != 1) { k = 1; }
+    if (blockwise == 1) {
+        if (block >= n / 2) { k = 1; }   # at most two blocks, or a slice unit past n
+    }
+    if (k <= 1) { return _tula_unpack1(dtype, src, n, scales, block, dst); }
+    # Slices of c elements, c a multiple of the unit (block < n / 2 here, so the
+    # unit is below n); the last slice takes the rest.
+    var unit = _tula_par_unit(dtype, block);
+    var c = n / k;
+    if (c * k < n) { c = c + 1; }
+    c = ((c + unit - 1) / unit) * unit;
+    var jobs[3072];   # TULA_PAR_MAX_THREADS x 48 bytes
+    var ths[512];     # TULA_PAR_MAX_THREADS x 8 bytes
+    var used = 0;
+    var s = 0;
+    while (s < n) {
+        var cnt = c;
+        if (cnt > n - s) { cnt = n - s; }
+        var jb = &jobs + used * 48;
+        store64(jb, dtype);
+        store64(jb + 8, src + _tula_par_src_off(dtype, s));
+        store64(jb + 16, cnt);
+        if (blockwise == 1) { store64(jb + 24, scales + (s / block) * 8); }
+        else                { store64(jb + 24, scales); }
+        store64(jb + 32, block);
+        store64(jb + 40, dst + s * 8);
+        used = used + 1;
+        s = s + cnt;
+    }
+    var j = 1;
+    while (j < used) {
+        var th = thread_create(&_tula_par_job, &jobs + j * 48);
+        store64(&ths + j * 8, th);
+        if (th == 0) { _tula_par_job(&jobs + j * 48); }   # no thread: run it here
+        j = j + 1;
+    }
+    _tula_par_job(&jobs);
+    j = 1;
+    while (j < used) {
+        var t = load64(&ths + j * 8);
+        if (t != 0) { thread_join(t); }
+        j = j + 1;
+    }
+    return n;
+}

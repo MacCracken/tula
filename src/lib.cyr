@@ -48,7 +48,8 @@ include "lib/sigil.cyr"
 # table's reader) builds on format; meta.cyr (1.6.0: the metadata table's
 # reader) builds on names; check.cyr (the strict validator + scale
 # lookup) builds on format, dtype and names; index.cyr (1.5.0: the sorted name
-# index) comes last, using names and check's sort.
+# index) uses names and check's sort; par.cyr (1.9.0: the parallel unpack) comes
+# last, using dtype and the stdlib's threads.
 # ================================================================
 include "src/error.cyr"
 include "src/format.cyr"
@@ -59,3 +60,4 @@ include "src/names.cyr"
 include "src/meta.cyr"
 include "src/check.cyr"
 include "src/index.cyr"
+include "src/par.cyr"

@@ -128,6 +128,26 @@ fn _tula_query_field(q, a, alen, b, blen): i64 {
     return q;
 }
 
+# _tula_query_field for one cstring (1.9.0): the name is measured up to 48
+# bytes; a short one is copied into the zeroed field a word at a time, and a
+# long one is measured to its end and the field becomes its key. Returns the
+# name's length.
+fn _tula_query_name(q, name): i64 {
+    var i = 0;
+    while (i < TULA_NAME_CAP) {
+        if (load8(name + i) == 0) { break; }
+        i = i + 1;
+    }
+    if (i <= TULA_NAME_MAX) {
+        _tula_zero48(q);
+        _tula_copy(q, name, i);
+        return i;
+    }
+    var n = TULA_NAME_CAP + strlen(name + TULA_NAME_CAP);
+    _tula_key2(q, name, n, "", 0);
+    return n;
+}
+
 # The entry whose FULL name is a[0..alen) ‖ b[0..blen), or 0: the stored field
 # it would have is looked up in place, then the full name confirmed.
 fn _tula_find_name2(r, a, alen, b, blen): i64 {
@@ -142,5 +162,7 @@ fn _tula_find_name2(r, a, alen, b, blen): i64 {
 # the names table confirms the full name, so a hash collision can't return the
 # wrong tensor. Returns the entry or 0.
 fn tula_find_name(r, name): i64 {
-    return _tula_find_name2(r, name, strlen(name), "", 0);
+    var q[48];
+    var n = _tula_query_name(&q, name);
+    return _tula_confirm(r, tula_find(r, &q), name, n, "", 0);
 }

@@ -1,0 +1,387 @@
+# tests/tcyr/kernels.tcyr — the 1.9.0 kernels and the parallel unpack (ADR 0012).
+#
+# The 1.9.0 array helpers take table and inline paths; each must give the bits
+# of the definition it replaces, which is still in the code: the scalar FP8
+# conversions, f64_mul(f64_from(code), scale) for int8 and INT4,
+# f64_mul(level, scale) for NF4, and tula_ternary_get. Lengths cross the table
+# thresholds and leave tails; NF4 and INT4 run at even, odd, small and large
+# blocks. tula_unpack_par must give the serial helper's output, bit for bit, at
+# every thread count, write exactly n outputs, and refuse what it can't do.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn lcg(s): i64 {
+    var x = load64(s) * 6364136223846793005 + 1442695040888963407;
+    store64(s, x);
+    var z = (x ^ ((x >> 30) & 0x3FFFFFFFF)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ ((z >> 27) & 0x1FFFFFFFFF)) * 0x94D049BB133111EB;
+    return z ^ ((z >> 31) & 0x1FFFFFFFF);
+}
+
+fn fill_bytes(p, n, s): i64 {
+    var i = 0;
+    while (i < n) {
+        store8(p + i, lcg(s) & 0xFF);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# A random f64: half of them in a weight-like range (|x| in [2^-14, 2^6)), the
+# rest any bit pattern (subnormals, zeros, inf, NaN included).
+fn rand_f64(s): i64 {
+    var r = lcg(s);
+    if ((r & 1) == 0) {
+        var ex = 1009 + ((r >> 1) & 0x1F) % 20;
+        return (r & 0x800FFFFFFFFFFFFF) | (ex << 52);
+    }
+    return lcg(s);
+}
+
+fn to8(fmt, x): i64 {
+    if (fmt == 0) { return tula_f64_to_e4m3(x); }
+    return tula_f64_to_e5m2(x);
+}
+
+fn from8(fmt, h): i64 {
+    if (fmt == 0) { return tula_e4m3_to_f64(h); }
+    return tula_e5m2_to_f64(h);
+}
+
+# FP8 arrays past the 1,024-element table threshold, with a tail: unpack is the
+# scalar widen on every code (each code many times, at every position mod 8);
+# pack is the scalar narrow on every code's value, the midpoints to its
+# neighbour and +-1 ulp, and random values.
+fn test_fp8_arrays() {
+    var fmt = 0;
+    while (fmt < 2) {
+        var n = 256 * 17 + 5;
+        var codes = alloc(n);
+        var i = 0;
+        while (i < n) { store8(codes + i, (i * 7) & 0xFF); i = i + 1; }
+        var wide = alloc(n * 8);
+        var r = 0;
+        if (fmt == 0) { r = tula_e4m3_unpack(codes, n, wide); }
+        else          { r = tula_e5m2_unpack(codes, n, wide); }
+        assert_eq(r, n, "fp8 unpack (table path) returns n");
+        var bad = 0;
+        i = 0;
+        while (i < n) {
+            if (load64(wide + i * 8) != from8(fmt, load8(codes + i))) { bad = bad + 1; }
+            i = i + 1;
+        }
+        assert_eq(bad, 0, "fp8 unpack table path == scalar widen, every code, tail too");
+        # pack inputs
+        var m = 256 * 4 + 50000;
+        var src = alloc(m * 8);
+        var s = alloc(8);
+        store64(s, 0xF8 + fmt);
+        var k = 0;
+        var c = 0;
+        while (c < 256) {
+            var a = from8(fmt, c);
+            var b = from8(fmt, (c + 1) & 0xFF);
+            var mid = f64_div(f64_add(a, b), f64_from(2));
+            store64(src + k * 8, a); k = k + 1;
+            store64(src + k * 8, mid); k = k + 1;
+            store64(src + k * 8, mid - 1); k = k + 1;
+            store64(src + k * 8, mid + 1); k = k + 1;
+            c = c + 1;
+        }
+        while (k < m) { store64(src + k * 8, rand_f64(s)); k = k + 1; }
+        var packed = alloc(m);
+        if (fmt == 0) { r = tula_e4m3_pack(src, m, packed); }
+        else          { r = tula_e5m2_pack(src, m, packed); }
+        assert_eq(r, m, "fp8 pack returns n");
+        bad = 0;
+        k = 0;
+        while (k < m) {
+            if (load8(packed + k) != (to8(fmt, load64(src + k * 8)) & 0xFF)) { bad = bad + 1; }
+            k = k + 1;
+        }
+        assert_eq(bad, 0, "fp8 pack inline path == scalar narrow: codes, midpoints +-1 ulp, 50k random");
+        fmt = fmt + 1;
+    }
+    return 0;
+}
+
+# int8 dequant's table path (n >= 1024, eight codes per load) against the
+# definition, at several scales, with tails of every length mod 8.
+fn test_int8_table() {
+    var s = alloc(8);
+    store64(s, 0x18);
+    var n = 4096 + 7;
+    var codes = alloc(n);
+    fill_bytes(codes, n, s);
+    var out = alloc(n * 8);
+    var bad = 0;
+    var t = 0;
+    while (t < 4) {
+        var scale = rand_f64(s);
+        if (t == 0) { scale = f64_div(f64_from(3), f64_from(127)); }
+        var len = n - t * 3;
+        tula_int8_dequant(codes, len, scale, out);
+        var i = 0;
+        while (i < len) {
+            var b = load8(codes + i);
+            if (b >= 128) { b = b - 256; }
+            if (load64(out + i * 8) != f64_mul(f64_from(b), scale)) { bad = bad + 1; }
+            i = i + 1;
+        }
+        t = t + 1;
+    }
+    assert_eq(bad, 0, "int8 dequant table path == f64_mul(code, scale) on every element");
+    return 0;
+}
+
+# Ternary's table path (n >= 1024) against tula_ternary_get, every byte value
+# (code 3 included), with tails.
+fn test_ternary_table() {
+    var s = alloc(8);
+    store64(s, 0x3);
+    var nb = 4096;
+    var packed = alloc(nb);
+    fill_bytes(packed, nb, s);
+    var out = alloc(nb * 4 * 8);
+    var bad = 0;
+    var len = nb * 4;
+    while (len > nb * 4 - 4) {
+        assert_eq(tula_ternary_unpack(packed, len, out), len, "ternary unpack returns n");
+        var i = 0;
+        while (i < len) {
+            if (load64(out + i * 8) != tula_ternary_get(packed, i)) { bad = bad + 1; }
+            i = i + 1;
+        }
+        len = len - 1;
+    }
+    assert_eq(bad, 0, "ternary table path == tula_ternary_get, all byte values, tails 0..3");
+    return 0;
+}
+
+# NF4 and INT4 unpack against their definitions, at blocks below, at and above
+# the 16-element table threshold, odd and even, over an odd count. The scales
+# include zero, negatives, a subnormal, inf and NaN.
+fn nibble_bad(which, n, block, codes, scales, out): i64 {
+    var r = 0;
+    if (which == 0) { r = tula_nf4_unpack(codes, scales, n, block, out); }
+    else            { r = tula_int4_unpack(codes, scales, n, block, out); }
+    if (r != n) { return 1000000; }
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        var d = load64(scales + (i / block) * 8);
+        var want = 0;
+        if (which == 0) { want = f64_mul(tula_nf4_level(tula_nf4_get(codes, i)), d); }
+        else            { want = f64_mul(f64_from(tula_int4_get(codes, i)), d); }
+        if (load64(out + i * 8) != want) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn test_nibble_tables() {
+    var s = alloc(8);
+    store64(s, 0x44);
+    var n = 2001;
+    var codes = alloc((n + 1) / 2);
+    fill_bytes(codes, (n + 1) / 2, s);
+    var scales = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(scales + i * 8, rand_f64(s)); i = i + 1; }
+    store64(scales, 0);                          # +0
+    store64(scales + 8, 0x8000000000000000);     # -0
+    store64(scales + 16, 1);                     # the smallest subnormal
+    store64(scales + 24, 0x7FF0000000000000);    # inf
+    store64(scales + 32, 0xFFF8000000000000);    # NaN
+    var out = alloc(n * 8);
+    var bl[64];
+    store64(&bl, 1); store64(&bl + 8, 3); store64(&bl + 16, 15); store64(&bl + 24, 16);
+    store64(&bl + 32, 17); store64(&bl + 40, 32); store64(&bl + 48, 33); store64(&bl + 56, 64);
+    var which = 0;
+    while (which < 2) {
+        var bad = 0;
+        var j = 0;
+        while (j < 8) {
+            bad = bad + nibble_bad(which, n, load64(&bl + j * 8), codes, scales, out);
+            bad = bad + nibble_bad(which, n - 1, load64(&bl + j * 8), codes, scales, out);
+            j = j + 1;
+        }
+        if (which == 0) { assert_eq(bad, 0, "nf4 unpack == f64_mul(level, scale): blocks 1..64, odd/even n"); }
+        else            { assert_eq(bad, 0, "int4 unpack == f64_mul(code, scale): blocks 1..64, odd/even n"); }
+        which = which + 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------------
+# tula_unpack_par
+# ---------------------------------------------------------------------------
+
+# Packed bytes of n elements of dt (the payload a slice reads).
+fn pbytes(dt, n): i64 {
+    return tula_packed_len(dt, n);
+}
+
+fn serial(dt, src, n, scales, block, dst): i64 {
+    if (dt == TULA_DT_F32)     { return tula_f32_unpack(src, n, dst); }
+    if (dt == TULA_DT_F16)     { return tula_f16_unpack(src, n, dst); }
+    if (dt == TULA_DT_BF16)    { return tula_bf16_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E4M3) { return tula_e4m3_unpack(src, n, dst); }
+    if (dt == TULA_DT_F8_E5M2) { return tula_e5m2_unpack(src, n, dst); }
+    if (dt == TULA_DT_INT8)    { tula_int8_dequant(src, n, load64(scales), dst); return n; }
+    if (dt == TULA_DT_NF4)     { return tula_nf4_unpack(src, scales, n, block, dst); }
+    if (dt == TULA_DT_INT4)    { return tula_int4_unpack(src, scales, n, block, dst); }
+    return tula_ternary_unpack(src, n, dst);
+}
+
+# Unpack n elements of dt at each thread count and compare with the serial
+# helper; the word after dst[n] is a guard that must stay put. Returns the
+# number of mismatching runs.
+fn par_runs(dt, n, block, src, scales, ref, out): i64 {
+    serial(dt, src, n, scales, block, ref);
+    var counts[80];
+    store64(&counts, 1); store64(&counts + 8, 2); store64(&counts + 16, 3);
+    store64(&counts + 24, 4); store64(&counts + 32, 7); store64(&counts + 40, 64);
+    store64(&counts + 48, 1000); store64(&counts + 56, 0); store64(&counts + 64, 0 - 5);
+    var bad = 0;
+    var j = 0;
+    while (j < 9) {
+        var k = 0;
+        while (k <= n) { store64(out + k * 8, 0x5A5A5A5A5A5A5A5A); k = k + 1; }
+        var r = tula_unpack_par(dt, src, n, scales, block, out, load64(&counts + j * 8));
+        if (r != n) { bad = bad + 1; }
+        if (memeq(out, ref, n * 8) != 1) { bad = bad + 1; }
+        if (load64(out + n * 8) != 0x5A5A5A5A5A5A5A5A) { bad = bad + 1; }
+        j = j + 1;
+    }
+    return bad;
+}
+
+fn test_par_matches_serial() {
+    var s = alloc(8);
+    store64(s, 0x9A9);
+    # Large enough for several slices of TULA_PAR_MIN_CHUNK, odd so slices end ragged.
+    var n = 4 * TULA_PAR_MIN_CHUNK + 4321;
+    var src = alloc(n * 4);
+    fill_bytes(src, n * 4, s);
+    var scales = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(scales + i * 8, rand_f64(s)); i = i + 1; }
+    var ref = alloc((n + 1) * 8);
+    var out = alloc((n + 1) * 8);
+    var dts[72];
+    store64(&dts, TULA_DT_F32); store64(&dts + 8, TULA_DT_F16); store64(&dts + 16, TULA_DT_BF16);
+    store64(&dts + 24, TULA_DT_F8_E4M3); store64(&dts + 32, TULA_DT_F8_E5M2);
+    store64(&dts + 40, TULA_DT_INT8); store64(&dts + 48, TULA_DT_TERNARY);
+    var bad = 0;
+    var d = 0;
+    while (d < 7) {
+        bad = bad + par_runs(load64(&dts + d * 8), n, 0, src, scales, ref, out);
+        d = d + 1;
+    }
+    assert_eq(bad, 0, "par == serial for F32/F16/BF16/E4M3/E5M2/INT8/TERNARY at 1..1000, 0, -5 threads");
+    var blocks[40];
+    store64(&blocks, 64); store64(&blocks + 8, 32); store64(&blocks + 16, 33);
+    store64(&blocks + 24, 7); store64(&blocks + 32, 1);
+    bad = 0;
+    var b = 0;
+    while (b < 5) {
+        var blk = load64(&blocks + b * 8);
+        bad = bad + par_runs(TULA_DT_NF4, n, blk, src, scales, ref, out);
+        bad = bad + par_runs(TULA_DT_INT4, n, blk, src, scales, ref, out);
+        b = b + 1;
+    }
+    assert_eq(bad, 0, "par == serial for NF4/INT4 at blocks 64/32/33/7/1, every thread count");
+    # Blocks near and past half the count run as one slice; still the serial output.
+    bad = par_runs(TULA_DT_NF4, n, n / 2, src, scales, ref, out);
+    bad = bad + par_runs(TULA_DT_INT4, n, n + 9, src, scales, ref, out);
+    assert_eq(bad, 0, "par == serial when a block is half the tensor or more");
+    # Small tensors (below one chunk per thread) take the caller's thread alone.
+    bad = par_runs(TULA_DT_F16, 1000, 0, src, scales, ref, out);
+    bad = bad + par_runs(TULA_DT_INT4, 3, 32, src, scales, ref, out);
+    assert_eq(bad, 0, "par == serial on tensors smaller than a chunk");
+    return 0;
+}
+
+fn test_par_refusals() {
+    var src = alloc(64);
+    var sc = alloc(64);
+    store64(sc, f64_from(1));
+    var out = alloc(64);
+    store64(out, 77);
+    assert_eq(tula_unpack_par(TULA_DT_F64, src, 4, sc, 0, out, 4), 0 - 1, "F64 has no unpack helper: -1");
+    assert_eq(tula_unpack_par(TULA_DT_I32, src, 4, sc, 0, out, 4), 0 - 1, "I32 (raw): -1");
+    assert_eq(tula_unpack_par(TULA_DT_BOOL, src, 4, sc, 0, out, 4), 0 - 1, "BOOL (raw): -1");
+    assert_eq(tula_unpack_par(99, src, 4, sc, 0, out, 4), 0 - 1, "an unknown dtype: -1");
+    assert_eq(tula_unpack_par(TULA_DT_F16, src, 0 - 1, sc, 0, out, 4), 0 - 1, "n < 0: -1");
+    assert_eq(tula_unpack_par(TULA_DT_NF4, src, 4, sc, 0, out, 4), 0 - 1, "NF4 block 0: -1");
+    assert_eq(tula_unpack_par(TULA_DT_INT4, src, 4, sc, 0 - 32, out, 4), 0 - 1, "INT4 block < 0: -1");
+    assert_eq(load64(out), 77, "... and nothing written");
+    assert_eq(tula_unpack_par(TULA_DT_INT8, src, 0, 0, 0, out, 4), 0, "n = 0: returns 0, reads no scale");
+    assert_eq(load64(out), 77, "... and writes nothing");
+    return 0;
+}
+
+# A file's tensors unpacked through the parallel path, sidecar and all.
+fn test_par_from_file() {
+    var s = alloc(8);
+    store64(s, 0xF11E);
+    var n = 3 * TULA_PAR_MIN_CHUNK + 17;
+    var vals = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        var r = lcg(s);
+        var ex = 1013 + ((r >> 1) & 7);
+        store64(vals + i * 8, (r & 0x800FFFFFFFFFFFFF) | (ex << 52));
+        i = i + 1;
+    }
+    var half = alloc(n * 2);
+    tula_bf16_pack(vals, n, half);
+    var nb = tula_int4_blocks(n, TULA_INT4_BLOCK);
+    var sc = alloc(nb * 8);
+    var q = alloc(tula_int4_bytes(n));
+    tula_int4_pack(vals, n, TULA_INT4_BLOCK, sc, q);
+    var b = tula_builder_new();
+    var dims[8];
+    store64(&dims, n);
+    tula_builder_add_checked(b, "w", TULA_DT_BF16, &dims, 1, half, n * 2);
+    tula_builder_add_checked(b, "q", TULA_DT_INT4, &dims, 1, q, tula_int4_bytes(n));
+    var sdims[8];
+    store64(&sdims, nb);
+    tula_builder_add_checked(b, "q.scale", TULA_DT_F64, &sdims, 1, sc, nb * 8);
+    var buf = tula_builder_finish(b);
+    assert_eq(tula_validate_strict(buf, tula_total_len(buf)), TULA_OK, "the file is strict-valid");
+    var ew = tula_find(buf, "w");
+    var eq = tula_find(buf, "q");
+    var es = tula_find_scale(buf, eq, nb);
+    assert(es != 0, "the int4 tensor's .scale sidecar is found");
+    var a = alloc(n * 8);
+    var c = alloc(n * 8);
+    var pw = tula_entry_data(buf, ew);
+    var rw = tula_unpack_par(tula_entry_dtype(ew), pw, n, 0, 0, a, 4);
+    assert_eq(rw, n, "bf16 from the file, 4 threads");
+    tula_bf16_unpack(half, n, c);
+    assert_eq(memeq(a, c, n * 8), 1, "... the serial helper's values");
+    var pq = tula_entry_data(buf, eq);
+    var ps = tula_entry_data(buf, es);
+    var rq = tula_unpack_par(tula_entry_dtype(eq), pq, n, ps, TULA_INT4_BLOCK, a, 4);
+    assert_eq(rq, n, "int4 + its sidecar from the file, 4 threads");
+    tula_int4_unpack(q, sc, n, TULA_INT4_BLOCK, c);
+    assert_eq(memeq(a, c, n * 8), 1, "... the serial helper's values");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_fp8_arrays();
+    test_int8_table();
+    test_ternary_table();
+    test_nibble_tables();
+    test_par_matches_serial();
+    test_par_refusals();
+    test_par_from_file();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);
