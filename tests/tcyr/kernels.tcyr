@@ -8,7 +8,8 @@
 # blocks. tula_unpack_par must give the serial helper's output, bit for bit, at
 # every thread count, write exactly n outputs, and refuse what it can't do.
 # 1.9.1: the F16 / BF16 table path for large tensors against the scalar
-# conversions, and NF4's thresholds against the codebook scan.
+# conversions, and NF4's thresholds against the codebook scan. 1.13.0:
+# tula_uint4_unpack_par against tula_uint4_unpack.
 include "src/lib.cyr"
 include "lib/assert.cyr"
 
@@ -520,6 +521,65 @@ fn test_par_matches_serial() {
     return 0;
 }
 
+# tula_uint4_unpack_par (1.13.0, ADR 0016) against tula_uint4_unpack at every
+# thread count, at even, odd and large blocks; the word after dst[n] stays put.
+fn uint4_par_runs(n, block, codes, scales, mins, ref, out): i64 {
+    tula_uint4_unpack(codes, scales, mins, n, block, ref);
+    var counts[80];
+    store64(&counts, 1); store64(&counts + 8, 2); store64(&counts + 16, 3);
+    store64(&counts + 24, 4); store64(&counts + 32, 7); store64(&counts + 40, 64);
+    store64(&counts + 48, 1000); store64(&counts + 56, 0); store64(&counts + 64, 0 - 5);
+    var bad = 0;
+    var j = 0;
+    while (j < 9) {
+        var k = 0;
+        while (k <= n) { store64(out + k * 8, 0x5A5A5A5A5A5A5A5A); k = k + 1; }
+        var r = tula_uint4_unpack_par(codes, scales, mins, n, block, out, load64(&counts + j * 8));
+        if (r != n) { bad = bad + 1; }
+        if (memeq(out, ref, n * 8) != 1) { bad = bad + 1; }
+        if (load64(out + n * 8) != 0x5A5A5A5A5A5A5A5A) { bad = bad + 1; }
+        j = j + 1;
+    }
+    return bad;
+}
+
+fn test_uint4_par() {
+    var s = alloc(8);
+    store64(s, 0x5114);
+    var n = 4 * TULA_PAR_MIN_CHUNK + 4321;
+    var codes = alloc(n);
+    fill_bytes(codes, (n + 1) / 2, s);
+    var scales = alloc(n * 8);
+    var mins = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(scales + i * 8, rand_f64(s));
+        store64(mins + i * 8, rand_f64(s));
+        i = i + 1;
+    }
+    var ref = alloc((n + 1) * 8);
+    var out = alloc((n + 1) * 8);
+    var blocks[48];
+    store64(&blocks, 32); store64(&blocks + 8, 64); store64(&blocks + 16, 33);
+    store64(&blocks + 24, 7); store64(&blocks + 32, 1); store64(&blocks + 40, n / 2);
+    var bad = 0;
+    var b = 0;
+    while (b < 6) {
+        bad = bad + uint4_par_runs(n, load64(&blocks + b * 8), codes, scales, mins, ref, out);
+        b = b + 1;
+    }
+    bad = bad + uint4_par_runs(1000, 32, codes, scales, mins, ref, out);
+    assert_eq(bad, 0, "uint4 par == serial: blocks 32/64/33/7/1/n-half, small n, threads 1..1000, 0, -5");
+    store64(out, 77);
+    assert_eq(tula_uint4_unpack_par(codes, scales, mins, 4, 0, out, 4), 0 - 1, "uint4 par, block 0: -1");
+    assert_eq(tula_uint4_unpack_par(codes, scales, mins, 0 - 1, 32, out, 4), 0 - 1, "uint4 par, n < 0: -1");
+    assert_eq(tula_uint4_unpack_par(codes, scales, mins, 0, 32, out, 4), 0, "uint4 par, n = 0: 0");
+    assert_eq(load64(out), 77, "... and none of them writes");
+    var ru = tula_unpack_par(TULA_DT_UINT4, codes, 4, scales, 32, out, 4);
+    assert_eq(ru, 0 - 1, "tula_unpack_par still refuses UINT4 (-1): it takes one sidecar");
+    return 0;
+}
+
 fn test_par_refusals() {
     var src = alloc(64);
     var sc = alloc(64);
@@ -600,6 +660,7 @@ fn main(): i64 {
     test_par_matches_serial();
     test_par_refusals();
     test_par_from_file();
+    test_uint4_par();
     return assert_summary();
 }
 

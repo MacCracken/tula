@@ -696,8 +696,12 @@ fn main(): i64 {
     var pnf = alloc(tula_nf4_bytes(pn));
     var pnfs = alloc(tula_nf4_blocks(pn, TULA_NF4_BLOCK) * 8);
     tula_nf4_pack(psig, pn, TULA_NF4_BLOCK, pnfs, pnf);
+    var pu4 = alloc(tula_int4_bytes(pn));
+    var pu4s = alloc(tula_int4_blocks(pn, TULA_INT4_BLOCK) * 8);
+    var pu4m = alloc(tula_int4_blocks(pn, TULA_INT4_BLOCK) * 8);
+    tula_uint4_pack(psig, pn, TULA_INT4_BLOCK, pu4s, pu4m, pu4);   # 1.13.0
     var pk = 0;
-    while (pk < 5) {
+    while (pk < 6) {
         var pdt = TULA_DT_BF16;
         var psrc = pbf;
         var psc = 0;
@@ -707,13 +711,15 @@ fn main(): i64 {
         if (pk == 2) { pdt = TULA_DT_INT8; psrc = pi8; psc = pi8s; plab = "par int8  x"; }
         if (pk == 3) { pdt = TULA_DT_INT4; psrc = pq4; psc = pq4s; pbl = TULA_INT4_BLOCK; plab = "par int4  x"; }
         if (pk == 4) { pdt = TULA_DT_NF4; psrc = pnf; psc = pnfs; pbl = TULA_NF4_BLOCK; plab = "par nf4   x"; }
+        if (pk == 5) { pdt = TULA_DT_UINT4; psrc = pu4; psc = pu4s; pbl = TULA_INT4_BLOCK; plab = "par uint4 x"; }
         var pt = 1;
         while (pt <= 8) {
             var pmin = 0;
             round = 0;
             while (round < 3) {
                 var tp = now_ns();
-                tula_unpack_par(pdt, psrc, pn, psc, pbl, pout, pt);
+                if (pk == 5) { tula_uint4_unpack_par(psrc, psc, pu4m, pn, pbl, pout, pt); }
+                else { tula_unpack_par(pdt, psrc, pn, psc, pbl, pout, pt); }
                 pmin = min_of(pmin, round, now_ns() - tp);
                 round = round + 1;
             }

@@ -499,7 +499,8 @@ block in `"<name>.scale"` and one f64 minimum `m` in `"<name>.min"`:
 - Find the sidecars with `tula_find_sidecar(r, e, ".scale", nb)` and
   `tula_find_sidecar(r, e, ".min", nb)`, `nb = tula_int4_blocks(nelems, block)`
   (or the index and set forms). `tula_unpack_par` doesn't cover UINT4, which
-  needs two sidecars, and returns −1 for it.
+  needs two sidecars, and returns −1 for it. Use `tula_uint4_unpack_par`
+  (1.13.0, below).
 - **To import GGUF Q4_1 losslessly**, move the codes from the block layout
   (byte `j` holds elements `j` and `j + 16`) into element order (no XOR: Q4_1's
   codes are already unsigned), and widen each block's f16 `d` and `m` to f64.
@@ -563,6 +564,12 @@ scan's answer on every input). Numbers are in [`benchmarks.md`](benchmarks.md).
     bump allocator, which has no free.
   - Like the serial helpers it trusts its arguments: run `tula_entry_payload_ok`
     on a foreign entry and its `.scale` sidecar first.
+- `fn tula_uint4_unpack_par(codes, scales, mins, n, block, dst, nthreads) -> n |
+  -1` *(1.13.0, ADR 0016)* — `tula_uint4_unpack` on up to `nthreads` threads.
+  It splits as `tula_unpack_par` does and gives the same output bit for bit.
+  Returns −1, writing nothing, for `n < 0` or `block <= 0`, and 0 for `n = 0`.
+  A separate call because `tula_unpack_par`'s frozen signature has one sidecar
+  and UINT4 needs two.
 
 ---
 
@@ -667,7 +674,7 @@ p = tula_entry_data(r, e)               # in-bounds, zero-copy
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
 index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0;
 `tula_open_protected` is 1.10.0; shard sets are 1.11.0; UINT4 and
-`tula_find_sidecar` are 1.12.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+`tula_find_sidecar` are 1.12.0; `tula_uint4_unpack_par` is 1.13.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

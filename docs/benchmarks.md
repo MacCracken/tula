@@ -270,6 +270,15 @@ wasn't measured.
 | `tula_uint4_pack` | 18.5 ms · ~56 Melem/s | Q4_1's rule in f64; INT4's pack is ~58 |
 | `tula_uint4_unpack` | 4.1 ms · ~257 Melem/s | `code × d + m`; INT4's unpack is ~333. Adding the minimum costs each block's table one more pass |
 
+### 1.13.0: the parallel UINT4 unpack
+
+2²⁴ elements, blocks of 32, `make bench` (Melem/s):
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| `tula_uint4_unpack_par` | 256 | 501 | 928 | 1,122 |
+| `tula_unpack_par`, INT4 (same run) | 332 | 636 | 1,045 | 1,223 |
+
 ### Added in 1.5.0
 
 | Op | 1.5.0 | Notes |

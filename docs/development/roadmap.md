@@ -75,7 +75,7 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ## How the lines below are ordered
 
-Shipped lines (through 1.11.0) aren't listed; a released line takes patches
+Shipped work (through 1.13.0) isn't listed; a released line takes patches
 only: fixes, with no new function, dtype or convention. The lines below are
 ordered by how soon a consumer is likely to need them. Each starts when its gate
 is met (an importer's need, a decision), not on a date, and new dtype codes start
@@ -105,8 +105,6 @@ any suffix. Still waiting on an importer:
   threads; the blockwise and float packs split as the unpacks do.
 - **A caller-owned worker pool**, if per-call thread starts (~29 µs each) show
   up beside `tula_unpack_par`.
-- **A parallel UINT4 unpack.** `tula_unpack_par` takes one sidecar, and UINT4
-  needs two (ADR 0015).
 
 ## 1.14.x — zero-copy protection for unsealed files
 
@@ -171,16 +169,14 @@ reading v1. Candidates, each to be argued in an ADR before it's planned:
 - **Consumers:** `rupantara` / `anukūlana` (Type-3 pretrained-import), the murti
   load-seam, the control-plane checkpoint store — all pull `dist/tula.cyr` via
   `[deps.tula]`. Keep the format stable for them; v2 is a coordinated event.
+- **The real-weights gate** is anukulana's: its `gpt2-tula` demo imports the
+  real GPT-2 checkpoint, NF4-quantizes it, saves a signed tula file, reloads it
+  and checks the result bit for bit, in its own CI. tula's CI can't run it
+  without depending on its consumer, so `make realmodels` covers tula's side.
 - **Cross-repo asks** (not tula code):
-  - **anukulana's migration**, which makes its `gpt2-tula` demo the
-    real-weights gate. That demo imports the real GPT-2 checkpoint,
-    NF4-quantizes it, saves a signed tula file, reloads it and checks the result
-    bit for bit. It needs anukulana on the current toolchain and tula, and the
-    checkpoint staged in its CI. tula's own CI can't run it without depending on
-    its consumer, so `make realmodels` covers tula's side.
-  - **Other consumers** move onto the newer calls (checked and long adds, strict
+  - **Consumers** move onto the newer calls (checked and long adds, strict
     reads, streaming writes, the index, metadata, `tula_unpack_par`,
-    `tula_open_protected`), as `examples/consumer.cyr` shows.
+    `tula_open_protected`, shard sets, UINT4), as `examples/consumer.cyr` shows.
   - **sigil's SHA-512 throughput** bounds big-file signing (~18 MB/s: a 14 GB
     checkpoint takes ~25 min to sign, ~13 to verify). tula benefits with no
     change. Filed with sigil:

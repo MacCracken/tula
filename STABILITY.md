@@ -31,7 +31,8 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
   from 1.9.0 also `tula_unpack_par` (ADR 0012), whose output is the serial
   helper's at any thread count, from 1.10.0 `tula_open_protected` (ADR 0013)
   with its guarantee: no later change to the file reaches the reader, and from
-  1.11.0 the shard-set calls (`tula_builder_set_shards`, `tula_set_*`, ADR 0014).
+  1.11.0 the shard-set calls (`tula_builder_set_shards`, `tula_set_*`, ADR 0014),
+  and from 1.13.0 `tula_uint4_unpack_par` (ADR 0016).
 - **Public constants** — `TULA_DT_*`, `TULA_SIG_*`, the `TULA_ERR_*` codes and
   their numeric values, and the format constants (`TULA_HEADER_SIZE`,
   `TULA_ENTRY_SIZE`, `TULA_NAME_CAP`, `TULA_MAXDIM`, `TULA_BUILDER_MAX`,

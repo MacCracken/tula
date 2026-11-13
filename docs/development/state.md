@@ -23,7 +23,7 @@ consumer-side over-read with `tula_entry_payload_ok`. **105 assertions** across 
 suites (`roundtrip.tcyr` 22 + `sign.tcyr` 8 + `fileio.tcyr` 16 + `dtype.tcyr` 29 +
 `hardening.tcyr` 30), all green; builds + tests warning-clean.
 
-VERSION is **1.12.0** (`tula_version_int()` returns `11200`). 1.0.1–1.1.1 are
+VERSION is **1.13.0** (`tula_version_int()` returns `11300`). 1.0.1–1.1.1 are
 toolchain/dep realigns. **1.1.2 is the P(-1) pass**
 ([audit](../audit/2026-11-04-audit.md)): ten reproduced defects fixed (worst: a
 truncated file crashed `tula_open_mmap` with SIGBUS), hot paths 1.2–11.6× faster
@@ -77,19 +77,22 @@ verifies one (one signature, then the shards' SHA-256 in parallel, ~1.2 GB/s at
 layout with `.scale` and `.min` sidecars (`code × d + m`, GGUF Q4_1), quantized
 by Q4_1's rule; `tula_find_sidecar` (and its index and set forms) finds a
 sidecar by suffix. 1.11.0 reads such files; its strict says `TULA_ERR_DTYPE`.
+**1.13.0 — a parallel UINT4 unpack**: `tula_uint4_unpack_par` (ADR 0016), UINT4's unpack on several threads, beside
+`tula_unpack_par` (which still refuses UINT4). ~1.1 Gelem/s at 8 threads.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.12.0)
+## Tests, fuzz, gates (1.13.0)
 
-**974 assertions** across 19 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
+**980 assertions** across 19 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
 (1.11.0: a written and opened set, every refusal with its code and shard, the
 builder's and strict's rules), `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
-`ints.tcyr` 61, `uint4.tcyr` 51 (1.12.0), `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
-and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
-16-bit tables and NF4 thresholds), `floats.tcyr` 37, `protected.tcyr` 35
+`ints.tcyr` 61, `uint4.tcyr` 51 (1.12.0), `dtype.tcyr` 50, `kernels.tcyr` 50 (the table
+and inline paths, `tula_unpack_par` against the serial helpers, 1.9.1's
+16-bit tables and NF4 thresholds, and 1.13.0's parallel UINT4), `int4.tcyr` 48,
+`floats.tcyr` 37, `protected.tcyr` 35
 (1.10.0: the copy branch under an in-place rewrite and a truncation, the forced
 zero-copy branch, the verity check), `fileio.tcyr` 30,
 `hardening.tcyr` 30,
@@ -195,5 +198,6 @@ time for the sharded 70B set. The rest of 1.12.x waits on an importer. The open 
 the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
 protection for unsealed files, then 1.x.x (shard-set follow-ups among them) and
 the v2 candidates. Each waits on
-its gate (an importer's need or a decision). Cross-repo: anukulana's migration
-(the real-weights gate) and sigil's SHA-512 throughput.
+its gate (an importer's need or a decision). Cross-repo: sigil's SHA-512
+throughput and binary size (both open with sigil). anukulana's real-weights gate
+runs in its own CI.

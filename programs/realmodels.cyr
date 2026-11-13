@@ -41,8 +41,8 @@
 # excerpt, the source — read back after the signed round trip.
 # Every tensor is found through the index AND tula_find_name, which must
 # agree; its rank, dims and dtype are checked; its payload is compared byte for
-# byte with what was written. A real-WEIGHTS round trip is anukulana's (its
-# gpt2-tula demo imports the real checkpoint); see the roadmap.
+# byte with what was written. A real-WEIGHTS round trip is anukulana's: its
+# gpt2-tula demo imports the real checkpoint, in anukulana's own CI.
 #
 #   make realmodels
 

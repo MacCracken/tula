@@ -110,7 +110,10 @@ The full march M0→M5:
   sidecars stores GGUF Q4_1 losslessly, and `tula_find_sidecar` finds a sidecar
   by any suffix.
 
-**974/974** assertions across 19 suites (meta · shards · fp8 · names · stream ·
+- **1.13.0** — `tula_uint4_unpack_par`: Q4_1 loads split across threads, as
+  INT4's do (~1.1 Gelem/s at 8 threads).
+
+**980/980** assertions across 19 suites (meta · shards · fp8 · names · stream ·
 builder · strict · ints · uint4 · dtype · int4 · kernels · floats · protected ·
 file-io · hardening · round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming

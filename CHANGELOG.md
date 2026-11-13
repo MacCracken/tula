@@ -7,6 +7,47 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-12
+
+**A parallel UINT4 unpack.** An additive MINOR with no format change
+(ADR 0016). `tula_unpack_par` takes one sidecar and UINT4 needs two, so 1.12.0
+left Q4_1 loads on one thread. `tula_uint4_unpack_par` gives them the same
+split. 2²⁴ elements go from 256 to 1,122 Melem/s at 8 threads, beside INT4's
+1,223. Every existing call is unchanged: a cross-version diff against the
+1.12.0 tag matched.
+
+### Added
+
+- **`tula_uint4_unpack_par(codes, scales, mins, n, block, dst, nthreads)`**
+  (ADR 0016): `tula_uint4_unpack` on up to `nthreads` threads, with its output
+  bit for bit.
+  - It splits as `tula_unpack_par` does: slices start on a whole block (twice
+    an odd block), at least `TULA_PAR_MIN_CHUNK` elements per thread, falling
+    back to the caller's thread where threads aren't real or fail to start.
+  - Returns −1, writing nothing, for `n < 0` or `block <= 0`, and 0 for `n = 0`.
+- **ADR 0016**: a call named for UINT4, rather than a generic second-sidecar
+  `tula_unpack_par2` or overloading the meaning of `scales`.
+
+### Changed
+
+- **`tula_unpack_par` is unchanged**: it still returns −1 for UINT4. Inside, one
+  slicer serves both calls; a job now carries a second sidecar pointer.
+- **`tests/tcyr/kernels.tcyr`** (50 assertions, 6 new): the parallel UINT4
+  unpack against the serial one at thread counts 1–1000, 0 and −5, blocks
+  32/64/33/7/1/n÷2 and a small tensor, a guard word past the output, the
+  refusals, and `tula_unpack_par` still refusing UINT4.
+
+  Two seeded bugs are each caught: minimums not advanced per slice, and UINT4
+  missing from the blockwise slicing.
+- **The fuzzer's phase J** draws UINT4 too, through `tula_uint4_unpack_par`,
+  with its minimums ending at a guard page of their own. The unsliced-minimums
+  bug fails it 11 times. Phases A–I are unchanged; phase K's counts move with
+  the random stream.
+- **Bench**: parallel UINT4 rows at 1, 2, 4 and 8 threads.
+- **Roadmap**: the parallel UINT4 item is done. The cross-repo ask for
+  anukulana's migration is gone: its real-weights gate runs in its own CI, and
+  it uses the newer calls (per its roadmap).
+
 ## [1.12.0] - 2026-11-12
 
 **Asymmetric 4-bit: UINT4 with a `.min` sidecar.** An additive MINOR

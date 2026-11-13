@@ -53,7 +53,8 @@
 #      checked on a strict accept, in phase I's file and phase H's builders.
 #  11. (1.9.0) the parallel unpack (ADR 0012) is the serial helper, bit for
 #      bit, and reads nothing past its inputs. Phase J draws a dtype with an
-#      unpack helper, a count up to five chunks, a block, odd ones included,
+#      unpack helper (1.13.0: UINT4 too, through tula_uint4_unpack_par, its
+#      minimums ending at a guard page of their own), a count up to five chunks, a block, odd ones included,
 #      and 1..9 threads. The payload and the scales each end exactly at a guard
 #      page, so a slice that starts or ends a byte or a block wrong faults. The
 #      output must equal the serial helper's, with the word after it untouched.
@@ -756,7 +757,8 @@ fn par_phase(s, st): i64 {
     var fails = 0;
     var pg = guard_span(FZ_PAR_MAXN * 4 + 4096);       # payloads: F32 is the widest
     var sg = guard_span(FZ_PAR_MAXN * 8 + 4096);       # scales: one per element at block 1
-    if (pg == 0 || sg == 0) {
+    var mg = guard_span(FZ_PAR_MAXN * 8 + 4096);       # UINT4's minimums (1.13.0)
+    if (pg == 0 || sg == 0 || mg == 0) {
         sput("phase J: could not map its guard pages\n");
         return 1;
     }
@@ -773,19 +775,20 @@ fn par_phase(s, st): i64 {
     }
     var ref = alloc((FZ_PAR_MAXN + 1) * 8);
     var out = alloc((FZ_PAR_MAXN + 1) * 8);
-    var dts[72];
+    var dts[80];
     store64(&dts, TULA_DT_F32); store64(&dts + 8, TULA_DT_F16); store64(&dts + 16, TULA_DT_BF16);
     store64(&dts + 24, TULA_DT_F8_E4M3); store64(&dts + 32, TULA_DT_F8_E5M2);
     store64(&dts + 40, TULA_DT_INT8); store64(&dts + 48, TULA_DT_NF4);
     store64(&dts + 56, TULA_DT_INT4); store64(&dts + 64, TULA_DT_TERNARY);
+    store64(&dts + 72, TULA_DT_UINT4);
     var it = 0;
     while (it < FZ_PAR_ITERS) {
-        var dt = load64(&dts + rng_below(s, 9) * 8);
+        var dt = load64(&dts + rng_below(s, 10) * 8);
         var n = 1 + rng_below(s, FZ_PAR_MAXN);
         if (rng_below(s, 4) == 0) { n = 1 + rng_below(s, 3 * TULA_PAR_MIN_CHUNK); }
         var block = 0;
         var nsc = 0;
-        if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4) {
+        if (dt == TULA_DT_NF4 || dt == TULA_DT_INT4 || dt == TULA_DT_UINT4) {
             block = 1 + rng_below(s, 300);
             if (rng_below(s, 3) == 0) { block = 32 + 32 * rng_below(s, 2); }
             if (rng_below(s, 20) == 0) { block = n / 2 + rng_below(s, n + 1); }   # one or two blocks
@@ -798,10 +801,19 @@ fn par_phase(s, st): i64 {
         memcpy_n(src, pool, plen);
         var scales = sg - nsc * 8;
         memcpy_n(scales, spool, nsc * 8);
+        var mins = mg - nsc * 8;
+        memcpy_n(mins, spool + 8, nsc * 8);
         var threads = 1 + rng_below(s, 9);
-        par_serial(dt, src, n, scales, block, ref);
-        store64(out + n * 8, 0x5A5A5A5A5A5A5A5A);
-        var rc = tula_unpack_par(dt, src, n, scales, block, out, threads);
+        var rc = 0;
+        if (dt == TULA_DT_UINT4) {
+            tula_uint4_unpack(src, scales, mins, n, block, ref);
+            store64(out + n * 8, 0x5A5A5A5A5A5A5A5A);
+            rc = tula_uint4_unpack_par(src, scales, mins, n, block, out, threads);
+        } else {
+            par_serial(dt, src, n, scales, block, ref);
+            store64(out + n * 8, 0x5A5A5A5A5A5A5A5A);
+            rc = tula_unpack_par(dt, src, n, scales, block, out, threads);
+        }
         var ok = 1;
         if (rc != n) { ok = 0; }
         if (load64(out + n * 8) != 0x5A5A5A5A5A5A5A5A) { ok = 0; }
