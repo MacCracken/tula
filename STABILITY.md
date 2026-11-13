@@ -18,19 +18,24 @@ At v1.0 the public API in [`docs/api.md`](docs/api.md) is **frozen**:
   key formula, the `__tula.names__` table layout, and its magic. From 1.6.0 also
   the metadata convention (ADR 0008): the `__tula.meta__` table's position,
   layout and magic, the key rules and the reserved `tula.` prefix, the
-  UTF-8-text values, and the caps (`TULA_META_*`). A file written
+  UTF-8-text values, and the caps (`TULA_META_*`). From 1.11.0 also the shard-set
+  convention (ADR 0014): the `tula.shards` key, its line format and ordering,
+  SHA-256 over each shard's first `size` bytes, file names in the manifest's
+  directory, and a manifest holding no tensors. A file written
   by v1.x opens on any later 1.x, and vice versa. An older reader sees a
   long-named tensor by its key.
 - **Public functions** — the builder, reader, accessors, signature, file-I/O, and
   dtype helpers documented in `docs/api.md`, with their signatures and semantics;
   from 1.9.0 also `tula_unpack_par` (ADR 0012), whose output is the serial
-  helper's at any thread count, and from 1.10.0 `tula_open_protected` (ADR 0013)
-  with its guarantee: no later change to the file reaches the reader.
+  helper's at any thread count, from 1.10.0 `tula_open_protected` (ADR 0013)
+  with its guarantee: no later change to the file reaches the reader, and from
+  1.11.0 the shard-set calls (`tula_builder_set_shards`, `tula_set_*`, ADR 0014).
 - **Public constants** — `TULA_DT_*`, `TULA_SIG_*`, the `TULA_ERR_*` codes and
   their numeric values, and the format constants (`TULA_HEADER_SIZE`,
   `TULA_ENTRY_SIZE`, `TULA_NAME_CAP`, `TULA_MAXDIM`, `TULA_BUILDER_MAX`,
-  `TULA_NF4_BLOCK`, from 1.8.0 `TULA_INT4_BLOCK`, `TULA_READ_MAX_TENSORS`,
-  `TULA_READ_MAX_BYTES`).
+  `TULA_NF4_BLOCK`, from 1.8.0 `TULA_INT4_BLOCK`, from 1.11.0 the
+  `TULA_SET_PROTECTED` flag, `TULA_READ_MAX_TENSORS`, `TULA_READ_MAX_BYTES`, and
+  from 1.11.0 `TULA_SHARDS_MAX`, a cap that may be raised like them).
 
 ## What each bump means (post-1.0)
 
@@ -54,7 +59,8 @@ These may change in a MINOR release without a major bump:
   every `_tula_*` function. Treat them as private, together with the builder's
   in-memory layout and the internal tuning constants (`TULA_BHDR_SIZE`,
   `TULA_BENTRY_SIZE`, `TULA_STRICT_SORT_MIN`, `TULA_STRICT_STACK_N`, from
-  1.5.0 the index layout `TULA_IDX_HDR` / `TULA_IDX_REC`, and from 1.9.0 the
+  1.5.0 the index layout `TULA_IDX_HDR` / `TULA_IDX_REC`, from 1.11.0 an open
+  set's layout (`TULA_SET_HDR`), and from 1.9.0 the
   parallel unpack's `TULA_PAR_MAX_THREADS` / `TULA_PAR_MIN_CHUNK`, which change
   how a call is split but never its output).
 - **Benchmark numbers** and the fuzz/bench harness internals.

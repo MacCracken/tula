@@ -706,6 +706,71 @@ fn main(): i64 {
         pk = pk + 1;
     }
 
+    # ---- shard sets (1.11.0, ADR 0014): 8 shards x 16 MiB, against one signed file ----
+    sys_mkdir("build/bench_shards", 0x1ED);
+    var bsk = alloc(64);
+    var bpk = alloc(32);
+    var bseed = alloc(32);
+    var bz = 0;
+    while (bz < 32) { store8(bseed + bz, bz * 3 + 11); bz = bz + 1; }
+    ed25519_keypair(bseed, bsk, bpk);
+    var spaths = alloc(64);
+    var sbytes = 16777216;
+    var sdata = alloc(sbytes);
+    fill_signal(sdata, sbytes / 8);
+    var sshape = alloc(8);
+    store64(sshape, sbytes / 8);
+    var si = 0;
+    while (si < 8) {
+        var sb = tula_builder_new();
+        var snm = alloc(16);
+        store8(snm, 119);
+        store8(snm + 1, 48 + si);
+        store8(snm + 2, 0);
+        tula_builder_add_checked(sb, snm, TULA_DT_F64, sshape, 1, sdata, sbytes);
+        var sp = alloc(48);
+        cat_into(sp, "build/bench_shards/s0.tula");
+        store8(sp + 20, 48 + si);
+        store64(spaths + si * 8, sp);
+        tula_builder_write_file(sb, sp);
+        si = si + 1;
+    }
+    var mpath = "build/bench_shards/m.tula";
+    var st1 = now_ns();
+    var smb = tula_builder_new();
+    tula_builder_set_shards(smb, spaths, 8, 8);
+    tula_builder_write_file_signed(smb, mpath, bsk);
+    var st2 = now_ns();
+    report_mb("set_shards x8: ", sbytes * 8, st2 - st1);
+    var srcv = alloc(16);
+    var sth = 1;
+    while (sth <= 8) {
+        var smin = 0;
+        round = 0;
+        while (round < 3) {
+            var tso = now_ns();
+            var sset = tula_set_open(mpath, bpk, 0, sth, srcv);
+            var dso = now_ns() - tso;
+            if (sset == 0) { sput("set_open FAILED\n"); return 1; }
+            tula_set_close(sset);
+            smin = min_of(smin, round, dso);
+            round = round + 1;
+        }
+        sput("set_open x");
+        fmt_int(sth);
+        report_mb(" : ", sbytes * 8, smin);
+        sth = sth * 8;
+    }
+    var vb = tula_builder_new();
+    tula_builder_add_checked(vb, "w", TULA_DT_F64, sshape, 1, sdata, sbytes);
+    var vbuf = tula_builder_finish_signed(vb, bsk);
+    var tv = now_ns();
+    if (tula_verify_required(vbuf, bpk) != TULA_OK) { sput("verify FAILED\n"); return 1; }
+    report_mb("verify 16 MiB: ", sbytes, now_ns() - tv);
+    si = 0;
+    while (si < 8) { xunlink(load64(spaths + si * 8)); si = si + 1; }
+    xunlink(mpath);
+
     sput("checksum: ");
     fmt_int(chk);
     sput(" (ignore; anti-DCE)\n");

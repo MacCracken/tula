@@ -137,6 +137,14 @@ every key matching its name.
   `tula_entry_payload_ok` on the sidecar and check its element count.)
   `tula_entry_payload_ok` treats a 0-dim entry as having no contract; under
   `tula_validate_strict` a 0-dim entry must hold exactly one element.
+- **Open a sharded model as a set** (1.11.0, ADR 0014). Each shard checked on
+  its own leaves the set unbound: a shard from another release, a missing one or
+  a repeated one passes every per-file check. Use `tula_set_open` with the
+  public key. It requires the manifest's signature and checks every shard
+  against the SHA-256 the manifest signed, so the shards need no signatures of
+  their own. A mapped set, like `tula_open_mmap`, holds only while nobody
+  rewrites its files; `TULA_SET_PROTECTED` copies them instead (or maps
+  fs-verity shards).
 - **Verify signatures you rely on.** Stripping the signature from a signed file
   gives a valid *unsigned* file, so a consumer that requires signatures must
   reject `UNSIGNED`, not only `BAD`. `tula_verify_required(r, pk)` (1.2.0)

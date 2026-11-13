@@ -101,8 +101,13 @@ The full march M0→M5:
   later rewrite or truncation of the file can reach, zero-copy for fs-verity
   files and a private copy otherwise.
 
-**836/836** assertions across 17 suites (meta · fp8 · names · stream · builder ·
-strict · ints · dtype · int4 · kernels · floats · protected · file-io ·
+- **1.11.0** — sharded checkpoints: a shard set binds a model's files with a
+  signed manifest of their SHA-256, and `tula_set_open` verifies it in parallel
+  (~1.2 GB/s at 8 threads, against 17 MB/s per signed file) and resolves names
+  across it.
+
+**923/923** assertions across 18 suites (meta · shards · fp8 · names · stream ·
+builder · strict · ints · dtype · int4 · kernels · floats · protected · file-io ·
 hardening · round-trip · index · sign) + a
 >3·10⁶-iteration guard-page fuzz harness (which also checks the streaming
 writers against the in-memory one), an end-to-end consumer, a real-model

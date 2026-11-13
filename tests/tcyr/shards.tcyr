@@ -1,0 +1,455 @@
+# tests/tcyr/shards.tcyr — shard sets (1.11.0, ADR 0014).
+#
+# A three-shard set is written (shards unsigned, the manifest signed) and opened:
+# every tensor resolves across the set with the right values and reader, a
+# .scale sidecar is found in another shard, the set's metadata reads, and the
+# manifest's digests are the files' SHA-256 (computed here with sigil's
+# one-shot sha256). Opening refuses each broken set with its code and shard: a
+# wrong or missing key, a rewritten, resized or missing shard, a shard that is
+# itself a manifest, a tensor name in two shards, a file that isn't a manifest.
+# The builder's rules, and strict's rules on crafted shard lists, are checked
+# one by one. Files go under build/test_shards/.
+include "src/lib.cyr"
+include "lib/assert.cyr"
+
+fn keys(seed_byte, sk, pk): i64 {
+    var seed = alloc(32);
+    var i = 0;
+    while (i < 32) { store8(seed + i, (i * 13 + seed_byte) & 0xFF); i = i + 1; }
+    ed25519_keypair(seed, sk, pk);
+    return 0;
+}
+
+# A strict-valid shard: `n` f64 [4] tensors named prefix + letter, values base + k,
+# and (when long) one long-named tensor too; written unsigned to path.
+fn write_shard(path, prefix, n, base, long): i64 {
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 4);
+    var i = 0;
+    while (i < n) {
+        var nm = alloc(64);
+        var pl = strlen(prefix);
+        memcpy(nm, prefix, pl);
+        store8(nm + pl, 97 + i);
+        store8(nm + pl + 1, 0);
+        var data = alloc(32);
+        var k = 0;
+        while (k < 4) { store64(data + k * 8, f64_from(base + i * 4 + k)); k = k + 1; }
+        tula_builder_add_long(b, nm, TULA_DT_F64, shape, 1, data, 32);
+        i = i + 1;
+    }
+    if (long == 1) {
+        var ln = "base_model.model.model.layers.31.self_attn.q_proj.lora_A.weight";
+        var ld = alloc(32);
+        store64(ld, f64_from(base + 1000));
+        tula_builder_add_long(b, ln, TULA_DT_F64, shape, 1, ld, 32);
+    }
+    return tula_builder_write_file(b, path);
+}
+
+fn hex_of(d, out): i64 {
+    var i = 0;
+    while (i < 32) {
+        var by = load8(d + i);
+        var hi = by >> 4;
+        var lo = by & 15;
+        var ch = 48 + hi;
+        if (hi >= 10) { ch = 87 + hi; }
+        var cl = 48 + lo;
+        if (lo >= 10) { cl = 87 + lo; }
+        store8(out + i * 2, ch);
+        store8(out + i * 2 + 1, cl);
+        i = i + 1;
+    }
+    store8(out + 64, 0);
+    return out;
+}
+
+# The three standard shards and their paths (an array of 3 cstrings).
+fn std_shards(): i64 {
+    var paths = alloc(24);
+    store64(paths, "build/test_shards/m-00002-of-00003.tula");
+    store64(paths + 8, "build/test_shards/m-00001-of-00003.tula");
+    store64(paths + 16, "build/test_shards/m-00003-of-00003.tula");
+    write_shard(load64(paths + 8), "layers.0.", 3, 0, 0);
+    write_shard(load64(paths), "layers.1.", 2, 100, 1);
+    # shard 3: a tensor and, separately, layers.0.a's scale sidecar
+    var b = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 2);
+    var sc = alloc(16);
+    store64(sc, f64_from(3));
+    store64(sc + 8, f64_from(5));
+    tula_builder_add_checked(b, "layers.0.a.scale", TULA_DT_F64, shape, 1, sc, 16);
+    tula_builder_add_checked(b, "lm_head", TULA_DT_F64, shape, 1, sc, 16);
+    tula_builder_set_meta(b, "shard.note", "shard-level metadata, not the set's");
+    tula_builder_write_file(b, load64(paths + 16));
+    return paths;
+}
+
+fn write_manifest(path, paths, n, sk): i64 {
+    var b = tula_builder_new();
+    tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM");
+    var rc = tula_builder_set_shards(b, paths, n, 2);
+    if (rc != 0) { return rc; }
+    return tula_builder_write_file_signed(b, path, sk);
+}
+
+fn test_write_and_open() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(7, sk, pk);
+    var paths = std_shards();
+    var mp = "build/test_shards/m.tula";
+    assert(write_manifest(mp, paths, 3, sk) > 0, "the manifest is written, signed");
+    var m = tula_read_file(mp);
+    assert(m != 0, "the manifest opens as an ordinary file");
+    assert_eq(tula_validate_strict(m, tula_total_len(m)), TULA_OK, "... strict-valid");
+    assert_eq(tula_count(m), 1, "... holding only its metadata table");
+    # the shard list: by name, each line the file's SHA-256 and size
+    var v = tula_meta_get(m, "tula.shards");
+    assert(v != 0, "tula.shards is set");
+    var ok = 1;
+    var want = alloc(512);
+    var w = 0;
+    var order = alloc(24);
+    store64(order, load64(paths + 8));
+    store64(order + 8, load64(paths));
+    store64(order + 16, load64(paths + 16));
+    var i = 0;
+    while (i < 3) {
+        var p = load64(order + i * 8);
+        var len = tula_file_len(p);
+        var buf = alloc(len);
+        tula_read_file_into(p, buf, len);
+        var d = alloc(32);
+        sha256(buf, len, d);
+        var hx = alloc(72);
+        hex_of(d, hx);
+        memcpy(want + w, hx, 64);
+        w = w + 64;
+        store8(want + w, 32);
+        w = w + 1;
+        var ds = alloc(24);
+        var dn = 0;
+        var t = len;
+        var tmp = alloc(24);
+        while (t > 0) { store8(tmp + dn, 48 + t % 10); t = t / 10; dn = dn + 1; }
+        var j = 0;
+        while (j < dn) { store8(want + w + j, load8(tmp + dn - 1 - j)); j = j + 1; }
+        w = w + dn;
+        store8(want + w, 32);
+        w = w + 1;
+        var nm = p + 18;                               # past "build/test_shards/"
+        memcpy(want + w, nm, strlen(nm));
+        w = w + strlen(nm);
+        store8(want + w, 10);
+        w = w + 1;
+        i = i + 1;
+    }
+    if (strlen(v) != w) { ok = 0; }
+    if (memeq(v, want, w) != 1) { ok = 0; }
+    assert_eq(ok, 1, "the list is in name order, each line '<sha256> <size> <name>' of its file");
+    var rc = alloc(16);
+    var set = tula_set_open(mp, pk, 0, 4, rc);
+    assert(set != 0, "tula_set_open opens the set");
+    assert_eq(load64(rc), TULA_OK, "... rc says TULA_OK");
+    assert_eq(tula_set_shards(set), 3, "three shards");
+    assert_eq(tula_set_tensors(set), 3 + 3 + 2, "eight tensors (without each shard's own tables)");
+    assert_eq(streq(tula_meta_get(tula_set_manifest(set), "hf.architecture"), "LlamaForCausalLM"), 1,
+      "the set's metadata reads from the manifest");
+    assert_eq(tula_meta_get(tula_set_manifest(set), "shard.note"), 0, "... and a shard's metadata isn't the set's");
+    var e = tula_set_find(set, "layers.1.b");
+    assert(e != 0, "a tensor in the second shard is found by name");
+    var r = tula_set_reader(set, e);
+    assert(r == tula_set_shard(set, 1), "... its reader is shard 1 (name order)");
+    assert_eq(load64(tula_entry_data(r, e) + 8), f64_from(105), "... with its values");
+    var el = tula_set_find(set, "base_model.model.model.layers.31.self_attn.q_proj.lora_A.weight");
+    assert(el != 0, "a long-named tensor is found by its full name");
+    assert_eq(load64(tula_entry_data(tula_set_reader(set, el), el)), f64_from(1100), "... with its values");
+    var ea = tula_set_find(set, "layers.0.a");
+    var es = tula_set_find_scale(set, ea, 2);
+    assert(es != 0, "layers.0.a's .scale sidecar is found in another shard");
+    assert(tula_set_reader(set, es) == tula_set_shard(set, 2), "... in shard 2");
+    assert_eq(tula_set_find_scale(set, ea, 3), 0, "... and refused when too short for 3 scales");
+    assert_eq(tula_set_find(set, "layers.9.a"), 0, "a missing name: 0");
+    assert_eq(tula_set_find(set, "__tula.meta__"), 0, "a shard's metadata table isn't a tensor of the set");
+    assert_eq(tula_set_reader(set, m + 64), 0, "an entry outside the set has no reader");
+    var all = 1;
+    var s = 0;
+    while (s < 3) {
+        var rs = tula_set_shard(set, s);
+        var c = tula_count(rs);
+        var k = 0;
+        while (k < c) {
+            var ek = tula_entry(rs, k);
+            var fname = tula_entry_full_name(rs, ek);
+            if (load8(fname) != 95) {
+                if (tula_set_find(set, fname) != ek) { all = 0; }
+            }
+            k = k + 1;
+        }
+        s = s + 1;
+    }
+    assert_eq(all, 1, "every tensor of every shard resolves to itself through the set");
+    assert_eq(tula_set_shard(set, 3), 0, "shard 3 is out of range: 0");
+    assert_eq(tula_set_close(set), 0, "tula_set_close releases it");
+    var s2 = tula_set_open(mp, 0, 0, 1, 0);
+    assert(s2 != 0, "with pk 0 the signature isn't required, and rc may be 0");
+    tula_set_close(s2);
+    var s3 = tula_set_open(mp, pk, TULA_SET_PROTECTED, 0, rc);
+    assert(s3 != 0, "TULA_SET_PROTECTED opens it too (private copies), at 0 threads");
+    write_shard(load64(paths), "layers.1.", 2, 555, 1);   # rewrite a shard in place, same size
+    var e3 = tula_set_find(s3, "layers.1.b");
+    assert_eq(load64(tula_entry_data(tula_set_reader(s3, e3), e3) + 8), f64_from(105),
+      "... and a rewrite of a shard afterwards doesn't reach it");
+    tula_set_close(s3);
+    write_shard(load64(paths), "layers.1.", 2, 100, 1);   # restore
+    return 0;
+}
+
+fn test_open_refusals() {
+    var sk = alloc(64);
+    var pk = alloc(32);
+    keys(7, sk, pk);
+    var sk2 = alloc(64);
+    var pk2 = alloc(32);
+    keys(9, sk2, pk2);
+    var paths = std_shards();
+    var mp = "build/test_shards/m.tula";
+    write_manifest(mp, paths, 3, sk);
+    var rc = alloc(16);
+    assert_eq(tula_set_open(mp, pk2, 0, 2, rc), 0, "another key: refused");
+    assert_eq(load64(rc), TULA_ERR_SIG, "... TULA_ERR_SIG");
+    assert_eq(load64(rc + 8), 0 - 1, "... at the manifest (-1)");
+    var b = tula_builder_new();
+    tula_builder_set_shards(b, paths, 3, 1);
+    tula_builder_write_file(b, "build/test_shards/unsigned.tula");
+    var up = "build/test_shards/unsigned.tula";
+    assert_eq(tula_set_open(up, pk, 0, 2, rc), 0, "an unsigned manifest with a key: refused");
+    assert_eq(load64(rc), TULA_ERR_UNSIGNED, "... TULA_ERR_UNSIGNED");
+    assert(tula_set_open(up, 0, 0, 2, rc) != 0, "... but opens with pk 0");
+    assert_eq(tula_set_open("build/test_shards/none.tula", pk, 0, 2, rc), 0, "a missing manifest: refused");
+    assert(load64(rc) < 0, "... a negative errno");
+    assert_eq(tula_set_open(load64(paths), 0, 0, 2, rc), 0, "a shard given as the manifest: refused");
+    assert_eq(load64(rc), TULA_ERR_SHARDS, "... TULA_ERR_SHARDS");
+    # a shard rewritten with other values, same size: its digest no longer matches
+    write_shard(load64(paths), "layers.1.", 2, 777, 1);
+    assert_eq(tula_set_open(mp, pk, 0, 2, rc), 0, "a rewritten shard: refused");
+    assert_eq(load64(rc), TULA_ERR_SHARDS, "... TULA_ERR_SHARDS");
+    assert_eq(load64(rc + 8), 1, "... at shard 1 (m-00002, in name order)");
+    # a shard of another size
+    write_shard(load64(paths), "layers.1.", 3, 100, 1);
+    assert_eq(tula_set_open(mp, pk, 0, 2, rc), 0, "a resized shard: refused");
+    assert_eq(load64(rc), TULA_ERR_SHARDS, "... TULA_ERR_SHARDS");
+    assert_eq(load64(rc + 8), 1, "... at shard 1");
+    # a missing shard
+    xunlink(load64(paths));
+    assert_eq(tula_set_open(mp, pk, 0, 2, rc), 0, "a missing shard: refused");
+    assert(load64(rc) < 0, "... a negative errno");
+    assert_eq(load64(rc + 8), 1, "... at shard 1");
+    # two shards with a tensor of the same name
+    write_shard(load64(paths), "layers.0.", 2, 100, 0);
+    write_manifest(mp, paths, 3, sk);
+    assert_eq(tula_set_open(mp, pk, 0, 2, rc), 0, "a name in two shards: refused");
+    assert_eq(load64(rc), TULA_ERR_DUP_NAME, "... TULA_ERR_DUP_NAME");
+    # a shard that is a manifest: made by hand, since the builder refuses it
+    std_shards();
+    write_manifest(mp, paths, 3, sk);
+    var inner = tula_builder_new();
+    tula_builder_set_shards(inner, paths, 1, 1);
+    tula_builder_write_file(inner, "build/test_shards/m-00000-inner.tula");
+    var four = alloc(32);
+    store64(four, load64(paths));
+    store64(four + 8, load64(paths + 8));
+    store64(four + 16, load64(paths + 16));
+    store64(four + 24, "build/test_shards/m-00000-inner.tula");
+    var mb = tula_builder_new();
+    assert_eq(tula_builder_set_shards(mb, four, 4, 2), TULA_ERR_SHARDS, "the builder refuses a manifest as a shard");
+    var lines = alloc(4096);
+    var v3 = tula_meta_get(tula_read_file(mp), "tula.shards");
+    var il = tula_file_len("build/test_shards/m-00000-inner.tula");
+    var ib = alloc(il);
+    tula_read_file_into("build/test_shards/m-00000-inner.tula", ib, il);
+    var d = alloc(32);
+    sha256(ib, il, d);
+    var w = 0;
+    hex_of(d, lines);
+    w = 64;
+    store8(lines + w, 32);
+    w = w + 1;
+    var tmp = alloc(24);
+    var dn = 0;
+    var t = il;
+    while (t > 0) { store8(tmp + dn, 48 + t % 10); t = t / 10; dn = dn + 1; }
+    var j = 0;
+    while (j < dn) { store8(lines + w + j, load8(tmp + dn - 1 - j)); j = j + 1; }
+    w = w + dn;
+    var tail = " m-00000-inner.tula\n";
+    memcpy(lines + w, tail, strlen(tail));
+    w = w + strlen(tail);
+    memcpy(lines + w, v3, strlen(v3));
+    w = w + strlen(v3);
+    store8(lines + w, 0);
+    var crafted = tula_builder_new();
+    assert_eq(_tula_builder_put_meta(crafted, "tula.shards", 11, lines, w), 0, "a crafted list naming it");
+    tula_builder_write_file_signed(crafted, mp, sk);
+    assert_eq(tula_set_open(mp, pk, 0, 2, rc), 0, "a set with a manifest among its shards: refused");
+    assert_eq(load64(rc), TULA_ERR_SHARDS, "... TULA_ERR_SHARDS");
+    assert_eq(load64(rc + 8), 0, "... at that shard (first by name)");
+    return 0;
+}
+
+fn test_builder_rules() {
+    var paths = std_shards();
+    var b = tula_builder_new();
+    assert_eq(tula_builder_set_shards(b, paths, 0, 1), TULA_ERR_SHARDS, "no shards: TULA_ERR_SHARDS");
+    assert_eq(tula_builder_set_shards(b, paths, TULA_SHARDS_MAX + 1, 1), TULA_ERR_SHARDS, "past TULA_SHARDS_MAX");
+    var shape = alloc(8);
+    store64(shape, 1);
+    var data = alloc(8);
+    var bt = tula_builder_new();
+    tula_builder_add(bt, "w", TULA_DT_F64, shape, 1, data, 8);
+    assert_eq(tula_builder_set_shards(bt, paths, 3, 1), TULA_ERR_SHARDS, "a builder holding a tensor refuses shards");
+    assert_eq(tula_builder_set_shards(b, paths, 3, 1), 0, "three shards are listed");
+    var ra = tula_builder_add(b, "w", TULA_DT_F64, shape, 1, data, 8);
+    assert_eq(ra, TULA_ERR_SHARDS, "the manifest refuses tula_builder_add");
+    assert_eq(tula_builder_add_checked(b, "w", TULA_DT_F64, shape, 1, data, 8), TULA_ERR_SHARDS, "... add_checked");
+    assert_eq(tula_builder_add_long(b, "w", TULA_DT_F64, shape, 1, data, 8), TULA_ERR_SHARDS, "... add_long");
+    assert_eq(tula_builder_set_shards(b, paths, 2, 1), 0, "calling it again replaces the list");
+    var two = tula_builder_finish(b);
+    var v = tula_meta_get(two, "tula.shards");
+    var lines = 0;
+    var i = 0;
+    while (load8(v + i) != 0) {
+        if (load8(v + i) == 10) { lines = lines + 1; }
+        i = i + 1;
+    }
+    assert_eq(lines, 2, "... two lines now");
+    var dup = alloc(16);
+    store64(dup, load64(paths));
+    store64(dup + 8, load64(paths));
+    var b2 = tula_builder_new();
+    assert_eq(tula_builder_set_shards(b2, dup, 2, 1), TULA_ERR_SHARDS, "the same file name twice: TULA_ERR_SHARDS");
+    var bad = alloc(8);
+    store64(bad, "build/test_shards/none.tula");
+    assert(tula_builder_set_shards(b2, bad, 1, 1) < 0, "a missing shard: a negative errno");
+    var junk = alloc(80);
+    memset(junk, 46, 80);
+    tula_write_file("build/test_shards/garbage.tula", junk, 70);
+    store64(bad, "build/test_shards/garbage.tula");
+    assert_eq(tula_builder_set_shards(b2, bad, 1, 1), TULA_ERR_TRUNCATED, "not a tula file: TULA_ERR_TRUNCATED");
+    # a shard that opens but isn't strict-valid: a non-zero padding byte
+    var bs = tula_builder_new();
+    var d5 = alloc(8);
+    store8(d5, 1);
+    tula_builder_add(bs, "u", TULA_DT_U8, shape, 1, d5, 1);
+    var sb = tula_builder_finish(bs);
+    store8(sb + load64(sb + 32) + 3, 9);
+    tula_write_file("build/test_shards/padding.tula", sb, tula_total_len(sb));
+    store64(bad, "build/test_shards/padding.tula");
+    var rl = tula_builder_set_shards(b2, bad, 1, 1);
+    assert_eq(rl, TULA_ERR_LAYOUT, "a shard that isn't strict-valid: its strict code");
+    return 0;
+}
+
+# Strict's rules on a manifest's list, through crafted values.
+fn strict_of(value): i64 {
+    var b = tula_builder_new();
+    _tula_builder_put_meta(b, "tula.shards", 11, value, strlen(value));
+    var buf = tula_builder_finish(b);
+    return tula_validate_strict(buf, tula_total_len(buf));
+}
+
+fn cat2(a, b): i64 {
+    var la = strlen(a);
+    var lb = strlen(b);
+    var p = alloc(la + lb + 1);
+    memcpy(p, a, la);
+    memcpy(p + la, b, lb);
+    store8(p + la + lb, 0);
+    return p;
+}
+
+fn test_strict_rules() {
+    var h = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var g = cat2(cat2(h, " 128 a.tula\n"), cat2(h, " 4096 b.tula\n"));
+    assert_eq(strict_of(g), TULA_OK, "a canonical list: TULA_OK");
+    var hu = "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq(strict_of(cat2(hu, " 128 a.tula\n")), TULA_ERR_SHARDS, "uppercase hex: TULA_ERR_SHARDS");
+    var h63 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde";
+    assert_eq(strict_of(cat2(h63, " 128 a.tula\n")), TULA_ERR_SHARDS, "63 hex digits");
+    assert_eq(strict_of(cat2(h, " 0128 a.tula\n")), TULA_ERR_SHARDS, "a leading zero in the size");
+    assert_eq(strict_of(cat2(h, " 63 a.tula\n")), TULA_ERR_SHARDS, "a size below the header");
+    assert_eq(strict_of(cat2(h, " 99999999999999 a.tula\n")), TULA_ERR_SHARDS, "a size past the cap");
+    var ba = cat2(cat2(h, " 128 b.tula\n"), cat2(h, " 128 a.tula\n"));
+    assert_eq(strict_of(ba), TULA_ERR_SHARDS, "names out of order");
+    var aa = cat2(cat2(h, " 128 a.tula\n"), cat2(h, " 128 a.tula\n"));
+    assert_eq(strict_of(aa), TULA_ERR_SHARDS, "a name twice");
+    assert_eq(strict_of(cat2(h, " 128 d/a.tula\n")), TULA_ERR_SHARDS, "a '/' in a name");
+    assert_eq(strict_of(cat2(h, " 128 ..\n")), TULA_ERR_SHARDS, "the name ..");
+    assert_eq(strict_of(cat2(h, " 128 a b\n")), TULA_ERR_SHARDS, "a space in a name");
+    assert_eq(strict_of(cat2(h, " 128 a.tula")), TULA_ERR_SHARDS, "no newline after the last line");
+    assert_eq(strict_of(cat2(h, "  128 a.tula\n")), TULA_ERR_SHARDS, "two spaces");
+    assert_eq(strict_of(""), TULA_ERR_SHARDS, "an empty list");
+    # past TULA_SHARDS_MAX lines
+    var many = alloc((TULA_SHARDS_MAX + 1) * 80 + 1);
+    var w = 0;
+    var i = 0;
+    while (i <= TULA_SHARDS_MAX) {
+        memcpy(many + w, h, 64);
+        w = w + 64;
+        memcpy(many + w, " 128 s", 6);
+        w = w + 6;
+        var k = 0;
+        while (k < 5) {   # five digits, so the names sort as numbers
+            store8(many + w + 4 - k, 48 + ((i / (pow10(k))) % 10));
+            k = k + 1;
+        }
+        w = w + 5;
+        store8(many + w, 10);
+        w = w + 1;
+        i = i + 1;
+    }
+    store8(many + w, 0);
+    assert_eq(strict_of(many), TULA_ERR_SHARDS, "4,097 shards: past TULA_SHARDS_MAX");
+    store8(many + w - 76, 0);   # the same list without its last line
+    assert_eq(strict_of(many), TULA_OK, "4,096 shards: TULA_OK");
+    # a manifest that also holds a tensor
+    var bt = tula_builder_new();
+    var shape = alloc(8);
+    store64(shape, 1);
+    var data = alloc(8);
+    tula_builder_add(bt, "w", TULA_DT_F64, shape, 1, data, 8);
+    _tula_builder_put_meta(bt, "tula.shards", 11, g, strlen(g));
+    var tb = tula_builder_finish(bt);
+    var rt = tula_validate_strict(tb, tula_total_len(tb));
+    assert_eq(rt, TULA_ERR_SHARDS, "a manifest with a tensor: TULA_ERR_SHARDS");
+    assert_eq(tula_validate(tb, tula_total_len(tb)), TULA_OK, "... which plain validate allows");
+    var bm = tula_builder_new();
+    tula_builder_set_meta(bm, "x.tula.shards", "not reserved");
+    var mb = tula_builder_finish(bm);
+    assert_eq(tula_validate_strict(mb, tula_total_len(mb)), TULA_OK, "other keys are untouched");
+    return 0;
+}
+
+fn pow10(k): i64 {
+    var v = 1;
+    var i = 0;
+    while (i < k) { v = v * 10; i = i + 1; }
+    return v;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sys_mkdir("build/test_shards", 0x1ED);
+    test_write_and_open();
+    test_open_refusals();
+    test_builder_rules();
+    test_strict_rules();
+    return assert_summary();
+}
+
+var rc = main();
+syscall(60, rc);

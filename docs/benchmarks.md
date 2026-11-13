@@ -244,6 +244,23 @@ On an fs-verity file, the protected open costs what `tula_open_mmap` does, plus
 one `ioctl`. The kernel then verifies each page against the file's Merkle tree
 the first time it's read.
 
+### 1.11.0: shard sets
+
+`make bench`: 8 shards of 16 MiB (one f64 tensor each), and a signed manifest.
+
+| Op | 1.11.0 | Notes |
+|---|---:|---|
+| `tula_builder_set_shards` + sign the manifest, 8 threads | 183 ms · 734 MB/s | maps, strict-validates and SHA-256s each shard |
+| `tula_set_open`, 1 thread | 453 ms · 296 MB/s | the manifest's signature, then every shard's SHA-256 and strict checks |
+| `tula_set_open`, 8 threads | 116 ms · 1,156 MB/s | one shard per thread |
+| `tula_verify_required`, one signed 16 MiB file | 951 ms · 17 MB/s | for comparison: Ed25519 hashes it through sigil's SHA-512 |
+
+So a set verifies 17× faster per byte on one thread, and ~68× on eight. In
+`make realmodels`, Llama-2-70B as 15 shards (33.8 MB, dims ÷ 64) opens in about
+40 ms with 4 threads, and resolves each of its 723 tensors in ~0.4 µs. sigil's
+SHA-256 has a SHA-NI path, which this machine (Zen 3) has. A CPU without it
+wasn't measured.
+
 ### Added in 1.5.0
 
 | Op | 1.5.0 | Notes |

@@ -127,6 +127,7 @@ are well-formed UTF-8 text, no NUL, ≤ 16 MiB. A table holds ≤ 4,096 pairs an
 | | | | `TULA_ERR_NAMES` | 17 |
 | | | | `TULA_ERR_META` | 18 |
 | | | | `TULA_ERR_VALUE` | 19 |
+| | | | `TULA_ERR_SHARDS` | 20 |
 | | | | `TULA_ERR_OTHER` | 99 |
 
 Codes 13–16 are new in 1.2.0, returned by the checked add and the strict
@@ -135,7 +136,9 @@ validator). 18 is new in 1.6.0 (a bad metadata key or value from the writer, or
 a malformed metadata table from the strict validator). 19 is new in 1.7.0 (a
 payload value its dtype doesn't allow, from the strict validator: a BOOL byte
 other than 0 or 1, and from 1.8.0 an odd-length INT4 tensor's last high nibble
-that isn't zero).
+that isn't zero). 20 is new in 1.11.0. It reports a malformed shard set: a
+manifest whose shard list isn't canonical (strict), a builder that mixes shards
+and tensors, or a shard its manifest doesn't match.
 
 ---
 
@@ -526,6 +529,73 @@ scan's answer on every input). Numbers are in [`benchmarks.md`](benchmarks.md).
 
 ---
 
+## Shard sets — `src/shard.cyr` *(1.11.0, ADR 0014)*
+
+A model in several files. The **manifest** is an ordinary tula file with no
+tensors, signed. Its reserved metadata key `tula.shards` lists the **shards**,
+one line each: `<sha256> <size> <name>\n`.
+- 64 lowercase hex digits of the SHA-256 over the shard's first `size` bytes;
+- the shard's total length, in decimal;
+- its file name in the manifest's directory: 1–255 bytes of printable ASCII or
+  UTF-8, with no `/`, `\` or space, and not `.` or `..`.
+
+Lines are in strictly increasing byte order of name, with 1 to
+`TULA_SHARDS_MAX` (4,096) shards. Signing the manifest signs every digest, so
+the shards need no signatures of their own. A set verifies with one Ed25519
+check over a small file and a SHA-256 of each shard, run in parallel: about
+1.2 GB/s at 8 threads here, against 17 MB/s for one signed file. Shards are
+ordinary strict-valid tula files, none of them a manifest, and tensor names are
+unique across the set. `tula_validate_strict` returns `TULA_ERR_SHARDS` for a
+manifest whose list isn't canonical, or that holds any entry but its metadata
+table.
+
+**Write:**
+- `fn tula_builder_set_shards(b, paths, n, nthreads) -> 0 | TULA_ERR_* | <0` —
+  make `b` the manifest for the `n` shard files at `paths` (an array of `n`
+  cstrings). Each shard is opened mapped, strict-validated and hashed, on up to
+  `nthreads` threads, then listed by file name (each path's part after its last
+  `/`). Errors leave the builder unchanged:
+  - a negative errno: a shard can't be opened;
+  - a validate or strict code: a shard isn't strict-valid;
+  - `TULA_ERR_SHARDS`: `n` outside 1..4,096, the builder holds tensors, a shard
+    is a manifest, a file name isn't allowed, or two shards share a name;
+  - `TULA_ERR_OOM`.
+
+  Calling it again replaces the list. A manifest builder refuses tensors: every
+  add returns `TULA_ERR_SHARDS`. Set the set's own metadata on it with
+  `tula_builder_set_meta`. Write it into the shards' directory, signed
+  (`tula_builder_finish_signed` or `tula_builder_write_file_signed`).
+
+**Read:**
+- `fn tula_set_open(path, pk, flags, nthreads, rc) -> set | 0`.
+  - **The manifest** is read through `tula_open_protected` and strict-validated.
+    With `pk` its signature is required; with `pk = 0` it isn't checked, and the
+    digests then only catch corruption.
+  - **Each shard** is mapped (`flags = 0`), or opened through
+    `tula_open_protected` with `TULA_SET_PROTECTED` (1).
+  - **The checks:** every size and SHA-256, on up to `nthreads` threads; every
+    shard strict-valid; no shard a manifest; no tensor name in two shards.
+  - **Failure:** `rc` (two words, or 0) gets the code and the shard it concerns
+    (`-1` for the manifest). The code is a negative errno; a validate, strict or
+    `tula_verify_required` code; `TULA_ERR_SHARDS` (not a manifest, a shard's
+    size or digest, a nested manifest); `TULA_ERR_DUP_NAME`; or `TULA_ERR_OOM`.
+  - **Trust:** a mapped set, like `tula_open_mmap`, holds only while nobody
+    rewrites its files.
+- `fn tula_set_find(set, name) -> e | 0` — any tensor of the set by its full
+  name, O(log n).
+- `fn tula_set_reader(set, e) -> r | 0` — the shard holding `e`, for its
+  accessors: `tula_entry_data(tula_set_reader(set, e), e)`.
+- `fn tula_set_find_scale(set, e, need) -> e | 0` — `e`'s `.scale` sidecar in
+  any shard, checked as `tula_find_scale` checks it.
+- `fn tula_set_shards(set)`, `fn tula_set_shard(set, i) -> r | 0` (in name
+  order), `fn tula_set_tensors(set)` (across the set, without each shard's own
+  names and metadata tables), `fn tula_set_manifest(set) -> r` (the set's
+  metadata: `tula_meta_get(tula_set_manifest(set), key)`).
+- `fn tula_set_close(set)` — release every shard, the manifest and the set
+  (`0` is a no-op).
+
+---
+
 ## Minimal consumer flow
 
 ```
@@ -548,6 +618,8 @@ arch = tula_meta_get(r, "hf.architecture")    # 1.6.0; 0 if absent
 if (tula_entry_payload_ok(e) == 0) { ...reject... }
 p = tula_entry_data(r, e)               # in-bounds, zero-copy
 # a quantized tensor: se = tula_find_scale(r, e, need); if (se == 0) { ...reject... }
+# a sharded model (1.11.0): set = tula_set_open("model.tula", pk, 0, 8, rc);
+#   e = tula_set_find(set, name); r = tula_set_reader(set, e); ...; tula_set_close(set)
 # to f64 on 8 threads (1.9.0); -1 for a dtype with no unpack helper:
 #   n = tula_entry_nelems(e)
 #   tula_unpack_par(tula_entry_dtype(e), p, n, tula_entry_data(r, se), block, dst, 8)
@@ -556,7 +628,7 @@ p = tula_entry_data(r, e)               # in-bounds, zero-copy
 `tula_validate_strict` and `tula_verify_required` are 1.2.0; `tula_find_name`
 and `tula_builder_add_long` are 1.3.0; the streaming writers are 1.4.0; the name
 index is 1.5.0; metadata is 1.6.0; `tula_unpack_par` is 1.9.0;
-`tula_open_protected` is 1.10.0. On 1.0–1.1, use `tula_verify(r, pk) !=
+`tula_open_protected` is 1.10.0; shard sets are 1.11.0. On 1.0–1.1, use `tula_verify(r, pk) !=
 TULA_SIG_OK` and check the consistency rules yourself.
 
 A complete runnable example is in [`examples/consumer.cyr`](../examples/consumer.cyr).

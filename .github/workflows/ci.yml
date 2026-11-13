@@ -101,7 +101,7 @@ jobs:
           CYRIUS_DCE=1 cyrius build examples/consumer.cyr build/tula_consumer
           ./build/tula_consumer
 
-      - name: Real-model inventories (1.5.0 gate — GPT-2, Llama-2-7B, Mixtral, LoRA, QLoRA, GPTQ, FP8, Q4)
+      - name: Real-model inventories (1.5.0 gate — GPT-2, Llama-2-7B, Mixtral, LoRA, QLoRA, GPTQ, FP8, Q4, 70B shards)
         # Real tensor names, ranks, counts and dtypes; dims divided by 64. Each is
         # written signed, read back, strict-validated, verified, and every tensor
         # resolved through the name index and tula_find_name.

@@ -63,7 +63,9 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
     (ADR 0008);
   - the raw integer encodings and BOOL's 0/1 rule (ADR 0009);
   - the FP8 encodings and conversion semantics (ADR 0010), and INT4's nibble
-    order, unused-nibble rule and quantization rule (ADR 0011).
+    order, unused-nibble rule and quantization rule (ADR 0011);
+  - shard sets: a tensor-less manifest whose `tula.shards` key lists each
+    shard's SHA-256, size and name (ADR 0014).
 
   A new convention (a reserved tensor, a naming rule) is a MINOR with its own
   ADR, and must stay readable by every older 1.x reader.
@@ -72,23 +74,11 @@ a format-version bump (`TULA_VERSION`) + reader back-compat consideration.
 
 ## How the lines below are ordered
 
-Shipped lines (through 1.10.0) aren't listed; a released line takes patches
+Shipped lines (through 1.11.0) aren't listed; a released line takes patches
 only: fixes, with no new function, dtype or convention. The lines below are
 ordered by how soon a consumer is likely to need them. Each starts when its gate
 is met (an importer's need, a decision), not on a date, and new dtype codes start
 at 15.
-
-## 1.11.x — sharded checkpoints
-
-**Goal:** a model too big for one file. A 70B+ checkpoint ships as many files
-plus an index (safetensors' `model.safetensors.index.json`).
-
-- **Decide the scope first (ADR).** It is either a codec convention, a signed
-  shard manifest naming each file and its digest, or the control-plane store's
-  job (ADR 0001's line). If it's the store's, the ADR closes this line.
-- If it's the codec's, then the manifest convention (a MINOR, readable by every
-  older 1.x reader as an ordinary tensor or file), its strict rules, and a
-  `make realmodels` inventory of a sharded 70B layout.
 
 ## 1.12.x — the remaining dtypes
 
@@ -122,6 +112,14 @@ snapshot. Today it maps fs-verity files and copies anything else (ADR 0013).
   this machine nor CI has such a filesystem today.
 
 ## 1.x.x — later / unscheduled
+
+- **Shard-set follow-ups** (ADR 0014), when an importer or loader asks:
+  - splitting one builder into shards (`tula_builder_write_sharded`, by a byte
+    budget);
+  - opening part of a set, verifying only the shards a loader reads (a
+    pipeline-parallel rank's layers).
+
+  1.11.0's `tula_set_open` checks the whole set.
 
 - **Size caps**: `TULA_READ_MAX_BYTES` is 1 TiB. STABILITY allows raising it in a
   MINOR, so do that when a real model needs it (≈ 500B parameters in BF16).

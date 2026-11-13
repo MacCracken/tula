@@ -68,13 +68,21 @@ scanning the codebook, and the F16 / BF16 unpacks read a per-call table from
 **1.10.0 — a protected open** (ADR 0013, audit D-7). `tula_open_protected` maps an fs-verity
 file zero-copy and reads any other file into a private copy, so no later
 rewrite or truncation reaches the validated reader.
+**1.11.0** (in CHANGELOG `[Unreleased]`, not yet cut — VERSION still reads 1.10.0):
+sharded checkpoints (ADR 0014). A shard set is ordinary tula files plus a
+signed, tensor-less manifest whose `tula.shards` key lists each shard's
+SHA-256, size and name. `tula_builder_set_shards` writes one; `tula_set_open`
+verifies one (one signature, then the shards' SHA-256 in parallel, ~1.2 GB/s at
+8 threads) and `tula_set_find` resolves names across it. `TULA_ERR_SHARDS` = 20.
 Post-1.0 work
 accretes under a fresh CHANGELOG `[Unreleased]` and is additive-only (SemVer);
 the maintainer bumps VERSION + renames the section + tags at each subsequent cut.
 
-## Tests, fuzz, gates (1.10.0)
+## Tests, fuzz, gates (1.11.0, unreleased)
 
-**836 assertions** across 17 suites, all green: `meta.tcyr` 98, `fp8.tcyr` 81,
+**923 assertions** across 18 suites, all green: `meta.tcyr` 98, `shards.tcyr` 87
+(1.11.0: a written and opened set, every refusal with its code and shard, the
+builder's and strict's rules), `fp8.tcyr` 81,
 `names.tcyr` 77, `stream.tcyr` 68, `builder.tcyr` 67, `strict.tcyr` 67,
 `ints.tcyr` 61, `dtype.tcyr` 50, `int4.tcyr` 48, `kernels.tcyr` 44 (the table
 and inline paths, `tula_unpack_par` against the serial helpers, and 1.9.1's
@@ -93,7 +101,9 @@ zero-copy branch, the verity check), `fileio.tcyr` 30,
   `g_idx`, F16 `scales`; 963 tensors), and (1.8.0) Llama-2-7B as an FP8 E4M3
   import (291) and as a Q4_0-style INT4 import with `.scale` sidecars (517), with
   real names, ranks, counts and dtypes, dims ÷ 64. Each is written signed, read, strict-validated,
-  verified and resolved by index.
+  verified and resolved by index. (1.11.0) Llama-2-70B, BF16, 723 tensors, as a
+  shard set: 15 unsigned shards and a signed manifest, opened with
+  `tula_set_open` and resolved through `tula_set_find`.
 - `make bigfile` (CI): a 2.36 GB file, one tensor over INT_MAX bytes, streamed,
   mapped, strict-validated, read into a caller buffer, and (1.6.2) written back
   out from it by `tula_write_file_atomic` and `tula_write_file`, each copy
@@ -130,7 +140,11 @@ zero-copy branch, the verity check), `fileio.tcyr` 30,
     bytes, dtype fields and shapes;
   - phase J (1.9.0): 400 parallel unpacks (nine dtypes, up to five chunks,
     odd blocks, 1–9 threads) against the serial helpers, payload and scales
-    each ending at a guard page.
+    each ending at a guard page;
+  - phase K (1.11.0): 200,000 mutations of a manifest's shard list, strict's
+    verdict matched against the fuzzer's own reading (18,921 accepted, 114,006
+    refused), and 300 sets on disk with one shard corrupted or cut, every one
+    refused by `tula_set_open`.
 
   `fmt` / `lint` / `vet` / `deny` clean; `cyrius doc --check src/*.cyr`:
   0 undocumented.
@@ -171,10 +185,10 @@ and tula itself makes no bayan calls. It shrinks when sigil's open issue
 
 ## Next
 
-Next: confirm CI's fs-verity step runs rather than skips (its first real run
-of the zero-copy branch); 1.10.x patches only for fixes. The open lines are in
-the [roadmap](roadmap.md): 1.11.x sharded checkpoints (an ADR on scope first),
-1.12.x the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
-protection for unsealed files, then 1.x.x and the v2 candidates. Each waits on
+Next: cut 1.11.0 (shard sets, in `[Unreleased]`); confirm CI's fs-verity step
+runs rather than skips. The open lines are in the [roadmap](roadmap.md): 1.12.x
+the remaining dtypes, 1.13.x throughput follow-ups, 1.14.x zero-copy
+protection for unsealed files, then 1.x.x (shard-set follow-ups among them) and
+the v2 candidates. Each waits on
 its gate (an importer's need or a decision). Cross-repo: anukulana's migration
 (the real-weights gate) and sigil's SHA-512 throughput.

@@ -259,6 +259,9 @@ fn _tula_strict_unique(buf, count): i64 {
 #   TULA_ERR_VALUE    — (1.7.0) a payload value its dtype doesn't allow: a BOOL
 #                       byte other than 0 or 1 (ADR 0009); (1.8.0) an odd-length
 #                       INT4 tensor whose last high nibble isn't zero (ADR 0011);
+#   TULA_ERR_SHARDS   — (1.11.0) the file is a shard-set manifest (its metadata
+#                       holds tula.shards) whose shard list isn't canonical, or
+#                       which holds an entry besides its metadata table (ADR 0014);
 #   TULA_ERR_DUP_NAME — two tensors share a name (for long names: a key);
 #   TULA_ERR_OOM      — no memory for the duplicate check (> 512 tensors).
 # Structure only, like tula_validate: authenticity is tula_verify_required. To
@@ -284,6 +287,8 @@ fn tula_validate_strict(buf, len): i64 {
     rc = _tula_strict_names(buf, count);
     if (rc != TULA_OK) { return rc; }
     rc = _tula_strict_meta(buf);
+    if (rc != TULA_OK) { return rc; }
+    rc = _tula_strict_shards(buf, count);
     if (rc != TULA_OK) { return rc; }
     return _tula_strict_unique(buf, count);
 }

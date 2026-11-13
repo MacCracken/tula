@@ -7,8 +7,103 @@ All notable changes to `tula` are documented here. Format follows
 
 ## [Unreleased]
 
+**Sharded checkpoints** (1.11.0). An additive MINOR with no format change
+(ADR 0014). A model in several files is a **shard set**: ordinary tula files,
+needing no signatures, plus a signed **manifest** listing each one's SHA-256,
+size and name. The set is bound, so a swapped, missing or repeated shard fails.
+It verifies by one Ed25519 check over a small file and a SHA-256 per shard in
+parallel. That runs at 296 MB/s on one thread and 1,156 MB/s on eight here,
+against 17 MB/s for one signed file through sigil's SHA-512: about 90 s, not
+2.2 hours, for a 140 GB model. Every existing call is unchanged. The ADR
+settles the roadmap's scope question for the codec: binding a model's bytes is
+the signed header's job. The store keeps transport, placement and dedup.
+
+### Added
+
+- **The manifest convention** (ADR 0014): an ordinary v1 file with no tensors.
+  - The reserved metadata key `tula.shards` lists the shards, one line each:
+    `<sha256> <size> <name>\n`.
+  - The digest is lowercase hex over the shard's first `size` bytes, and `size`
+    is its total length.
+  - The name is a file in the manifest's directory: printable ASCII or UTF-8,
+    no `/`, `\` or space, not `.` or `..`.
+  - Lines are in strictly increasing order of name, so names are unique by
+    construction and checked in one pass. 1 to `TULA_SHARDS_MAX` (4,096)
+    shards.
+  - Other metadata sits beside it as the set's.
+  - Readers since 1.6 open a manifest as an empty file with metadata.
+- **`tula_builder_set_shards(b, paths, n, nthreads)`** opens each shard,
+  strict-validates it, hashes it in parallel, and lists them by file name. A
+  manifest builder refuses tensors (every add returns `TULA_ERR_SHARDS`), and a
+  builder holding tensors refuses shards.
+- **`tula_set_open(path, pk, flags, nthreads, rc)`** does these steps:
+  - reads the manifest through `tula_open_protected` and strict-validates it;
+  - requires its signature when `pk` is given;
+  - maps each shard, or opens it protected with `TULA_SET_PROTECTED`;
+  - checks every size and SHA-256 in parallel, strict-validates every shard,
+    and refuses nested manifests and tensor names that appear in two shards.
+
+  On failure `rc` gets the code and the shard it concerns.
+- **Lookups and the rest:**
+  - `tula_set_find`: any tensor by full name, O(log n) over the whole set;
+  - `tula_set_reader`: the shard holding an entry;
+  - `tula_set_find_scale`: a `.scale` sidecar in any shard;
+  - `tula_set_shards` / `tula_set_shard`, `tula_set_tensors`,
+    `tula_set_manifest` (the set's metadata), and `tula_set_close`.
+- **`TULA_ERR_SHARDS` (20).** Strict returns it for a manifest whose list isn't
+  canonical, or that holds an entry besides its metadata table. The writer and
+  `tula_set_open` return it as above.
+- **ADR 0014** records why the codec owns this, and what was rejected:
+  - per-shard membership keys, where every shard still costs SHA-512;
+  - a JSON index, unsigned and a second parser;
+  - a binary table tensor;
+  - the manifest inside shard 0;
+  - SHA-512 digests.
+
+  It also defers splitting one builder into shards automatically, and partial
+  opens.
+
 ### Changed
 
+- **`tests/tcyr/shards.tcyr`** (new, 87 assertions):
+  - a three-shard set with long names, a `.scale` sidecar in another shard than
+    its tensor, shard-level metadata, and the manifest's digests checked
+    against sigil's one-shot SHA-256 of each file;
+  - every tensor resolving through the set to itself, and the protected mode
+    surviving a shard rewritten in place;
+  - every refusal at open, with its code and shard: another key, an unsigned
+    manifest, a missing manifest, a shard given as the manifest, a rewritten,
+    resized or missing shard, a tensor name in two shards, a manifest among the
+    shards;
+  - the builder's rules;
+  - strict's rules on crafted lists: case, digit counts, leading zeros, the size
+    bounds, order, repeats, `/`, `..`, spaces, the final newline, empty, 4,097
+    against 4,096 lines, a manifest with a tensor.
+
+  Five seeded bugs are each caught: no digest check, no duplicate-name check, no
+  nesting check, uppercase hex accepted, and a shard lookup that misses the
+  first shard.
+- **The fuzzer's phase K:**
+  - 200,000 mutations of a manifest, mostly inside its shard list. Strict's
+    verdict must match the fuzzer's own line-by-line reading: 18,921 accepted,
+    114,006 refused, all agreeing.
+  - 300 corrupted sets on disk (a byte of a shard changed, or a shard cut short,
+    mapped or protected, 1–4 threads), every one refused.
+  - A strict validator seeded to accept uppercase hex fails phase K 9,168
+    times.
+- **`make realmodels`** gains a ninth inventory: Llama-2-70B in BF16 (723
+  tensors, grouped-query attention). It is written as 15 unsigned shards as
+  Hugging Face ships it, plus a signed manifest, opened with `tula_set_open`,
+  and every tensor is checked through `tula_set_find`.
+- **Bench**: `set_shards`, `set_open` at 1 and 8 threads, and one signed file's
+  verify for comparison (`docs/benchmarks.md`).
+- **The protected open's internals** now report why a file failed
+  (`_tula_open_fd_coded`), so `tula_set_open` can say which file and why.
+  `tula_open_protected` is unchanged.
+- **`tula_builder_set_meta`'s storing step** is split out, so tula can set its
+  reserved key. The public call's checks are unchanged.
+- **Roadmap**: 1.11.x is done. Its follow-ups (automatic splitting, partial
+  opens) are under 1.x.x.
 - **Roadmap cleaned up.** The shipped lines (1.6.x – 1.9.x) are gone; what
   shipped is here. Their open items are regrouped:
   - 1.11.x sharded checkpoints (an ADR on scope first);

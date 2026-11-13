@@ -212,22 +212,50 @@ fn tula_open_protected(path): i64 {
 # the file fs-verity), else read into a private anonymous mapping. Either way
 # the buffer is validated, and released again if validation fails.
 fn _tula_open_fd_protected(fd, sealed): i64 {
+    var code[8];
+    return _tula_open_fd_coded(fd, sealed, &code);
+}
+
+# Open the tula file at `fd`: mapped read-only when `mapped` is 1, else read
+# into a private anonymous mapping; then validated. Returns the buffer, or 0
+# with the reason at `code` (1.11.0): TULA_ERR_TRUNCATED for a bad header or a
+# file shorter than it says, TULA_ERR_OOM when the mapping can't be made, else
+# tula_validate's code. Release the buffer with tula_close_mmap.
+fn _tula_open_fd_coded(fd, mapped, code): i64 {
+    store64(code, TULA_OK);
     var total = _tula_fd_total(fd);
-    if (total < 0) { return 0; }
-    if (sealed == 1) {
-        var addr = mmap_file_ro(fd, total);
-        if (addr == 0) { return 0; }
-        if (tula_open(addr, total) == 0) {
-            cyr_munmap(addr, total);
+    if (total < 0) {
+        store64(code, TULA_ERR_TRUNCATED);
+        return 0;
+    }
+    var buf = 0;
+    if (mapped == 1) {
+        buf = mmap_file_ro(fd, total);
+        if (buf == 0) {
+            store64(code, TULA_ERR_OOM);
             return 0;
         }
-        return addr;
+    } else {
+        buf = mmap_anon(total);
+        if (buf == 0) {
+            store64(code, TULA_ERR_OOM);
+            return 0;
+        }
+        var got = 0 - 1;
+        if (xlseek(fd, 0, 0) == 0) { got = _tula_read_full(fd, buf, total); }   # SEEK_SET
+        if (got != total) {
+            cyr_munmap(buf, total);
+            store64(code, TULA_ERR_TRUNCATED);
+            return 0;
+        }
     }
-    var buf = mmap_anon(total);
-    if (buf == 0) { return 0; }
-    var r = _tula_read_fd_into(fd, buf, total);
-    if (r == 0) { cyr_munmap(buf, total); }
-    return r;
+    var rc = tula_validate(buf, total);
+    if (rc != TULA_OK) {
+        cyr_munmap(buf, total);
+        store64(code, rc);
+        return 0;
+    }
+    return buf;
 }
 
 # 1 if fd's file has fs-verity enabled (Linux: FS_VERITY_FL, 0x00100000, from

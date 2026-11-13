@@ -1,4 +1,4 @@
-# programs/realmodels.cyr — the 1.5.0 real-model inventory gate. Eight real
+# programs/realmodels.cyr — the 1.5.0 real-model inventory gate. Nine real
 # checkpoint inventories go through every 1.2–1.5 path: the sized builder,
 # tula_builder_add_long, the dtype conversions, the signed streaming writer, mmap,
 # tula_validate_strict, tula_verify_required, the name index and
@@ -25,6 +25,12 @@
 #   q4        — (1.8.0) Llama-2-7B as a Q4_0-style import: each 2-D weight INT4
 #               with its per-32 f64 "<name>.scale" sidecar (ADR 0011), the norms
 #               F16: 517.
+#   70b       — (1.11.0) Llama-2-70B, BF16, 723 tensors (hidden 8192,
+#               intermediate 28672, 80 layers, grouped-query k/v of 1024), as a
+#               shard set (ADR 0014): 15 unsigned shards, as Hugging Face ships it
+#               (the embedding in the first, the layers in order, the final norm
+#               and lm_head in the last), and a signed manifest. It is opened with
+#               tula_set_open and every tensor resolved through tula_set_find.
 #
 # Every float payload is a real conversion (tula_*_pack / tula_nf4_pack /
 # tula_int4_pack) of an f64 signal; an I32 one holds the low words of the signal's bit patterns. Each
@@ -497,6 +503,131 @@ fn rm_run(label, which, dt2, dt1, nf4, sig, sk, pk): i64 {
     return 0;
 }
 
+# ---- the sharded inventory (1.11.0, ADR 0014) --------------------------------
+
+# Llama-2-70B's tensors, into 15 shards: shard 0 takes the embedding, layer L
+# goes to shard (L x 15) / 80, the final norm and lm_head to shard 14. Each
+# shard is written unsigned; `paths` gets the 15 file paths.
+fn rm_70b_shards(m, paths): i64 {
+    var nm = alloc(128);
+    var sh = 0;
+    var dir = "build/tula_realmodel_70b/";
+    while (sh < 15) {
+        store64(m, tula_builder_new_cap(RM_MAXT));
+        if (sh == 0) {
+            rm_cat(nm, 0, "model.embed_tokens.weight");
+            rm_add(m, nm, 2, 32000, 8192);
+        }
+        var L = 0;
+        while (L < 80) {
+            if ((L * 15) / 80 == sh) {
+                var b = rm_cat(nm, 0, "model.layers.");
+                b = rm_cati(nm, b, L);
+                b = rm_cat(nm, b, ".");
+                rm_cat(nm, b, "self_attn.q_proj.weight");        rm_add(m, nm, 2, 8192, 8192);
+                rm_cat(nm, b, "self_attn.k_proj.weight");        rm_add(m, nm, 2, 1024, 8192);
+                rm_cat(nm, b, "self_attn.v_proj.weight");        rm_add(m, nm, 2, 1024, 8192);
+                rm_cat(nm, b, "self_attn.o_proj.weight");        rm_add(m, nm, 2, 8192, 8192);
+                rm_cat(nm, b, "mlp.gate_proj.weight");           rm_add(m, nm, 2, 28672, 8192);
+                rm_cat(nm, b, "mlp.up_proj.weight");             rm_add(m, nm, 2, 28672, 8192);
+                rm_cat(nm, b, "mlp.down_proj.weight");           rm_add(m, nm, 2, 8192, 28672);
+                rm_cat(nm, b, "input_layernorm.weight");         rm_add(m, nm, 1, 8192, 0);
+                rm_cat(nm, b, "post_attention_layernorm.weight"); rm_add(m, nm, 1, 8192, 0);
+            }
+            L = L + 1;
+        }
+        if (sh == 14) {
+            rm_cat(nm, 0, "model.norm.weight");
+            rm_add(m, nm, 1, 8192, 0);
+            rm_cat(nm, 0, "lm_head.weight");
+            rm_add(m, nm, 2, 32000, 8192);
+        }
+        var pth = alloc(96);
+        var pl = rm_cat(pth, 0, dir);
+        pl = rm_cat(pth, pl, "model-000");
+        if (sh + 1 < 10) { pl = rm_cat(pth, pl, "0"); }
+        pl = rm_cati(pth, pl, sh + 1);
+        pl = rm_cat(pth, pl, "-of-00015.tula");
+        store64(paths + sh * 8, pth);
+        if (tula_builder_write_file(load64(m), pth) <= 0) { return 1; }
+        sh = sh + 1;
+    }
+    return 0;
+}
+
+fn rm_run_sharded(sig, sk, pk): i64 {
+    sys_mkdir("build/tula_realmodel_70b", 0x1ED);
+    var m = rm_ctx_new(TULA_DT_BF16, TULA_DT_BF16, 0, sig);
+    var paths = alloc(15 * 8);
+    if (rm_70b_shards(m, paths) != 0) { sput("FAIL: write a shard\n"); return 1; }
+    var n = load64(m + 8);
+    if (n != 723) { sput("FAIL: tensor count\n"); return 1; }
+    var mb = tula_builder_new();
+    tula_builder_set_meta(mb, "hf.architecture", "LlamaForCausalLM");
+    var cfg = "{\"hidden_size\": 8192, \"num_hidden_layers\": 80, \"num_key_value_heads\": 8}";
+    tula_builder_set_meta(mb, "hf.config", cfg);
+    tula_builder_set_meta(mb, "realmodels.scale", "dims divided by 64");
+    var tw = now_ns();
+    if (tula_builder_set_shards(mb, paths, 15, 4) != 0) { sput("FAIL: set_shards\n"); return 1; }
+    var mpath = "build/tula_realmodel_70b/model.tula";
+    var mtotal = tula_builder_write_file_signed(mb, mpath, sk);
+    if (mtotal <= 0) { sput("FAIL: write the manifest\n"); return 1; }
+    var t_write = now_ns() - tw;
+    var rc = alloc(16);
+    var to = now_ns();
+    var set = tula_set_open(mpath, pk, 0, 4, rc);
+    var t_open = now_ns() - to;
+    if (set == 0) { sput("FAIL: tula_set_open: "); sput(tula_err_name(load64(rc))); sput("\n"); return 1; }
+    if (tula_set_shards(set) != 15) { sput("FAIL: shard count\n"); return 1; }
+    if (tula_set_tensors(set) != n) { sput("FAIL: set tensor count\n"); return 1; }
+    var man = tula_set_manifest(set);
+    if (streq(tula_meta_get(man, "hf.architecture"), "LlamaForCausalLM") == 0) {
+        sput("FAIL: set metadata\n");
+        return 1;
+    }
+    var recs = load64(m + 16);
+    var bytes = mtotal;
+    var s = 0;
+    while (s < 15) { bytes = bytes + tula_total_len(tula_set_shard(set, s)); s = s + 1; }
+    var tl = now_ns();
+    var i = 0;
+    while (i < n) {
+        if (tula_set_find(set, load64(recs + i * RM_REC)) == 0) { sput("FAIL: set miss\n"); return 1; }
+        i = i + 1;
+    }
+    var t_look = now_ns() - tl;
+    i = 0;
+    while (i < n) {
+        var rec = recs + i * RM_REC;
+        var nm = load64(rec);
+        var e = tula_set_find(set, nm);
+        var r = tula_set_reader(set, e);
+        if (r == 0) { sput("FAIL: reader\n"); return 1; }
+        if (tula_entry_dtype(e) != load64(rec + 32)) { sput("FAIL: dtype\n"); return 1; }
+        if (tula_entry_ndim(e) != load64(rec + 8)) { sput("FAIL: rank\n"); return 1; }
+        if (tula_entry_dim(e, 0) != load64(rec + 16)) { sput("FAIL: dim 0\n"); return 1; }
+        if (tula_entry_nelems(e) != load64(rec + 40)) { sput("FAIL: nelems\n"); return 1; }
+        var len = load64(rec + 56);
+        if (tula_entry_data_len(e) != len) { sput("FAIL: data_len\n"); return 1; }
+        if (memeq(tula_entry_data(r, e), load64(rec + 48), len) != 1) { sput("FAIL: payload bytes\n"); return 1; }
+        if (streq(tula_entry_full_name(r, e), nm) == 0) { sput("FAIL: full name\n"); return 1; }
+        i = i + 1;
+    }
+    tula_set_close(set);
+    s = 0;
+    while (s < 15) { xunlink(load64(paths + s * 8)); s = s + 1; }
+    xunlink(mpath);
+    sput("  llama-2-70b  BF16 shards 15");
+    rm_kvs(" tensors ", n);
+    rm_kvs("  bytes ", bytes);
+    rm_kvs("  manifest ", mtotal);
+    rm_kvs("  set_shards+sign us ", t_write / 1000);
+    rm_kvs("  set_open us ", t_open / 1000);
+    rm_kvs("  lookup ns ", t_look / n);
+    sput("\n");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     var sig = alloc(RM_SIGNAL * 8);
@@ -512,7 +643,8 @@ fn main(): i64 {
     var sk = alloc(64);
     var pk = alloc(32);
     ed25519_keypair(seed, sk, pk);
-    sput("tula real-model inventory gate (1.5.0; metadata 1.6.0; integer dtypes 1.7.0; fp8, int4 1.8.0)\n");
+    sput("tula real-model inventory gate (1.5.0; metadata 1.6.0; integer dtypes 1.7.0;\n");
+    sput("  fp8, int4 1.8.0; shard sets 1.11.0)\n");
     var fails = 0;
     fails = fails + rm_run("  gpt2-small   F32 ", 0, TULA_DT_F32, TULA_DT_F32, 0, sig, sk, pk);
     fails = fails + rm_run("  llama-2-7b   F16 ", 1, TULA_DT_F16, TULA_DT_F16, 0, sig, sk, pk);
@@ -522,8 +654,9 @@ fn main(): i64 {
     fails = fails + rm_run("  gptq-llama2  I32 ", 5, TULA_DT_I32, TULA_DT_F16, 0, sig, sk, pk);
     fails = fails + rm_run("  fp8-llama2   E4M3", 6, TULA_DT_F8_E4M3, TULA_DT_BF16, 0, sig, sk, pk);
     fails = fails + rm_run("  q4-llama2    INT4", 7, TULA_DT_INT4, TULA_DT_F16, 2, sig, sk, pk);
+    fails = fails + rm_run_sharded(sig, sk, pk);
     if (fails == 0) {
-        sput("RESULT: PASS — eight real checkpoint inventories written, signed, read and resolved by name\n");
+        sput("RESULT: PASS — nine real checkpoint inventories written, signed, read and resolved by name\n");
         return 0;
     }
     sput("RESULT: FAIL\n");

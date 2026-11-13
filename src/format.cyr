@@ -424,6 +424,9 @@ fn _tula_bidx_slot(b, k): i64 {
 fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, mode): i64 {
     var c = load64(b);
     if (c >= load64(b + 16))   { return TULA_ERR_TOO_MANY; }
+    if (load64(b + 56) != 0) {
+        if (_tula_builder_has_shards(b) == 1) { return TULA_ERR_SHARDS; }   # a manifest holds no tensors (1.11.0)
+    }
     if (ndim < 0)              { return TULA_ERR_NDIM; }
     if (ndim > TULA_MAXDIM)    { return TULA_ERR_NDIM; }
     if (data_len < 0)          { return TULA_ERR_BOUNDS; }
@@ -534,7 +537,9 @@ fn _tula_builder_add(b, name, dtype, shape, ndim, data, data_len, mode): i64 {
 #   TULA_ERR_TOO_MANY — the builder's cap (TULA_BUILDER_MAX by default) reached;
 #   TULA_ERR_NDIM     — ndim outside [0, TULA_MAXDIM];
 #   TULA_ERR_BOUNDS   — data_len < 0;
-#   TULA_ERR_TOO_BIG  — the payload would pass TULA_READ_MAX_BYTES.
+#   TULA_ERR_TOO_BIG  — the payload would pass TULA_READ_MAX_BYTES;
+#   TULA_ERR_SHARDS   — (1.11.0) the builder is a shard-set manifest
+#                       (tula_builder_set_shards), which holds no tensors.
 # Names over 47 chars are truncated and duplicates are allowed (frozen v1
 # behaviour; two long names can become one stored name, see SECURITY.md) — use
 # tula_builder_add_checked to refuse both.
@@ -673,6 +678,36 @@ fn tula_builder_set_meta(b, key, value): i64 {
     var vlen = strlen(value);
     if (vlen > TULA_META_VALUE_MAX) { return TULA_ERR_META; }
     if (_tula_utf8_ok(value, vlen) == 0) { return TULA_ERR_META; }
+    return _tula_builder_put_meta(b, key, klen, value, vlen);
+}
+
+# Index of `key` among the builder's metadata pairs, or -1 (1.11.0).
+fn _tula_builder_meta_find(b, key, klen): i64 {
+    var mt = load64(b + 56);
+    if (mt == 0) { return 0 - 1; }
+    var arr = load64(mt + 16);
+    var lo = 0;
+    var hi = load64(mt);
+    while (lo < hi) {
+        var mid = (lo + hi) / 2;
+        var c = _tula_bytes_cmp(load64(arr + mid * 32), load64(arr + mid * 32 + 8), key, klen);
+        if (c == 0) { return mid; }
+        if (c < 0) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return 0 - 1;
+}
+
+# 1 if the builder is a shard-set manifest: it holds `tula.shards` (1.11.0).
+fn _tula_builder_has_shards(b): i64 {
+    if (_tula_builder_meta_find(b, "tula.shards", 11) >= 0) { return 1; }
+    return 0;
+}
+
+# Set (or replace) a metadata pair whose key and value are already checked:
+# tula_builder_set_meta's checks passed, or tula itself sets a reserved key
+# (1.11.0: tula.shards). The builder is unchanged on error.
+fn _tula_builder_put_meta(b, key, klen, value, vlen): i64 {
     var mt = load64(b + 56);
     var np = 0;
     var bytes = 0;

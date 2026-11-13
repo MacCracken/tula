@@ -36,3 +36,4 @@ Durable rationale belongs in an ADR; the public contract lives in `docs/api.md` 
 | [0011](0011-int4-blockwise-codes-with-scale-sidecar.md) | Accepted | INT4: signed 4-bit codes, with blockwise scales in an ADR 0002 sidecar |
 | [0012](0012-parallel-unpack.md) | Accepted | Parallel unpack: one call over every unpack helper, threads started per call |
 | [0013](0013-protected-open.md) | Accepted | A protected open: zero-copy for fs-verity files, a private copy otherwise |
+| [0014](0014-shard-sets.md) | Accepted | Sharded checkpoints: a signed manifest of shard digests, in the codec |

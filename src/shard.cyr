@@ -1,0 +1,700 @@
+# @public — tula shard sets (1.11.0, ADR 0014): one model in several files,
+# bound by a signed manifest of their SHA-256 digests.
+#
+# A set is a manifest plus shard files in one directory. The manifest is an
+# ordinary tula file with no tensors, only its metadata table, whose reserved
+# key tula.shards lists the shards one line each, "<sha256> <size> <name>\n":
+# 64 lowercase hex digits over the shard's first `size` bytes, its total length
+# in decimal, and its file name, in strictly increasing byte order of name.
+# Signing the manifest signs every digest, so the shards need no signatures of
+# their own. Shards are ordinary strict-valid tula files, none a manifest, and
+# tensor names are unique across the set.
+#
+# Layout of an open set (one private mapping, released by tula_set_close):
+#   +0 shard count S   +8 the manifest's reader   +16 tensor count T
+#   +24 mapping bytes  +32 ..47 unused
+#   +48 S x 16 {shard reader, its names-table entry or 0}, in manifest order
+#   then S x 16 {shard reader, shard index}, sorted by reader address
+#   then T x 16 {stored-name hash, entry}, sorted, as the strict check sorts
+
+enum TulaShardCfg {
+    TULA_SHARDS_MAX    = 4096;   # shards in one set
+    TULA_SET_PROTECTED = 1;      # tula_set_open flag: shards through tula_open_protected
+    TULA_SET_HDR       = 48;
+}
+
+# 1 if p[0..n) may name a shard: 1-255 bytes, each printable ASCII (0x21-0x7E)
+# or above 0x7F (UTF-8, which the metadata rules check), none of them '/' or
+# '\', and not "." or "..".
+fn _tula_shard_name_ok(p, n): i64 {
+    if (n < 1) { return 0; }
+    if (n > 255) { return 0; }
+    if (load8(p) == 46) {
+        if (n == 1) { return 0; }
+        if (n == 2) {
+            if (load8(p + 1) == 46) { return 0; }
+        }
+    }
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i);
+        if (c < 33) { return 0; }
+        if (c == 127) { return 0; }
+        if (c == 47) { return 0; }   # '/'
+        if (c == 92) { return 0; }   # '\'
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Parse a tula.shards value v[0..vlen). Returns the shard count, or -1 when
+# the value isn't canonical (ADR 0014). With `recs` (count x 32 bytes) it also
+# fills, per line: +0 the digest's 64 hex digits, +8 the size, +16 the name,
+# +24 its length (pointers into v).
+fn _tula_shards_parse(v, vlen, recs): i64 {
+    var s = 0;
+    var i = 0;
+    var pn = 0;
+    var pl = 0;
+    while (i < vlen) {
+        if (s >= TULA_SHARDS_MAX) { return 0 - 1; }
+        if (vlen - i < 65) { return 0 - 1; }
+        var dg = v + i;
+        var k = 0;
+        while (k < 64) {
+            var h = load8(v + i + k);
+            var hex = 0;
+            if (h >= 48) { if (h <= 57) { hex = 1; } }    # 0-9
+            if (h >= 97) { if (h <= 102) { hex = 1; } }   # a-f
+            if (hex == 0) { return 0 - 1; }
+            k = k + 1;
+        }
+        i = i + 64;
+        if (load8(v + i) != 32) { return 0 - 1; }
+        i = i + 1;
+        var st = i;
+        var size = 0;
+        while (i < vlen) {
+            var c = load8(v + i);
+            if (c < 48) { break; }
+            if (c > 57) { break; }
+            if (i - st >= 13) { return 0 - 1; }   # 13 digits hold TULA_READ_MAX_BYTES
+            size = size * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (i == st) { return 0 - 1; }
+        if (load8(v + st) == 48) { return 0 - 1; }   # a leading zero
+        if (size < TULA_HEADER_SIZE) { return 0 - 1; }
+        if (size > TULA_READ_MAX_BYTES) { return 0 - 1; }
+        if (i >= vlen) { return 0 - 1; }
+        if (load8(v + i) != 32) { return 0 - 1; }
+        i = i + 1;
+        var ns = i;
+        while (i < vlen) {
+            if (load8(v + i) == 10) { break; }
+            i = i + 1;
+        }
+        if (i >= vlen) { return 0 - 1; }   # the line has no newline
+        var nl = i - ns;
+        if (_tula_shard_name_ok(v + ns, nl) == 0) { return 0 - 1; }
+        if (s > 0) {
+            if (_tula_bytes_cmp(pn, pl, v + ns, nl) >= 0) { return 0 - 1; }   # out of order, or repeated
+        }
+        if (recs != 0) {
+            var rec = recs + s * 32;
+            store64(rec, dg);
+            store64(rec + 8, size);
+            store64(rec + 16, v + ns);
+            store64(rec + 24, nl);
+        }
+        pn = v + ns;
+        pl = nl;
+        i = i + 1;
+        s = s + 1;
+    }
+    if (s == 0) { return 0 - 1; }
+    return s;
+}
+
+# The strict rule for a manifest (ADR 0014), called by tula_validate_strict
+# after the metadata rules: a file whose metadata holds tula.shards has a
+# canonical shard list and no entry but its metadata table.
+fn _tula_strict_shards(buf, count): i64 {
+    var v = tula_meta_get(buf, "tula.shards");
+    if (v == 0) { return TULA_OK; }
+    if (count != 1) { return TULA_ERR_SHARDS; }
+    if (_tula_shards_parse(v, strlen(v), 0) < 0) { return TULA_ERR_SHARDS; }
+    return TULA_OK;
+}
+
+# SHA-256 of p[0..n) into out (32 bytes), on a context of its own, so any
+# thread may run it.
+fn _tula_sha256(p, n, out): i64 {
+    var ctx[160];
+    sha256_init_into(&ctx);
+    sha256_update(&ctx, p, n);
+    sha256_finalize(&ctx, out);
+    return 0;
+}
+
+# 1 if the 32-byte digest d is the 64 lowercase hex digits at hx.
+fn _tula_digest_is_hex(d, hx): i64 {
+    var i = 0;
+    while (i < 32) {
+        var b = load8(d + i);
+        var hi = b >> 4;
+        var lo = b & 15;
+        var ch = 48 + hi;
+        if (hi >= 10) { ch = 87 + hi; }
+        var cl = 48 + lo;
+        if (lo >= 10) { cl = 87 + lo; }
+        if (load8(hx + i * 2) != ch) { return 0; }
+        if (load8(hx + i * 2 + 1) != cl) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# A hashing thread: items i, i + k, i + 2k ... of the 48-byte items
+# {pointer, length, 32-byte digest out}; the job is {items, count, k, i}.
+fn _tula_hash_job(j): i64 {
+    var items = load64(j);
+    var s = load64(j + 8);
+    var k = load64(j + 16);
+    var i = load64(j + 24);
+    while (i < s) {
+        var it = items + i * 48;
+        _tula_sha256(load64(it), load64(it + 8), it + 16);
+        i = i + k;
+    }
+    return 0;
+}
+
+# SHA-256 of each of `s` items on up to `nthreads` threads, the caller's
+# included; one thread per item at most. A thread that fails to start has its
+# items hashed on the caller's thread.
+fn _tula_hash_items(items, s, nthreads): i64 {
+    sha256_global_init();
+    var k = nthreads;
+    if (k < 1) { k = 1; }
+    if (k > TULA_PAR_MAX_THREADS) { k = TULA_PAR_MAX_THREADS; }
+    if (k > s) { k = s; }
+    if (THREADS_CONCURRENT != 1) { k = 1; }
+    var jobs[2048];   # TULA_PAR_MAX_THREADS x 32 bytes
+    var ths[512];
+    var t = 0;
+    while (t < k) {
+        var jb = &jobs + t * 32;
+        store64(jb, items);
+        store64(jb + 8, s);
+        store64(jb + 16, k);
+        store64(jb + 24, t);
+        t = t + 1;
+    }
+    t = 1;
+    while (t < k) {
+        var th = thread_create(&_tula_hash_job, &jobs + t * 32);
+        store64(&ths + t * 8, th);
+        if (th == 0) { _tula_hash_job(&jobs + t * 32); }
+        t = t + 1;
+    }
+    _tula_hash_job(&jobs);
+    t = 1;
+    while (t < k) {
+        var h = load64(&ths + t * 8);
+        if (h != 0) { thread_join(h); }
+        t = t + 1;
+    }
+    return 0;
+}
+
+# Open the tula file at `path` for a set: mapped (protect 0) or as
+# tula_open_protected does (1). Returns the validated reader, or 0 with the
+# reason at `code`: a negative errno when the file can't be opened, else
+# _tula_open_fd_coded's.
+fn _tula_set_open_file(path, protect, code): i64 {
+    store64(code, TULA_OK);
+    var fd = file_open(path, 0, 0);   # O_RDONLY
+    if (fd < 0) {
+        store64(code, fd);
+        return 0;
+    }
+    var mapped = 1;
+    if (protect == 1) { mapped = _tula_fd_verity(fd); }
+    var r = _tula_open_fd_coded(fd, mapped, code);
+    file_close(fd);
+    return r;
+}
+
+# The decimal digits of v (v > 0) written at p; returns their count.
+fn _tula_put_udec(p, v): i64 {
+    var tmp[24];
+    var n = 0;
+    while (v > 0) {
+        store8(&tmp + n, 48 + v % 10);
+        v = v / 10;
+        n = n + 1;
+    }
+    var j = 0;
+    while (j < n) {
+        store8(p + j, load8(&tmp + n - 1 - j));
+        j = j + 1;
+    }
+    return n;
+}
+
+# Make builder `b` the manifest of a shard set (1.11.0, ADR 0014) for the n
+# shard files at paths[0..n), an array of n cstring pointers. Each shard is
+# opened mapped, strict-validated and hashed with SHA-256, on up to `nthreads`
+# threads. They are listed under the reserved metadata key tula.shards by file
+# name (each path's part after its last '/'), in byte order. Write the manifest
+# into the shards' directory, signed (tula_builder_finish_signed or
+# tula_builder_write_file_signed); the shards need no signatures. Set the
+# set's own metadata on the same builder with tula_builder_set_meta. Calling it
+# again replaces the list. Returns 0, or (builder unchanged):
+#   a negative errno  — a shard can't be opened;
+#   a tula_validate or tula_validate_strict code (TULA_ERR_TRUNCATED for a bad
+#                       header) — a shard isn't a strict-valid tula file;
+#   TULA_ERR_SHARDS   — n outside 1..TULA_SHARDS_MAX, the builder holds tensors,
+#                       a shard is itself a manifest, a file name ADR 0014
+#                       doesn't allow, or two shards with the same name;
+#   TULA_ERR_OOM.
+fn tula_builder_set_shards(b, paths, n, nthreads): i64 {
+    if (n < 1) { return TULA_ERR_SHARDS; }
+    if (n > TULA_SHARDS_MAX) { return TULA_ERR_SHARDS; }
+    if (load64(b) > 0) { return TULA_ERR_SHARDS; }
+    var items = mmap_anon(n * 48);
+    if (items == 0) { return TULA_ERR_OOM; }
+    var names = mmap_anon(n * 24);   # {name, length, item index}
+    if (names == 0) {
+        cyr_munmap(items, n * 48);
+        return TULA_ERR_OOM;
+    }
+    var rc = TULA_OK;
+    var opened = 0;
+    var code[8];
+    while (opened < n) {
+        var p = load64(paths + opened * 8);
+        var r = _tula_set_open_file(p, 0, &code);
+        if (r == 0) {
+            rc = load64(&code);
+            break;
+        }
+        var len = tula_total_len(r);
+        store64(items + opened * 48, r);
+        store64(items + opened * 48 + 8, len);
+        opened = opened + 1;
+        var sv = tula_validate_strict(r, len);
+        if (sv != TULA_OK) {
+            rc = sv;
+            break;
+        }
+        if (tula_meta_get(r, "tula.shards") != 0) {
+            rc = TULA_ERR_SHARDS;
+            break;
+        }
+        var nm = p;
+        var q = 0;
+        while (load8(p + q) != 0) {
+            if (load8(p + q) == 47) { nm = p + q + 1; }
+            q = q + 1;
+        }
+        var nlen = strlen(nm);
+        if (_tula_shard_name_ok(nm, nlen) == 0) {
+            rc = TULA_ERR_SHARDS;
+            break;
+        }
+        if (_tula_utf8_ok(nm, nlen) == 0) {
+            rc = TULA_ERR_SHARDS;
+            break;
+        }
+        store64(names + (opened - 1) * 24, nm);
+        store64(names + (opened - 1) * 24 + 8, nlen);
+        store64(names + (opened - 1) * 24 + 16, opened - 1);
+    }
+    if (rc == TULA_OK) { _tula_hash_items(items, n, nthreads); }
+    var u = 0;
+    while (u < opened) {
+        cyr_munmap(load64(items + u * 48), load64(items + u * 48 + 8));
+        u = u + 1;
+    }
+    var vlen = 0;
+    var v = 0;
+    if (rc == TULA_OK) {
+        # order by name (insertion sort: the writer's own list, n <= 4096)
+        var i = 1;
+        while (i < n) {
+            var a0 = load64(names + i * 24);
+            var a1 = load64(names + i * 24 + 8);
+            var a2 = load64(names + i * 24 + 16);
+            var j = i;
+            while (j > 0) {
+                var pj = names + (j - 1) * 24;
+                if (_tula_bytes_cmp(load64(pj), load64(pj + 8), a0, a1) <= 0) { break; }
+                _tula_copy(pj + 24, pj, 24);
+                j = j - 1;
+            }
+            store64(names + j * 24, a0);
+            store64(names + j * 24 + 8, a1);
+            store64(names + j * 24 + 16, a2);
+            i = i + 1;
+        }
+        i = 1;
+        while (i < n) {
+            var pa = names + (i - 1) * 24;
+            if (_tula_bytes_cmp(load64(pa), load64(pa + 8), load64(pa + 24), load64(pa + 32)) == 0) {
+                rc = TULA_ERR_SHARDS;   # two shards share a file name
+            }
+            i = i + 1;
+        }
+    }
+    if (rc == TULA_OK) {
+        var cap = n * (64 + 1 + 13 + 1 + 255 + 1);
+        v = mmap_anon(cap);
+        if (v == 0) { rc = TULA_ERR_OOM; }
+    }
+    if (rc == TULA_OK) {
+        var w = 0;
+        var i2 = 0;
+        while (i2 < n) {
+            var ne = names + i2 * 24;
+            var it = items + load64(ne + 16) * 48;
+            var d = 0;
+            while (d < 32) {
+                var by = load8(it + 16 + d);
+                var hi = by >> 4;
+                var lo = by & 15;
+                var ch = 48 + hi;
+                if (hi >= 10) { ch = 87 + hi; }
+                var cl = 48 + lo;
+                if (lo >= 10) { cl = 87 + lo; }
+                store8(v + w, ch);
+                store8(v + w + 1, cl);
+                w = w + 2;
+                d = d + 1;
+            }
+            store8(v + w, 32);
+            w = w + 1;
+            w = w + _tula_put_udec(v + w, load64(it + 8));
+            store8(v + w, 32);
+            w = w + 1;
+            _tula_copy(v + w, load64(ne), load64(ne + 8));
+            w = w + load64(ne + 8);
+            store8(v + w, 10);
+            w = w + 1;
+            i2 = i2 + 1;
+        }
+        vlen = w;
+        rc = _tula_builder_put_meta(b, "tula.shards", 11, v, vlen);
+        cyr_munmap(v, n * (64 + 1 + 13 + 1 + 255 + 1));
+    }
+    cyr_munmap(names, n * 24);
+    cyr_munmap(items, n * 48);
+    return rc;
+}
+
+# Record a tula_set_open failure: the code, and the shard it concerns (-1 for
+# the manifest), at rc when rc is non-zero.
+fn _tula_set_fail(rc, code, shard): i64 {
+    if (rc != 0) {
+        store64(rc, code);
+        store64(rc + 8, shard);
+    }
+    return 0;
+}
+
+# Release what a failing tula_set_open holds: the manifest, the first `opened`
+# shard readers of `items`, and the scratch mappings.
+fn _tula_set_unwind(m, items, opened, scratch, sbytes): i64 {
+    var i = 0;
+    while (i < opened) {
+        tula_close_mmap(load64(items + i * 48));
+        i = i + 1;
+    }
+    if (scratch != 0) { cyr_munmap(scratch, sbytes); }
+    tula_close_mmap(m);
+    return 0;
+}
+
+# Open the shard set whose manifest is at `path` (1.11.0, ADR 0014). Returns
+# the set, or 0. `rc`, when non-zero, points at two words that get the reason
+# and the shard it concerns (-1 for the manifest); on success the code is
+# TULA_OK.
+#
+# The manifest is read through tula_open_protected and strict-validated. With a
+# public key `pk` its signature is required (tula_verify_required); with pk 0 it
+# isn't checked, and the digests then only detect corruption. Each shard named
+# in it, in the manifest's directory, is mapped (flags 0) or opened through
+# tula_open_protected (TULA_SET_PROTECTED). Every shard's size and SHA-256 are
+# checked against the manifest on up to `nthreads` threads, every shard is
+# strict-validated, none may be a manifest, and no two tensors of the set may
+# share a name. A mapped set, like tula_open_mmap, is sound only while nobody
+# rewrites its files.
+#
+# Failure codes: a negative errno (a file can't be opened); tula_validate's,
+# tula_validate_strict's or tula_verify_required's codes; TULA_ERR_SHARDS (not a
+# manifest, a shard of the wrong size or digest, a shard that is a manifest);
+# TULA_ERR_DUP_NAME (two shards hold a tensor of the same name); TULA_ERR_OOM.
+# Release the set with tula_set_close.
+fn tula_set_open(path, pk, flags, nthreads, rc): i64 {
+    _tula_set_fail(rc, TULA_OK, 0 - 1);
+    var protect = 0;
+    if ((flags & TULA_SET_PROTECTED) != 0) { protect = 1; }
+    var code[8];
+    var m = _tula_set_open_file(path, 1, &code);
+    if (m == 0) { return _tula_set_fail(rc, load64(&code), 0 - 1); }
+    var sv = tula_validate_strict(m, tula_total_len(m));
+    if (sv != TULA_OK) {
+        tula_close_mmap(m);
+        return _tula_set_fail(rc, sv, 0 - 1);
+    }
+    if (pk != 0) {
+        var vr = tula_verify_required(m, pk);
+        if (vr != TULA_OK) {
+            tula_close_mmap(m);
+            return _tula_set_fail(rc, vr, 0 - 1);
+        }
+    }
+    var v = tula_meta_get(m, "tula.shards");
+    if (v == 0) {
+        tula_close_mmap(m);
+        return _tula_set_fail(rc, TULA_ERR_SHARDS, 0 - 1);
+    }
+    var s = _tula_shards_parse(v, strlen(v), 0);   # >= 1: strict checked it
+    # scratch: s x 32 parsed lines, s x 48 hash items, a path buffer
+    var dlen = 0;
+    var q = 0;
+    while (load8(path + q) != 0) {
+        if (load8(path + q) == 47) { dlen = q + 1; }
+        q = q + 1;
+    }
+    var sbytes = s * 80 + dlen + 264;
+    var scratch = mmap_anon(sbytes);
+    if (scratch == 0) {
+        tula_close_mmap(m);
+        return _tula_set_fail(rc, TULA_ERR_OOM, 0 - 1);
+    }
+    var lines = scratch;
+    var items = scratch + s * 32;
+    var pbuf = scratch + s * 80;
+    _tula_shards_parse(v, strlen(v), lines);
+    _tula_copy(pbuf, path, dlen);
+    var opened = 0;
+    while (opened < s) {
+        var ln = lines + opened * 32;
+        _tula_copy(pbuf + dlen, load64(ln + 16), load64(ln + 24));
+        store8(pbuf + dlen + load64(ln + 24), 0);
+        var r = _tula_set_open_file(pbuf, protect, &code);
+        if (r == 0) {
+            _tula_set_unwind(m, items, opened, scratch, sbytes);
+            return _tula_set_fail(rc, load64(&code), opened);
+        }
+        store64(items + opened * 48, r);
+        store64(items + opened * 48 + 8, load64(ln + 8));
+        opened = opened + 1;
+        if (tula_total_len(r) != load64(ln + 8)) {
+            _tula_set_unwind(m, items, opened, scratch, sbytes);
+            return _tula_set_fail(rc, TULA_ERR_SHARDS, opened - 1);
+        }
+    }
+    _tula_hash_items(items, s, nthreads);
+    var tensors = 0;
+    var i = 0;
+    while (i < s) {
+        var it = items + i * 48;
+        var ri = load64(it);
+        if (_tula_digest_is_hex(it + 16, load64(lines + i * 32)) == 0) {
+            _tula_set_unwind(m, items, s, scratch, sbytes);
+            return _tula_set_fail(rc, TULA_ERR_SHARDS, i);
+        }
+        var si = tula_validate_strict(ri, tula_total_len(ri));
+        if (si != TULA_OK) {
+            _tula_set_unwind(m, items, s, scratch, sbytes);
+            return _tula_set_fail(rc, si, i);
+        }
+        if (tula_meta_get(ri, "tula.shards") != 0) {
+            _tula_set_unwind(m, items, s, scratch, sbytes);
+            return _tula_set_fail(rc, TULA_ERR_SHARDS, i);
+        }
+        tensors = tensors + _tula_set_own_count(ri);
+        i = i + 1;
+    }
+    var bytes = TULA_SET_HDR + s * 32 + tensors * 16;
+    var set = mmap_anon(bytes);
+    if (set == 0) {
+        _tula_set_unwind(m, items, s, scratch, sbytes);
+        return _tula_set_fail(rc, TULA_ERR_OOM, 0 - 1);
+    }
+    store64(set, s);
+    store64(set + 8, m);
+    store64(set + 16, tensors);
+    store64(set + 24, bytes);
+    var shards = set + TULA_SET_HDR;
+    var bases = shards + s * 16;
+    var recs = bases + s * 16;
+    var t = 0;
+    i = 0;
+    while (i < s) {
+        var rs = load64(items + i * 48);
+        store64(shards + i * 16, rs);
+        store64(shards + i * 16 + 8, _tula_names_entry(rs));
+        store64(bases + i * 16, rs);
+        store64(bases + i * 16 + 8, i);
+        var c = tula_count(rs);
+        var te = load64(shards + i * 16 + 8);
+        var me = _tula_meta_entry(rs);
+        var k = 0;
+        while (k < c) {
+            var e = tula_entry(rs, k);
+            if (e != te) {
+                if (e != me) {
+                    store64(recs + t * 16, _tula_name_hash(e));
+                    store64(recs + t * 16 + 8, e);
+                    t = t + 1;
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    cyr_munmap(scratch, sbytes);
+    if (s >= 2) { _tula_heapsort(bases, s, 0); }   # the addresses differ, so they decide
+    if (tensors >= 2) {
+        _tula_heapsort(recs, tensors, 0);
+        i = 1;
+        while (i < tensors) {
+            if (_tula_rec_cmp(recs + i * 16 - 16, recs + i * 16) == 0) {
+                tula_set_close(set);
+                return _tula_set_fail(rc, TULA_ERR_DUP_NAME, 0 - 1);
+            }
+            i = i + 1;
+        }
+    }
+    return set;
+}
+
+# The entries of shard reader r that are its own tensors: all but its names
+# table and its metadata table.
+fn _tula_set_own_count(r): i64 {
+    var c = tula_count(r);
+    if (_tula_names_entry(r) != 0) { c = c - 1; }
+    if (_tula_meta_entry(r) != 0) { c = c - 1; }
+    return c;
+}
+
+# Release a set from tula_set_open: every shard, the manifest, the set. 0 is a
+# no-op.
+fn tula_set_close(set): i64 {
+    if (set == 0) { return 0; }
+    var s = load64(set);
+    var i = 0;
+    while (i < s) {
+        tula_close_mmap(load64(set + TULA_SET_HDR + i * 16));
+        i = i + 1;
+    }
+    tula_close_mmap(load64(set + 8));
+    return cyr_munmap(set, load64(set + 24));
+}
+
+# The number of shards in an open set.
+fn tula_set_shards(set): i64 { return load64(set); }
+
+# The reader of shard i (0..tula_set_shards - 1), in the manifest's order (by
+# file name), or 0 for an i out of range. Its accessors work as for one file.
+fn tula_set_shard(set, i): i64 {
+    if (i < 0) { return 0; }
+    if (i >= load64(set)) { return 0; }
+    return load64(set + TULA_SET_HDR + i * 16);
+}
+
+# The number of tensors across the set (each shard's, without its names and
+# metadata tables).
+fn tula_set_tensors(set): i64 { return load64(set + 16); }
+
+# The manifest's reader: the set's metadata is tula_meta_get(tula_set_manifest(set), key).
+fn tula_set_manifest(set): i64 { return load64(set + 8); }
+
+# The shard reader that holds entry `e` (one tula_set_find returned, or any
+# entry of a shard), or 0 when e is in none of them. Use it with the entry's
+# accessors: tula_entry_data(tula_set_reader(set, e), e).
+fn tula_set_reader(set, e): i64 {
+    var i = _tula_set_shard_of(set, e);
+    if (i < 0) { return 0; }
+    return load64(set + TULA_SET_HDR + i * 16);
+}
+
+# The index of the shard whose manifest holds entry e, or -1: a binary search
+# over the shards sorted by address, then a check that e is one of its entries.
+fn _tula_set_shard_of(set, e): i64 {
+    var s = load64(set);
+    var bases = set + TULA_SET_HDR + s * 16;
+    var lo = 0;
+    var hi = s;
+    while (lo < hi) {   # the first base above e
+        var mid = (lo + hi) >> 1;
+        if (load64(bases + mid * 16) <= e) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    if (lo == 0) { return 0 - 1; }
+    var r = load64(bases + (lo - 1) * 16);
+    if (e < r + TULA_HEADER_SIZE) { return 0 - 1; }
+    if (e >= r + load64(r + 32)) { return 0 - 1; }   # past the manifest
+    if (((e - r - TULA_HEADER_SIZE) % TULA_ENTRY_SIZE) != 0) { return 0 - 1; }
+    return load64(bases + (lo - 1) * 16 + 8);
+}
+
+# The set's entry whose stored name field is the 48 bytes at q and whose full
+# name is a ‖ b, or 0.
+fn _tula_set_lookup(set, q, a, alen, b, blen): i64 {
+    var s = load64(set);
+    var t = load64(set + 16);
+    var recs = set + TULA_SET_HDR + s * 32;
+    var qh = _tula_name_hash(q);
+    var qrec[16];
+    store64(&qrec, qh);
+    store64(&qrec + 8, q);
+    var lo = 0;
+    var hi = t;
+    while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        var rh = load64(recs + mid * 16);
+        if (rh < qh) { lo = mid + 1; }
+        else {
+            if (rh == qh) {
+                if (_tula_rec_order(recs + mid * 16, &qrec, 0) < 0) { lo = mid + 1; }
+                else { hi = mid; }
+            } else {
+                hi = mid;
+            }
+        }
+    }
+    if (lo >= t) { return 0; }
+    var rec = recs + lo * 16;
+    if (_tula_rec_order(rec, &qrec, 0) != 0) { return 0; }
+    var e = load64(rec + 8);
+    var si = _tula_set_shard_of(set, e);
+    if (si < 0) { return 0; }
+    var sh = set + TULA_SET_HDR + si * 16;   # its reader and names table, found at open
+    return _tula_confirm_t(load64(sh), load64(sh + 8), e, a, alen, b, blen);
+}
+
+# Find a tensor by its full name, any length, across the whole set: the entry,
+# or 0. Its reader is tula_set_reader(set, e). O(log n) in the set's tensors.
+fn tula_set_find(set, name): i64 {
+    var q[48];
+    var n = _tula_query_name(&q, name);
+    return _tula_set_lookup(set, &q, name, n, "", 0);
+}
+
+# Entry e's "<full name>.scale" sidecar anywhere in the set, checked for an
+# unpack reading `need` scales (as tula_find_scale), or 0.
+fn tula_set_find_scale(set, e, need): i64 {
+    if (need < 1) { return 0; }
+    var r = tula_set_reader(set, e);
+    if (r == 0) { return 0; }
+    var name = tula_entry_full_name(r, e);
+    var alen = strlen(name);
+    var q[48];
+    _tula_query_field(&q, name, alen, ".scale", 6);
+    return _tula_scale_ok(_tula_set_lookup(set, &q, name, alen, ".scale", 6), need);
+}

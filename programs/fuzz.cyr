@@ -55,6 +55,12 @@
 #      and 1..9 threads. The payload and the scales each end exactly at a guard
 #      page, so a slice that starts or ends a byte or a block wrong faults. The
 #      output must equal the serial helper's, with the word after it untouched.
+#  12. (1.11.0) shard sets (ADR 0014). Phase K mutates a canonical manifest,
+#      mostly inside its tula.shards list (digits, hex letters, spaces,
+#      newlines, '/', '.', uppercase hex), and the strict validator's verdict on
+#      the list must match the fuzzer's own reading of it. On disk, a real
+#      signed set has one byte of one shard changed, or a shard cut short, and
+#      tula_set_open must refuse every one (mapped or protected, 1-4 threads).
 #
 # Every buffer under test is placed so it ENDS at a PROT_NONE guard page, so a
 # read past `len` — by the validator, an accessor, tula_verify or an unpack —
@@ -80,6 +86,8 @@ enum FuzzCfg {
     FZ_INT_ITERS    = 300000;    # phase I: the 1.7.0 dtypes, mutations aimed at BOOL bytes, dtypes, shapes
     FZ_PAR_ITERS    = 400;       # phase J: parallel unpacks against the serial helpers (1.9.0)
     FZ_PAR_MAXN     = 327680;    # phase J: the most elements per unpack (5 x TULA_PAR_MIN_CHUNK)
+    FZ_SHARD_ITERS  = 200000;    # phase K: mutations of a manifest's shard list (1.11.0)
+    FZ_SET_ITERS    = 300;       # phase K: corrupted shards on disk, each set refused
     FZ_POOL         = 135168;    # phase H: random payload bytes (> the 64 KiB stage + 60000)
     FZ_MAXBUF       = 8192;
     FZ_GUARD_SPAN   = 16384;     # readable bytes before the guard (>= FZ_MAXBUF + 64)
@@ -801,17 +809,297 @@ fn par_phase(s, st): i64 {
     return fails;
 }
 
+# ---- phase K helpers: shard sets (1.11.0) ---------------------------------
+
+# The fuzzer's own reading of a tula.shards value (ADR 0014), written apart from
+# src/shard.cyr: the value is cut into lines first, then each line is read
+# field by field. Returns the line count, or 0 when the value isn't canonical.
+fn fz_shards_ok(v): i64 {
+    var n = strlen(v);
+    if (n == 0) { return 0; }
+    if (load8(v + n - 1) != 10) { return 0; }
+    var lines = 0;
+    var start = 0;
+    var prev = 0;
+    var plen = 0;
+    var i = 0;
+    while (i < n) {
+        if (load8(v + i) == 10) {
+            var k = 0;
+            while (k < 64) {
+                if (start + k >= i) { return 0; }
+                var h = load8(v + start + k);
+                var okh = 0;
+                if (h >= 48) { if (h <= 57) { okh = 1; } }
+                if (h >= 97) { if (h <= 102) { okh = 1; } }
+                if (okh == 0) { return 0; }
+                k = k + 1;
+            }
+            var j = start + 64;
+            if (j >= i) { return 0; }
+            if (load8(v + j) != 32) { return 0; }
+            j = j + 1;
+            var ds = j;
+            var size = 0;
+            while (j < i) {
+                var c = load8(v + j);
+                if (c == 32) { break; }
+                if (c < 48) { return 0; }
+                if (c > 57) { return 0; }
+                if (j - ds >= 13) { return 0; }
+                size = size * 10 + c - 48;
+                j = j + 1;
+            }
+            if (j == ds) { return 0; }
+            if (j >= i) { return 0; }
+            if (load8(v + ds) == 48) { return 0; }
+            if (size < 64) { return 0; }
+            if (size > TULA_READ_MAX_BYTES) { return 0; }
+            j = j + 1;                              # past the space
+            var nm = v + j;
+            var nl = i - j;
+            if (nl < 1) { return 0; }
+            if (nl > 255) { return 0; }
+            var q = 0;
+            while (q < nl) {
+                var b = load8(nm + q);
+                if (b <= 32) { return 0; }
+                if (b == 127) { return 0; }
+                if (b == 47) { return 0; }
+                if (b == 92) { return 0; }
+                q = q + 1;
+            }
+            if (nl == 1) { if (load8(nm) == 46) { return 0; } }
+            if (nl == 2) { if (load8(nm) == 46) { if (load8(nm + 1) == 46) { return 0; } } }
+            if (lines > 0) {
+                # strictly after the previous name, byte by byte, a prefix first
+                var m = 0;
+                var cmp = 0;
+                while (m < plen) {
+                    if (m >= nl) { cmp = 1; break; }
+                    var x = load8(prev + m);
+                    var y = load8(nm + m);
+                    if (x < y) { cmp = 0 - 1; break; }
+                    if (x > y) { cmp = 1; break; }
+                    m = m + 1;
+                }
+                if (cmp == 0) {
+                    if (plen >= nl) { return 0; }       # equal: a repeat
+                } else {
+                    if (cmp > 0) { return 0; }
+                }
+            }
+            prev = nm;
+            plen = nl;
+            lines = lines + 1;
+            if (lines > 4096) { return 0; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return lines;
+}
+
+# A canonical manifest held in memory: five shard lines (made-up digests and
+# sizes) and one other key.
+fn build_manifest_base(): i64 {
+    var b = tula_builder_new();
+    tula_builder_set_meta(b, "hf.architecture", "LlamaForCausalLM");
+    var v = alloc(1024);
+    var w = 0;
+    var i = 0;
+    while (i < 5) {
+        var k = 0;
+        while (k < 64) {
+            var d = (i * 7 + k * 3) % 16;
+            var c = 48 + d;
+            if (d >= 10) { c = 87 + d; }
+            store8(v + w, c);
+            w = w + 1;
+            k = k + 1;
+        }
+        store8(v + w, 32);
+        w = w + 1;
+        w = w + put_dec_fz(v + w, 4096 + i * 1000);
+        store8(v + w, 32);
+        w = w + 1;
+        var nm = "model-00000-of-00005.tula";
+        var nl = strlen(nm);
+        memcpy_n(v + w, nm, nl);
+        store8(v + w + 10, 49 + i);
+        w = w + nl;
+        store8(v + w, 10);
+        w = w + 1;
+        i = i + 1;
+    }
+    _tula_builder_put_meta(b, "tula.shards", 11, v, w);
+    return tula_builder_finish(b);
+}
+
+fn put_dec_fz(p, v): i64 {
+    var tmp = alloc(24);
+    var n = 0;
+    while (v > 0) { store8(tmp + n, 48 + v % 10); v = v / 10; n = n + 1; }
+    var j = 0;
+    while (j < n) { store8(p + j, load8(tmp + n - 1 - j)); j = j + 1; }
+    return n;
+}
+
+# A small signed set on disk under build/fuzz_shards: three shards of two f64
+# tensors each and a manifest. `paths` gets the three shard paths, `keep` their
+# bytes; returns the manifest's path, or 0.
+fn build_set_on_disk(sk, paths, keep): i64 {
+    sys_mkdir("build/fuzz_shards", 0x1ED);
+    var shape = alloc(8);
+    store64(shape, 8);
+    var i = 0;
+    while (i < 3) {
+        var b = tula_builder_new();
+        var k = 0;
+        while (k < 2) {
+            var nm = alloc(16);
+            store8(nm, 107);                 # "k" + shard digit + "." + letter
+            store8(nm + 1, 48 + i);
+            store8(nm + 2, 46);
+            store8(nm + 3, 97 + k);
+            store8(nm + 4, 0);
+            var data = alloc(64);
+            var q = 0;
+            while (q < 8) { store64(data + q * 8, f64_from(i * 100 + k * 10 + q)); q = q + 1; }
+            tula_builder_add_checked(b, nm, TULA_DT_F64, shape, 1, data, 64);
+            k = k + 1;
+        }
+        var p = alloc(40);
+        memcpy_n(p, "build/fuzz_shards/s0.tula", 26);
+        store8(p + 19, 48 + i);
+        store64(paths + i * 8, p);
+        if (tula_builder_write_file(b, p) <= 0) { return 0; }
+        store64(keep + i * 8, tula_read_file(p));
+        i = i + 1;
+    }
+    var mb = tula_builder_new();
+    if (tula_builder_set_shards(mb, paths, 3, 2) != 0) { return 0; }
+    var mp = "build/fuzz_shards/m.tula";
+    if (tula_builder_write_file_signed(mb, mp, sk) <= 0) { return 0; }
+    return mp;
+}
+
+# Phase K: shard lists in memory against fz_shards_ok, then corrupted sets on
+# disk. Returns the failures.
+fn shard_phase(s, st, guard, scratch): i64 {
+    var fails = 0;
+    var base = build_manifest_base();
+    var len = tula_total_len(base);
+    if (fz_shards_ok(tula_meta_get(base, "tula.shards")) != 5) { return 1; }
+    var v0 = tula_meta_get(base, "tula.shards");
+    var voff = v0 - base;
+    var vlen = strlen(v0);
+    var it = 0;
+    while (it < FZ_SHARD_ITERS) {
+        memcpy_n(scratch, base, len);
+        if (rng_below(s, 4) == 0) {
+            mutate(s, scratch, len);
+        } else {
+            var nb = 1 + rng_below(s, 3);
+            var q = 0;
+            while (q < nb) {
+                var pick = rng_below(s, 8);
+                var val = rng_below(s, 256);
+                if (pick == 0) { val = 48 + rng_below(s, 10); }
+                if (pick == 1) { val = 97 + rng_below(s, 6); }
+                if (pick == 2) { val = 32; }
+                if (pick == 3) { val = 10; }
+                if (pick == 4) { val = 47; }
+                if (pick == 5) { val = 46; }
+                if (pick == 6) { val = 65 + rng_below(s, 6); }
+                store8(scratch + voff + rng_below(s, vlen), val);
+                q = q + 1;
+            }
+        }
+        var r = tula_open(place(guard, scratch, len), len);
+        if (r != 0) {
+            var sv = tula_validate_strict(r, len);
+            if (sv == TULA_OK) {
+                var v = tula_meta_get(r, "tula.shards");
+                if (v != 0) {
+                    if (fz_shards_ok(v) == 0) { fails = fails + 1; }
+                    if (tula_count(r) != 1) { fails = fails + 1; }
+                    store64(st + 112, load64(st + 112) + 1);
+                }
+            }
+            if (sv == TULA_ERR_SHARDS) {
+                var v2 = tula_meta_get(r, "tula.shards");
+                if (v2 == 0) { fails = fails + 1; }
+                else {
+                    if (fz_shards_ok(v2) != 0) {
+                        if (tula_count(r) == 1) { fails = fails + 1; }   # strict refused a good list
+                    }
+                }
+                store64(st + 120, load64(st + 120) + 1);
+            }
+        }
+        it = it + 1;
+    }
+    # on disk
+    var seed = alloc(32);
+    var z = 0;
+    while (z < 32) { store8(seed + z, z * 5 + 1); z = z + 1; }
+    var sk = alloc(64);
+    var pk = alloc(32);
+    ed25519_keypair(seed, sk, pk);
+    var paths = alloc(24);
+    var keep = alloc(24);
+    var mp = build_set_on_disk(sk, paths, keep);
+    if (mp == 0) { return fails + 1; }
+    var rc = alloc(16);
+    var ok = tula_set_open(mp, pk, 0, 2, rc);
+    if (ok == 0) { return fails + 1; }
+    tula_set_close(ok);
+    var bad = alloc(4096);
+    it = 0;
+    while (it < FZ_SET_ITERS) {
+        var k2 = rng_below(s, 3);
+        var orig = load64(keep + k2 * 8);
+        var tl = tula_total_len(orig);
+        memcpy_n(bad, orig, tl);
+        var wl = tl;
+        if (rng_below(s, 4) == 0) {
+            wl = rng_below(s, tl);                  # cut short
+        } else {
+            var at = rng_below(s, tl);
+            store8(bad + at, (load8(bad + at) + 1 + rng_below(s, 255)) & 0xFF);   # a different byte
+        }
+        tula_write_file(load64(paths + k2 * 8), bad, wl);
+        var fl = 0;
+        if (rng_below(s, 2) == 1) { fl = TULA_SET_PROTECTED; }
+        var set = tula_set_open(mp, pk, fl, 1 + rng_below(s, 4), rc);
+        if (set != 0) {
+            fails = fails + 1;
+            tula_set_close(set);
+        } else {
+            store64(st + 128, load64(st + 128) + 1);
+        }
+        tula_write_file(load64(paths + k2 * 8), orig, tl);
+        it = it + 1;
+    }
+    ok = tula_set_open(mp, pk, 0, 2, rc);
+    if (ok == 0) { fails = fails + 1; }
+    else { tula_set_close(ok); }
+    return fails;
+}
+
 fn main(): i64 {
     alloc_init();
     var s = alloc(8);
     store64(s, 0x243F6A8885A308D3);   # fixed seed (digits of pi) -> reproducible
 
-    var st = alloc(128);
+    var st = alloc(160);
     var z = 0;
-    while (z < 16) { store64(st + z * 8, 0); z = z + 1; }
+    while (z < 20) { store64(st + z * 8, 0); z = z + 1; }
     # st+0 iters  +8 opened  +16 fails  +24 v_uns  +32 v_ok  +40 v_bad  +48 unpacked
     # +56 strict accepted  +64 strict DUP_NAME  +72 stream writes  +80 nameless
     # +88 canonical builders  +96 strict VALUE (1.7.0)  +104 parallel unpacks (1.9.0)
+    # +112 manifests strict-accepted  +120 strict SHARDS  +128 corrupt sets refused (1.11.0)
 
     var guard = guard_region();
     if (guard == 0) { sput("RESULT: FAIL (could not map the guard page)\n"); return 1; }
@@ -1109,6 +1397,9 @@ fn main(): i64 {
     # ---- phase J (1.9.0): the parallel unpack against the serial helpers ----
     store64(st + 16, load64(st + 16) + par_phase(s, st));
 
+    # ---- phase K (1.11.0): shard lists against the fuzzer's reading, corrupt sets ----
+    store64(st + 16, load64(st + 16) + shard_phase(s, st, guard, scratch));
+
     var t1 = now_ns();
 
     sput("tula fuzz — reader hardening (M3) under hostile input\n");
@@ -1122,6 +1413,9 @@ fn main(): i64 {
     kv("  strict DUP_NAME    : ", load64(st + 64));
     kv("  strict VALUE       : ", load64(st + 96));
     kv("  parallel unpacks   : ", load64(st + 104));
+    kv("  manifests accepted : ", load64(st + 112));
+    kv("  strict SHARDS      : ", load64(st + 120));
+    kv("  corrupt sets refused: ", load64(st + 128));
     kv("  stream writes      : ", load64(st + 72));
     kv("    nameless         : ", load64(st + 80));
     kv("    canonical        : ", load64(st + 88));

@@ -121,6 +121,20 @@ serial helper's output. See
 [`examples/consumer.cyr`](../../examples/consumer.cyr) for a complete
 quantize→sign→read→verify→dequant loop.
 
+## Sharded models
+
+A model split across files (1.11.0, [ADR 0014](../adr/0014-shard-sets.md)) is
+a shard set: the shards, written with the usual writers and needing no
+signatures, plus a signed manifest listing their SHA-256.
+- **To write one:** make a builder, call
+  `tula_builder_set_shards(b, paths, n, nthreads)`, then
+  `tula_builder_write_file_signed(b, "dir/model.tula", sk)` beside the shards.
+- **To read one:** `tula_set_open("dir/model.tula", pk, 0, nthreads, rc)`, then
+  `tula_set_find` and `tula_set_reader` per tensor.
+
+Verifying a set costs a SHA-256 per shard, run in parallel, instead of one
+Ed25519 check per file through SHA-512.
+
 ## Consume tula from another Cyrius repo
 
 Downstream repos pull the bundle via a `[deps.tula]` git-tag entry and supply

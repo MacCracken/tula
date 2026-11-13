@@ -9,7 +9,7 @@
 #   make lint / fmt-check / vet  — quality gates
 #   make bigfile — 1.4.0 gate: a 2.36 GB file (one tensor > INT_MAX bytes) streamed, validated, read, written back (CI)
 #   make bigfile-signed — the same, signed + verified (minutes: sigil's SHA-512)
-#   make realmodels — 1.5.0 gate: eight real checkpoint inventories end to end (CI)
+#   make realmodels — 1.5.0 gate: nine real checkpoint inventories end to end, one a shard set (CI)
 #   make clean   — scrub build/
 
 CYRIUS ?= cyrius
